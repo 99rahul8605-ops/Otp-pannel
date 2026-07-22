@@ -118,10 +118,19 @@ async def callback_handler(event):
         })
 
         phone = acc["phone"]
-        await event.edit(
-            f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n\n"
+        twofa_password = acc.get("twofa_password")  # may be None
+
+        # Compose success message
+        success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
+        if twofa_password:
+            success_text += f"🔒 **2FA Password:** `{twofa_password}`\n\n"
+        success_text += (
             "Now login to Telegram with this number. OTP will appear here automatically.\n"
-            "If you need a new OTP later, click below.",
+            "If you need a new OTP later, click below."
+        )
+
+        await event.edit(
+            success_text,
             buttons=[
                 [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
                 [Button.inline("🔙 Main Menu", b"main")]
@@ -315,6 +324,7 @@ async def process_phone_otp_step(event):
             await temp_client.sign_in(password=password)
             session_str = temp_client.session.save()
             state["session"] = session_str
+            state["twofa_password"] = password  # Store the password
             state["step"] = "country"
             await temp_client.disconnect()
             await event.respond("🌍 Send country code (e.g., IN, US):",
@@ -327,12 +337,16 @@ async def process_phone_otp_step(event):
         country = event.message.text.strip().upper()
         session_str = state["session"]
         phone = state["phone"]
-        await accounts_col.insert_one({
+        twofa_password = state.get("twofa_password")  # may be None
+        insert_data = {
             "phone": phone,
             "country": country,
             "session_string": session_str,
             "status": "available"
-        })
+        }
+        if twofa_password:
+            insert_data["twofa_password"] = twofa_password
+        await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, session_str)
         await event.respond(f"✅ Account `{phone}` ({country}) added successfully!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
@@ -353,21 +367,18 @@ async def process_session_step(event):
     if step == "session":
         session_str = event.message.text.strip()
         state["session_str"] = session_str
-        # Create client and start with password callback
         temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         password_future = asyncio.get_event_loop().create_future()
 
         async def get_password():
             await event.respond("🔒 This account has 2FA. Please send the password:",
                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            # set state to wait for password
             state["step"] = "await_password"
             state["client"] = temp_client
             state["future"] = password_future
             return await password_future
 
         try:
-            # Start client; it will call get_password if needed
             await temp_client.start(password=get_password)
             me = await temp_client.get_me()
             phone = me.phone
@@ -381,28 +392,29 @@ async def process_session_step(event):
             await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             user_states.pop(user_id, None)
     elif step == "await_password":
-        # Password message received
         password = event.message.text.strip()
         future = state.get("future")
         if future and not future.done():
             future.set_result(password)
-        # The flow will continue in the start() call and return to "country" step
-        # But we need to wait until start() finishes. We'll not proceed here; start() will handle.
-        # Just ignore further processing; start() will eventually send country prompt.
+            # Also store password in state
+            state["twofa_password"] = password
         return
     elif step == "country":
         country = event.message.text.strip().upper()
         phone = state["phone"]
         session_str = state["session_str"]
         client = state["client"]
-        # Save session string (get fresh one)
         new_session = client.session.save()
-        await accounts_col.insert_one({
+        twofa_password = state.get("twofa_password")
+        insert_data = {
             "phone": phone,
             "country": country,
             "session_string": new_session,
             "status": "available"
-        })
+        }
+        if twofa_password:
+            insert_data["twofa_password"] = twofa_password
+        await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, new_session)
         await client.disconnect()
         await event.respond(f"✅ Account `{phone}` ({country}) added!",
@@ -444,7 +456,7 @@ async def process_deposit_step(event):
     elif step == "txn_id":
         txn_id = event.message.text.strip()
         amount = state["amount"]
-        deposit = await deposits_col.insert_one({
+        await deposits_col.insert_one({
             "user_id": user_id,
             "amount": amount,
             "transaction_id": txn_id,
@@ -536,7 +548,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with 2FA session add + admin deposit alert...")
+    logging.info("🚀 Bot started with 2FA password delivery + admin deposit alert...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
