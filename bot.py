@@ -159,10 +159,9 @@ async def send_join_message(event):
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
     await event.respond("🔒 **You must join the channels below to use the bot.**", buttons=buttons)
 
-# ---------- WELCOME MENU (used by both /start and check_join) ----------
+# ---------- WELCOME MENU (fix: use edit only for callbacks) ----------
 async def show_welcome_menu(event, user_id):
-    """Send welcome message with buttons, suitable for both message and callback events."""
-    # Get dynamic bot username
+    """Send welcome message with buttons. For callback, edit; for new message, respond."""
     username = await get_bot_username()
     ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
 
@@ -184,10 +183,11 @@ async def show_welcome_menu(event, user_id):
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
 
-    # If called from a callback, we edit the existing message; otherwise respond
-    if hasattr(event, 'edit'):
+    # If called from a callback query (has .edit), edit the existing message
+    if isinstance(event, events.CallbackQuery.Event):
         await event.edit(welcome_msg, buttons=buttons)
     else:
+        # New message (e.g., /start), send a new message
         await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN MENU ----------
@@ -214,11 +214,9 @@ async def callback_handler(event):
 
     if data == "check_join":
         if await is_user_member(user_id):
-            # All joined – show welcome menu, not start_cmd
             await show_welcome_menu(event, user_id)
         else:
             await event.answer("You haven't joined all channels yet!", alert=True)
-            # Re-send updated join message (only remaining channels)
             await send_join_message(event)
         return
 
@@ -885,7 +883,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with fixed Check Again & filtered join list...")
+    logging.info("🚀 Bot started with fixed show_welcome_menu...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
