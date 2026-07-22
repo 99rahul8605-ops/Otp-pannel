@@ -87,7 +87,6 @@ def parse_chat_id(raw_id: str):
         return None
 
 async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
-    """Check if user is member of a single chat (raw ID)."""
     parsed = parse_chat_id(chat_id_raw)
     if parsed is None:
         return False
@@ -105,7 +104,6 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
         return False
 
 async def is_user_member(user_id: int) -> bool:
-    """True only if user is member of ALL force-join chats."""
     if not RAW_CHAT_IDS:
         return True
     for raw_id in RAW_CHAT_IDS:
@@ -114,14 +112,10 @@ async def is_user_member(user_id: int) -> bool:
     return True
 
 async def send_join_message(event):
-    """Sirf unhi chats ke liye Join button dikhaye jo abhi tak join nahi hue."""
     buttons = []
-    # Check each chat and add only those not joined
     for raw_id in RAW_CHAT_IDS:
-        # Skip if already member
         if await is_user_member_of(raw_id, event.sender_id):
             continue
-
         title = raw_id
         try:
             parsed = parse_chat_id(raw_id)
@@ -129,7 +123,6 @@ async def send_join_message(event):
             title = getattr(entity, 'title', raw_id)
         except Exception as e:
             logging.warning(f"Could not get title for {raw_id}: {e}")
-
         if raw_id.startswith('@'):
             link = f"https://t.me/{raw_id[1:]}"
             buttons.append([Button.url(f"📢 Join {title}", link)])
@@ -146,25 +139,19 @@ async def send_join_message(event):
                 logging.error(f"Bot is not admin in '{raw_id}', cannot generate invite link.")
             except Exception as e:
                 logging.error(f"Failed to export invite for '{raw_id}': {type(e).__name__}: {e}")
-
             if invite_link:
                 buttons.append([Button.url(f"📢 Join {title}", invite_link)])
             else:
                 buttons.append([Button.inline(f"🔒 {title} (join manually)", b"noop")])
-
     if not buttons:
-        # All joined – no join message needed; this case is handled before calling this function.
         return
-
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
     await event.respond("🔒 **You must join the channels below to use the bot.**", buttons=buttons)
 
-# ---------- WELCOME MENU (fix: use edit only for callbacks) ----------
+# ---------- WELCOME MENU ----------
 async def show_welcome_menu(event, user_id):
-    """Send welcome message with buttons. For callback, edit; for new message, respond."""
     username = await get_bot_username()
     ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
-
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
@@ -172,7 +159,6 @@ async def show_welcome_menu(event, user_id):
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
         "Use the buttons below to get started."
     )
-
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy")],
         [Button.inline("💰 My Balance", b"balance")],
@@ -182,12 +168,9 @@ async def show_welcome_menu(event, user_id):
     ]
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
-
-    # If called from a callback query (has .edit), edit the existing message
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(welcome_msg, buttons=buttons)
     else:
-        # New message (e.g., /start), send a new message
         await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN MENU ----------
@@ -282,9 +265,36 @@ async def callback_handler(event):
         )
 
     elif data.startswith("price_"):
+        # Show confirmation message
         parts = data.split("_", 2)
         country = parts[1]
         price = float(parts[2])
+        stock = await accounts_col.count_documents({"country": country, "status": "available", "price": price})
+        # Store intent in state
+        user_states[user_id] = {"action": "awaiting_confirmation", "country": country, "price": price}
+        confirm_text = (
+            "👋 Dear customer, after you agree to the terms and click the confirm button, "
+            "the number will be reserved for you.\n\n"
+            "💰 The amount will only be deducted from your account when you successfully receive the login codes.\n\n"
+            "⚠️ Please note that cancellation is not available in this server because OTP Delivery is guaranteed!\n\n"
+            f"🌏 Country: {country} 🇮🇳\n"
+            f"💰 Price: ₹{price}\n"
+            f"📦 Stock: {stock}"
+        )
+        buttons = [
+            [Button.inline("✅ Confirm Purchase", b"confirm_purchase")],
+            [Button.inline("❌ Cancel", b"cancel_purchase")]
+        ]
+        await event.edit(confirm_text, buttons=buttons)
+
+    elif data == "confirm_purchase":
+        state = user_states.get(user_id)
+        if not state or state.get("action") != "awaiting_confirmation":
+            await event.answer("Session expired. Please start again.", alert=True)
+            return
+        country = state["country"]
+        price = state["price"]
+        # Perform purchase
         user = await users_col.find_one({"user_id": user_id})
         balance = user["balance"] if user else 0
         if balance < price:
@@ -325,7 +335,6 @@ async def callback_handler(event):
             "Now login to Telegram with this number. OTP will appear here automatically.\n"
             "If you need a new OTP later, click below."
         )
-
         await event.edit(
             success_text,
             buttons=[
@@ -333,7 +342,9 @@ async def callback_handler(event):
                 [Button.inline("🔙 Main Menu", b"main")]
             ]
         )
+        user_states.pop(user_id, None)
 
+        # Notify admins
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -346,6 +357,35 @@ async def callback_handler(event):
                 )
             except:
                 pass
+
+    elif data == "cancel_purchase":
+        # Clear state and go back to price selection for that country (if available)
+        state = user_states.pop(user_id, None)
+        if state and state.get("action") == "awaiting_confirmation":
+            # Go back to the price list for the same country
+            country = state["country"]
+            total_count = await accounts_col.count_documents({"country": country, "status": "available"})
+            if total_count == 0:
+                await event.edit("❌ No accounts left in this country.", buttons=[[Button.inline("🔙 Back", b"buy")]])
+                return
+            pipeline = [
+                {"$match": {"country": country, "status": "available"}},
+                {"$group": {"_id": "$price", "count": {"$sum": 1}}},
+                {"$sort": {"_id": 1}}
+            ]
+            agg = await accounts_col.aggregate(pipeline).to_list(length=None)
+            btns = []
+            for item in agg:
+                price_val = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
+                count = item["count"]
+                btns.append([Button.inline(f"₹{price_val} ({count} available)", f"price_{country}_{price_val}")])
+            btns.append([Button.inline("🔙 Back", b"buy")])
+            await event.edit(
+                f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
+                buttons=btns
+            )
+        else:
+            await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
 
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
@@ -457,7 +497,6 @@ async def callback_handler(event):
             upsert=True
         )
 
-        # Referral bonus logic
         user_doc = await users_col.find_one({"user_id": user_id_dep})
         if user_doc and user_doc.get("referred_by"):
             if not user_doc.get("referral_bonus_paid"):
@@ -843,7 +882,7 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND (clean welcome + referral button) ----------
+# ---------- /start COMMAND ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     user_id = event.sender_id
@@ -883,7 +922,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with fixed show_welcome_menu...")
+    logging.info("🚀 Bot started with confirmation step before purchase...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
