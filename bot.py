@@ -1,4 +1,3 @@
-# bot.py
 import os
 import io
 import asyncio
@@ -42,7 +41,7 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 
 # ---------- STATE MACHINE ----------
 user_states = {}
-pending_otp_requests = {}  # (user_id, phone) -> bool (for resend OTP feature)
+pending_otp_requests = {}  # (user_id, phone) -> bool
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -119,7 +118,6 @@ async def callback_handler(event):
         })
 
         phone = acc["phone"]
-        # Send success message with Resend OTP button
         await event.edit(
             f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n\n"
             "Now login to Telegram with this number. OTP will appear here automatically.\n"
@@ -132,14 +130,11 @@ async def callback_handler(event):
 
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
-        # Check if bot is still logged into this account
         if phone not in acc_mgr.clients:
             await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
             return
-        # Set a pending request for this user+phone (will be cleared when OTP arrives)
         pending_otp_requests[(user_id, phone)] = True
         await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
-        # Optionally, set a timeout to clear pending if no OTP within 90 seconds
         async def clear_pending():
             await asyncio.sleep(90)
             key = (user_id, phone)
@@ -343,7 +338,7 @@ async def process_phone_otp_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- ADD SESSION FLOW ----------
+# ---------- ADD SESSION FLOW (2FA handled) ----------
 async def start_add_session_flow(event):
     user_states[event.sender_id] = {"action": "add_session", "step": "session"}
     await event.edit("🔑 Send the session string:",
@@ -354,43 +349,67 @@ async def process_session_step(event):
     state = user_states.get(user_id)
     if not state or state["action"] != "add_session":
         return
-    if state["step"] == "session":
+    step = state["step"]
+    if step == "session":
         session_str = event.message.text.strip()
+        state["session_str"] = session_str
+        # Create client and start with password callback
         temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        password_future = asyncio.get_event_loop().create_future()
+
+        async def get_password():
+            await event.respond("🔒 This account has 2FA. Please send the password:",
+                                buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            # set state to wait for password
+            state["step"] = "await_password"
+            state["client"] = temp_client
+            state["future"] = password_future
+            return await password_future
+
         try:
-            await temp_client.connect()
-            if not await temp_client.is_user_authorized():
-                await event.respond("❌ Invalid session!", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-                await temp_client.disconnect()
-                user_states.pop(user_id, None)
-                return
+            # Start client; it will call get_password if needed
+            await temp_client.start(password=get_password)
             me = await temp_client.get_me()
             phone = me.phone
             state["phone"] = phone
-            state["session"] = session_str
+            state["client"] = temp_client
             state["step"] = "country"
-            await temp_client.disconnect()
             await event.respond(f"📱 Number: {phone}\n🌍 Send country code (e.g., IN):",
                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
         except Exception as e:
+            await temp_client.disconnect()
             await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             user_states.pop(user_id, None)
-    elif state["step"] == "country":
+    elif step == "await_password":
+        # Password message received
+        password = event.message.text.strip()
+        future = state.get("future")
+        if future and not future.done():
+            future.set_result(password)
+        # The flow will continue in the start() call and return to "country" step
+        # But we need to wait until start() finishes. We'll not proceed here; start() will handle.
+        # Just ignore further processing; start() will eventually send country prompt.
+        return
+    elif step == "country":
         country = event.message.text.strip().upper()
         phone = state["phone"]
-        session_str = state["session"]
+        session_str = state["session_str"]
+        client = state["client"]
+        # Save session string (get fresh one)
+        new_session = client.session.save()
         await accounts_col.insert_one({
             "phone": phone,
             "country": country,
-            "session_string": session_str,
+            "session_string": new_session,
             "status": "available"
         })
-        await acc_mgr.add_client(phone, session_str)
+        await acc_mgr.add_client(phone, new_session)
+        await client.disconnect()
         await event.respond(f"✅ Account `{phone}` ({country}) added!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (QR photo fix) ----------
+# ---------- DEPOSIT FLOW (QR + admin notify) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -425,13 +444,20 @@ async def process_deposit_step(event):
     elif step == "txn_id":
         txn_id = event.message.text.strip()
         amount = state["amount"]
-        await deposits_col.insert_one({
+        deposit = await deposits_col.insert_one({
             "user_id": user_id,
             "amount": amount,
             "transaction_id": txn_id,
             "status": "pending",
             "created_at": datetime.utcnow()
         })
+        # Notify all admins
+        for admin in ADMIN_IDS:
+            try:
+                await bot.send_message(admin,
+                    f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTransaction ID: `{txn_id}`\nCheck /admin panel to approve/reject.")
+            except:
+                pass
         await event.respond(
             f"✅ Deposit request sent!\nAmount: ₹{amount}\nTransaction ID: {txn_id}\n"
             "Admin will verify and approve shortly.",
@@ -510,7 +536,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with Resend OTP feature...")
+    logging.info("🚀 Bot started with 2FA session add + admin deposit alert...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
