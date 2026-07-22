@@ -1,5 +1,4 @@
 import os
-import re
 import io
 import asyncio
 import logging
@@ -11,6 +10,7 @@ from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
+from account_manager import AccountManager   # <-- yahan import karo
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -24,62 +24,17 @@ UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
-    raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS.")
+    raise ValueError("❌ .env file incomplete!")
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------- MONGODB SETUP ----------
+# ---------- MongoDB Setup ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client['otp_bot']
 accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
 deposits_col = db['deposits']
-
-# ---------- ACCOUNT CLIENT MANAGER ----------
-class AccountManager:
-    def __init__(self):
-        self.clients = {}
-
-    async def add_client(self, phone, session_str):
-        if phone in self.clients:
-            await self.remove_client(phone)
-        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await client.start()
-        self.clients[phone] = client
-
-        @client.on(events.NewMessage(from_users=777000))
-        async def otp_handler(event):
-            text = event.message.message
-            code_match = re.search(r'\b(\d{5,6})\b', text)
-            if not code_match:
-                code_match = re.search(r'Login code:\s*(\d+)', text, re.I)
-            if code_match:
-                otp = code_match.group(1)
-                buyer = await accounts_col.find_one({"phone": phone, "status": "sold"})
-                buyer_id = buyer["buyer_id"] if buyer else None
-                if buyer_id:
-                    try:
-                        await bot.send_message(buyer_id, f"🔐 **Login OTP:** `{otp}`\n(Account: {phone})")
-                    except:
-                        pass
-        logging.info(f"✅ Client started for {phone}")
-
-    async def remove_client(self, phone):
-        if phone in self.clients:
-            await self.clients[phone].disconnect()
-            del self.clients[phone]
-
-    async def stop_all(self):
-        for c in self.clients.values():
-            await c.disconnect()
-        self.clients.clear()
-
-    async def load_all(self):
-        async for acc in accounts_col.find({"status": "available"}):
-            await self.add_client(acc["phone"], acc["session_string"])
-
-acc_mgr = AccountManager()
 
 # ---------- BOT INSTANCE ----------
 bot = TelegramClient('bot_session', API_ID, API_HASH)
@@ -100,7 +55,7 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- CALLBACK QUERY HANDLER ----------
+# ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
@@ -355,6 +310,7 @@ async def process_phone_otp_step(event):
             "session_string": session_str,
             "status": "available"
         })
+        # Add to account manager
         await acc_mgr.add_client(phone, session_str)
         await event.respond(f"✅ Account `{phone}` ({country}) added successfully!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
@@ -424,7 +380,6 @@ async def process_deposit_step(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
         state["amount"] = amount
-        # Generate UPI string and QR code
         upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
@@ -441,7 +396,7 @@ async def process_deposit_step(event):
     elif step == "txn_id":
         txn_id = event.message.text.strip()
         amount = state["amount"]
-        dep = await deposits_col.insert_one({
+        await deposits_col.insert_one({
             "user_id": user_id,
             "amount": amount,
             "transaction_id": txn_id,
@@ -515,12 +470,21 @@ async def start_cmd(event):
 
 # ---------- MAIN FUNCTION ----------
 async def main():
+    # Start bot client
     await bot.start(bot_token=BOT_TOKEN)
-    # Optional indexes
+
+    # Initialize account manager with required references
+    global acc_mgr
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH)
+
+    # Optional: create indexes
     # await accounts_col.create_index("phone", unique=True)
     # await users_col.create_index("user_id", unique=True)
+
+    # Load all available account sessions
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with QR Deposit + Order History...")
+
+    logging.info("🚀 Bot started with separate OTP manager...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
