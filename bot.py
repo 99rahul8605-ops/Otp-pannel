@@ -10,7 +10,7 @@ from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
-from account_manager import AccountManager   # alag file se import
+from account_manager import AccountManager
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -362,7 +362,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (FIXED) ----------
+# ---------- DEPOSIT FLOW (QR photo bhejega) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -384,13 +384,15 @@ async def process_deposit_step(event):
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
-        # FIX: Use send_file instead of event.respond for file + caption
+        # 🔥 QR as photo, not file
         await bot.send_file(
             event.chat_id,
             buf,
             caption=f"💳 **Deposit ₹{amount}**\nScan QR or use UPI ID: `{UPI_ID}`\n\n"
                     "Payment karke Transaction ID yahan bhejo (ya 'done' type karo).",
-            buttons=[[Button.inline("🔙 Cancel", b"main")]]
+            buttons=[[Button.inline("🔙 Cancel", b"main")]],
+            file_name="qr_code.png",   # ← important
+            force_document=False       # photo ke roop mein
         )
         state["step"] = "txn_id"
 
@@ -476,13 +478,13 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH)
 
-    # Optional indexes
+    # Optional: unique indexes
     # await accounts_col.create_index("phone", unique=True)
     # await users_col.create_index("user_id", unique=True)
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with separate OTP manager...")
+    logging.info("🚀 Bot started with QR photo fix...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
