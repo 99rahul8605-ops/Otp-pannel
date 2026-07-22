@@ -195,6 +195,23 @@ async def callback_handler(event):
                 "admin_deposits", "admin_setprice"):
         user_states.pop(user_id, None)
 
+    # --- Referral Info Button ---
+    if data == "referral_info":
+        username = await get_bot_username()
+        ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
+        invited_count = await users_col.count_documents({"referred_by": user_id})
+        paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
+        text = (
+            "👥 **Referral Program**\n\n"
+            f"🔗 **Your Link:** `{ref_link}`\n"
+            f"💰 **Bonus:** ₹{REFERRAL_BONUS} (when your referral deposits ₹50 or more)\n"
+            f"📊 **Invited Users:** {invited_count}\n"
+            f"✅ **Bonus Paid:** {paid_count}\n\n"
+            "Share your link and earn!"
+        )
+        await event.edit(text, buttons=[[Button.inline("🔙 Back", b"main")]])
+        return
+
     # --- User purchase flow ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
@@ -407,12 +424,10 @@ async def callback_handler(event):
             upsert=True
         )
 
-        # 🆕 Referral bonus logic: check if user was referred, and if total approved deposits >= 50
+        # Referral bonus logic
         user_doc = await users_col.find_one({"user_id": user_id_dep})
         if user_doc and user_doc.get("referred_by"):
-            # Check if bonus already paid for this referral
             if not user_doc.get("referral_bonus_paid"):
-                # Sum all approved deposits for this user
                 total_dep = await deposits_col.aggregate([
                     {"$match": {"user_id": user_id_dep, "status": "approved"}},
                     {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
@@ -420,17 +435,14 @@ async def callback_handler(event):
                 total = total_dep[0]["total"] if total_dep else 0
                 if total >= 50:
                     referrer_id = user_doc["referred_by"]
-                    # Give bonus to referrer
                     await users_col.update_one(
                         {"user_id": referrer_id},
                         {"$inc": {"balance": REFERRAL_BONUS}}
                     )
-                    # Mark bonus as paid for this referred user
                     await users_col.update_one(
                         {"user_id": user_id_dep},
                         {"$set": {"referral_bonus_paid": True}}
                     )
-                    # Notify referrer
                     try:
                         await bot.send_message(referrer_id,
                             f"🎉 Your referral {user_id_dep} has deposited ₹{total}.\n"
@@ -438,7 +450,6 @@ async def callback_handler(event):
                     except:
                         pass
 
-        # Notify the depositor
         try:
             await bot.send_message(user_id_dep,
                                    f"✅ Deposit of ₹{amount} approved! Balance updated.")
@@ -799,7 +810,7 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND (dynamic username + deferred referral) ----------
+# ---------- /start COMMAND (clean welcome + referral button) ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     user_id = event.sender_id
@@ -812,7 +823,6 @@ async def start_cmd(event):
         except:
             referrer_id = None
 
-    # Insert or update user
     user_data = await users_col.find_one({"user_id": user_id})
     if not user_data:
         await users_col.insert_one({
@@ -822,31 +832,21 @@ async def start_cmd(event):
             "referred_by": referrer_id,
             "referral_bonus_paid": False
         })
-        # No immediate bonus
     else:
-        # If user already exists, maybe update referred_by if not set (prevent self-referral)
         if user_data.get("referred_by") is None and referrer_id and referrer_id != user_id:
             await users_col.update_one({"user_id": user_id}, {"$set": {"referred_by": referrer_id}})
-        # Ensure referral_bonus_paid field exists
         if "referral_bonus_paid" not in user_data:
             await users_col.update_one({"user_id": user_id}, {"$set": {"referral_bonus_paid": False}})
 
-    # Force join check
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
-
-    # Get dynamic bot username
-    username = await get_bot_username()
-    ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
 
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
         "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
-        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n"
-        f"🔗 **Your Referral Link:** `{ref_link}`\n"
-        f"👥 Share this link. Earn ₹{REFERRAL_BONUS} when your referral deposits ₹50 or more.\n\n"
+        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
         "Use the buttons below to get started."
     )
 
@@ -855,6 +855,7 @@ async def start_cmd(event):
         [Button.inline("💰 My Balance", b"balance")],
         [Button.inline("💳 Deposit", b"deposit")],
         [Button.inline("📜 Order History", b"orders")],
+        [Button.inline("👥 Referral Program", b"referral_info")],
     ]
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
@@ -867,7 +868,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with API username fetch & deferred referral bonus...")
+    logging.info("🚀 Bot started with clean referral button...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
