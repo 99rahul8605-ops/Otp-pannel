@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import asyncio
 import logging
 from datetime import datetime
@@ -8,6 +9,8 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
+import qrcode
+from bson import ObjectId
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -17,7 +20,8 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-PAYMENT_DETAILS = os.getenv("PAYMENT_DETAILS", "Payment details not set. Contact admin.")
+UPI_ID = os.getenv("UPI_ID", "example@upi")
+PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS.")
@@ -30,11 +34,10 @@ db = mongo_client['otp_bot']
 accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
-deposits_col = db['deposits']   # NEW
+deposits_col = db['deposits']
 
 # ---------- ACCOUNT CLIENT MANAGER ----------
 class AccountManager:
-    # ... (exactly same as before) ...
     def __init__(self):
         self.clients = {}
 
@@ -105,7 +108,6 @@ async def callback_handler(event):
     user_states.pop(user_id, None)
 
     if data == "buy":
-        # ... same buy flow as before ...
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
             await event.answer("❌ No accounts available!", alert=True)
@@ -172,13 +174,11 @@ async def callback_handler(event):
         await event.edit(f"💰 Your balance: ₹{bal}", buttons=[[Button.inline("🔙 Back", b"main")]])
 
     elif data == "deposit":
-        # start deposit flow
         user_states[user_id] = {"action": "deposit", "step": "amount"}
         await event.edit("💵 Enter the amount you want to deposit (₹):",
                          buttons=[[Button.inline("🔙 Cancel", b"main")]])
 
     elif data == "orders":
-        # Show order history
         cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
         orders = await cursor.to_list(length=10)
         if not orders:
@@ -190,7 +190,7 @@ async def callback_handler(event):
             )
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
 
-    # ---------- ADMIN CALLBACKS (same as before) ----------
+    # ---------- ADMIN CALLBACKS ----------
     elif data == "admin":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -200,7 +200,7 @@ async def callback_handler(event):
             [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
             [Button.inline("📋 List Accounts", b"admin_list")],
             [Button.inline("💰 Add Balance", b"admin_addbal")],
-            [Button.inline("🕒 Pending Deposits", b"admin_deposits")],  # NEW
+            [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
             [Button.inline("🔙 Back", b"main")],
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
@@ -228,19 +228,15 @@ async def callback_handler(event):
         await event.edit("👤 Send the user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
     elif data == "admin_deposits":
-        # Show pending deposits with approve/reject buttons
         cursor = deposits_col.find({"status": "pending"}).sort("created_at", 1)
         pending = await cursor.to_list(length=10)
         if not pending:
             await event.answer("No pending deposits.", alert=True)
             return
-        # Inline buttons: for each deposit, approve and reject
         btns = []
         for dep in pending:
-            label = f"User {dep['user_id']}: ₹{dep['amount']} (ID:{dep['_id']})"
-            # We'll create a row with Approve and Reject buttons
             btns.append([
-                Button.inline(f"✅ Approve {dep['amount']}", f"approve_{dep['_id']}"),
+                Button.inline(f"✅ Approve ₹{dep['amount']}", f"approve_{dep['_id']}"),
                 Button.inline(f"❌ Reject", f"reject_{dep['_id']}")
             ])
         btns.append([Button.inline("🔙 Back", b"admin")])
@@ -252,14 +248,12 @@ async def callback_handler(event):
         if not deposit or deposit["status"] != "pending":
             await event.answer("Already processed.", alert=True)
             return
-        # Add balance
         await users_col.update_one(
             {"user_id": deposit["user_id"]},
             {"$inc": {"balance": deposit["amount"]}},
             upsert=True
         )
         await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "approved"}})
-        # Notify user
         try:
             await bot.send_message(deposit["user_id"],
                                    f"✅ Deposit of ₹{deposit['amount']} approved! Balance updated.")
@@ -287,14 +281,13 @@ async def callback_handler(event):
     else:
         await event.answer("Unknown action", alert=True)
 
-# ---------- ADD PHONE (OTP) FLOW (same as before) ----------
+# ---------- ADD PHONE (OTP) FLOW ----------
 async def start_add_phone_flow(event):
     user_states[event.sender_id] = {"action": "add_phone_otp", "step": "phone"}
     await event.edit("📱 Send the phone number in international format (e.g., +919876543210):",
                      buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
 async def process_phone_otp_step(event):
-    # ... same as previous code ...
     user_id = event.sender_id
     state = user_states.get(user_id)
     if not state or state["action"] != "add_phone_otp":
@@ -367,7 +360,7 @@ async def process_phone_otp_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- ADD SESSION FLOW (same as before) ----------
+# ---------- ADD SESSION FLOW ----------
 async def start_add_session_flow(event):
     user_states[event.sender_id] = {"action": "add_session", "step": "session"}
     await event.edit("🔑 Send the session string:",
@@ -414,7 +407,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW ----------
+# ---------- DEPOSIT FLOW (with QR) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -427,20 +420,27 @@ async def process_deposit_step(event):
             if amount <= 0:
                 raise ValueError
         except:
-            await event.respond("❌ Invalid amount. Enter again:", 
+            await event.respond("❌ Invalid amount. Enter again:",
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
         state["amount"] = amount
-        state["step"] = "txn_id"
+        # Generate UPI string and QR code
+        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
+        img = qrcode.make(upi_string)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
         await event.respond(
-            f"💳 **Payment Details:**\n{PAYMENT_DETAILS}\n\n"
-            f"Send ₹{amount} and then reply with your Transaction ID (or 'done' if already sent).",
+            file=buf,
+            caption=f"💳 **Deposit ₹{amount}**\nScan QR or use UPI ID: `{UPI_ID}`\n\n"
+                    "Payment karke Transaction ID yahan bhejo (ya 'done' type karo).",
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
+        state["step"] = "txn_id"
+
     elif step == "txn_id":
         txn_id = event.message.text.strip()
         amount = state["amount"]
-        # Save deposit request as pending
         dep = await deposits_col.insert_one({
             "user_id": user_id,
             "amount": amount,
@@ -470,7 +470,6 @@ async def handle_message(event):
     elif action == "add_session":
         await process_session_step(event)
     elif action == "add_balance":
-        # ... add balance step (same as before) ...
         step = state["step"]
         if step == "await_user_id":
             try:
@@ -516,17 +515,13 @@ async def start_cmd(event):
 
 # ---------- MAIN FUNCTION ----------
 async def main():
-    from bson import ObjectId   # for approve/reject
-    global ObjectId
     await bot.start(bot_token=BOT_TOKEN)
     # Optional indexes
     # await accounts_col.create_index("phone", unique=True)
     # await users_col.create_index("user_id", unique=True)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with Deposit + Order History...")
+    logging.info("🚀 Bot started with QR Deposit + Order History...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    import bson
-    ObjectId = bson.ObjectId
     asyncio.run(main())
