@@ -48,7 +48,7 @@ pending_otp_requests = {}
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- MAIN MENU ----------
+# ---------- MAIN MENU (simpler for "Main Menu" button) ----------
 async def send_main_menu(event):
     user_id = event.sender_id
     buttons = [
@@ -625,7 +625,7 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND (Updated with detailed welcome) ----------
+# ---------- /start COMMAND (NOW WITH WELCOME + BUTTONS) ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     await users_col.update_one(
@@ -633,6 +633,8 @@ async def start_cmd(event):
         {"$setOnInsert": {"balance": 0, "joined_at": datetime.utcnow()}},
         upsert=True
     )
+
+    # Detailed welcome message with inline buttons
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
@@ -641,8 +643,17 @@ async def start_cmd(event):
         "⚙️ **Admin Panel** – Manage accounts, set prices, approve deposits.\n\n"
         "Use the buttons below to get started."
     )
-    await event.respond(welcome_msg)
-    await send_main_menu(event)
+
+    buttons = [
+        [Button.inline("🛒 Buy Account", b"buy")],
+        [Button.inline("💰 My Balance", b"balance")],
+        [Button.inline("💳 Deposit", b"deposit")],
+        [Button.inline("📜 Order History", b"orders")],
+    ]
+    if event.sender_id in ADMIN_IDS:
+        buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
+
+    await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN FUNCTION ----------
 async def main():
@@ -653,7 +664,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with detailed start message...")
+    logging.info("🚀 Bot started with detailed welcome message...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
