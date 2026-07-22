@@ -4,13 +4,14 @@ import asyncio
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, functions
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     UserNotParticipantError,
     ChatAdminRequiredError,
-    ChannelPrivateError
+    ChannelPrivateError,
+    InviteHashInvalidError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -28,8 +29,10 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "10"))
 
-# Force join (multiple channels, support for username & numeric ID)
+# Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -59,32 +62,28 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 user_states = {}
 pending_otp_requests = {}
 
-# ---------- HELPER: Get existing countries ----------
+# ---------- HELPER ----------
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (IMPROVED) ----------
+# ---------- FORCE JOIN (with auto invite links) ----------
 def parse_chat_id(raw_id: str):
-    """Convert raw ID string to a format Telethon can use (str for username, int for numeric ID)."""
     raw = raw_id.strip()
     if raw.startswith('@'):
-        return raw  # username, Telethon accepts as string
+        return raw
     try:
-        chat_id_int = int(raw)
+        return int(raw)
     except ValueError:
         logging.error(f"Invalid chat ID format: {raw}")
         return None
-    # Telethon's get_entity can handle integer IDs (including -100 prefix)
-    return chat_id_int
 
 async def is_user_member(user_id: int) -> bool:
-    """Check if user is member of all force-join chats. Returns True only if all passed."""
     if not RAW_CHAT_IDS:
-        return True  # force join disabled
+        return True
     for raw_id in RAW_CHAT_IDS:
         parsed = parse_chat_id(raw_id)
         if parsed is None:
-            continue  # skip invalid IDs (already logged)
+            continue
         try:
             entity = await bot.get_entity(parsed)
         except ValueError as e:
@@ -96,7 +95,7 @@ async def is_user_member(user_id: int) -> bool:
         try:
             await bot.get_permissions(entity, user_id)
         except UserNotParticipantError:
-            return False  # user not a member
+            return False
         except ChatAdminRequiredError:
             logging.error(f"Bot is not admin in '{raw_id}'. Membership check impossible. Make the bot admin.")
             return False
@@ -109,10 +108,9 @@ async def is_user_member(user_id: int) -> bool:
     return True
 
 async def send_join_message(event):
-    """Send a message listing required channels with Join buttons (public) and a Check Again button."""
     lines = []
     buttons = []
-    for idx, raw_id in enumerate(RAW_CHAT_IDS, start=1):
+    for idx, raw_id in enumerate(RAW_CHAT_IDS):
         title = raw_id
         try:
             parsed = parse_chat_id(raw_id)
@@ -120,12 +118,34 @@ async def send_join_message(event):
             title = getattr(entity, 'title', raw_id)
         except Exception as e:
             logging.warning(f"Could not get title for {raw_id}: {e}")
+
         if raw_id.startswith('@'):
             link = f"https://t.me/{raw_id[1:]}"
-            lines.append(f"{idx}. [{title}]({link})")
+            lines.append(f"{idx+1}. [{title}]({link})")
             buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            lines.append(f"{idx}. Private: {title} (join manually)")
+            # Private chat – auto-generate invite link if bot is admin
+            invite_link = None
+            try:
+                result = await bot(functions.messages.ExportChatInviteRequest(
+                    peer=entity,
+                    expire_date=None,      # no expiry
+                    usage_limit=0          # unlimited
+                ))
+                invite_link = result.link
+            except ChatAdminRequiredError:
+                logging.error(f"Bot is not admin in '{raw_id}', cannot generate invite link.")
+            except InviteHashInvalidError:
+                logging.error(f"Invite hash invalid for '{raw_id}'.")
+            except Exception as e:
+                logging.error(f"Failed to export invite for '{raw_id}': {type(e).__name__}: {e}")
+
+            if invite_link:
+                lines.append(f"{idx+1}. [{title}]({invite_link})")
+                buttons.append([Button.url(f"📢 Join {title}", invite_link)])
+            else:
+                lines.append(f"{idx+1}. Private: {title} (join manually)")
+
     join_text = (
         "🔒 **You must join these channels/groups to use the bot:**\n\n" +
         "\n".join(lines) +
@@ -156,7 +176,6 @@ async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
 
-    # Always allow check_join
     if data == "check_join":
         if await is_user_member(user_id):
             await start_cmd(event)
@@ -164,13 +183,11 @@ async def callback_handler(event):
             await event.answer("You haven't joined all channels yet!", alert=True)
         return
 
-    # For all other callbacks, verify membership
     if not await is_user_member(user_id):
         await event.answer("You must join all channels first!", alert=True)
         await send_join_message(event)
         return
 
-    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice"):
@@ -262,7 +279,6 @@ async def callback_handler(event):
             ]
         )
 
-        # Notify all admins
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -624,7 +640,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (Screenshot) ----------
+# ---------- DEPOSIT FLOW (screenshot) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -740,25 +756,57 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND ----------
+# ---------- /start COMMAND (with referral) ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     user_id = event.sender_id
-    await users_col.update_one(
-        {"user_id": user_id},
-        {"$setOnInsert": {"balance": 0, "joined_at": datetime.utcnow()}},
-        upsert=True
-    )
+    args = event.message.text.split()
+    referrer_id = None
+
+    if len(args) > 1 and args[1].startswith('ref'):
+        try:
+            referrer_id = int(args[1][3:])
+        except:
+            referrer_id = None
+
+    # Check if new user
+    user_data = await users_col.find_one({"user_id": user_id})
+    if not user_data:
+        await users_col.insert_one({
+            "user_id": user_id,
+            "balance": 0,
+            "joined_at": datetime.utcnow(),
+            "referred_by": referrer_id
+        })
+        if referrer_id and referrer_id != user_id:
+            await users_col.update_one(
+                {"user_id": referrer_id},
+                {"$inc": {"balance": REFERRAL_BONUS}}
+            )
+            await users_col.update_one(
+                {"user_id": user_id},
+                {"$inc": {"balance": REFERRAL_BONUS}}
+            )
+            try:
+                await bot.send_message(referrer_id,
+                    f"🎉 A new user joined using your referral link!\nYou earned ₹{REFERRAL_BONUS}.")
+            except:
+                pass
+
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
+
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
         "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
-        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
+        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n"
+        f"🔗 **Your Referral Link:** `https://t.me/{BOT_USERNAME}?start=ref{user_id}`\n"
+        f"👥 Share this link and earn ₹{REFERRAL_BONUS} per invite!\n\n"
         "Use the buttons below to get started."
     )
+
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy")],
         [Button.inline("💰 My Balance", b"balance")],
@@ -767,6 +815,7 @@ async def start_cmd(event):
     ]
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
+
     await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN FUNCTION ----------
@@ -775,7 +824,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with bulletproof force join...")
+    logging.info("🚀 Bot started – auto invite link generation + referral...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
