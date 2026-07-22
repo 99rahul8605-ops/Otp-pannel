@@ -288,28 +288,27 @@ async def callback_handler(event):
     elif data == "main":
         await send_main_menu(event)
 
-    # ---------- Country selection callbacks (used in add flows) ----------
-    elif data == "select_country":
-        # User wants to add new country manually
-        state = user_states.get(user_id)
-        if not state or state.get("action") not in ("add_phone_otp", "add_session"):
-            await event.answer("❌ Session expired or invalid action. Please start again.", alert=True)
-            return
-        state["step"] = "country_manual"
-        await event.edit("🌍 Send the new country code (e.g., IN):",
-                         buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-
-    elif data.startswith("country_select_"):
-        # User selected an existing country
-        country = data.split("_", 2)[2]  # format: country_select_IN
-        state = user_states.get(user_id)
-        if not state or state.get("action") not in ("add_phone_otp", "add_session"):
-            await event.answer("❌ Session expired or invalid action. Please start again.", alert=True)
-            return
-        state["country"] = country
-        state["step"] = "price"
-        await event.edit("💵 Send price for this number (e.g., 50):",
-                         buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+    # ---------- Country selection for admin add flows ----------
+    elif data.startswith("addcountry_"):
+        # Format: addcountry_IN (existing) or addcountry_new (new)
+        if data == "addcountry_new":
+            state = user_states.get(user_id)
+            if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+                await event.answer("❌ Session expired. Please start again from Admin Panel.", alert=True)
+                return
+            state["step"] = "country_manual"
+            await event.edit("🌍 Send the new country code (e.g., IN):",
+                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+        else:
+            country = data[len("addcountry_"):]  # e.g., "IN"
+            state = user_states.get(user_id)
+            if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+                await event.answer("❌ Session expired. Please start again.", alert=True)
+                return
+            state["country"] = country
+            state["step"] = "price"
+            await event.edit("💵 Send price for this number (e.g., 50):",
+                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
     else:
         await event.answer("Unknown action", alert=True)
@@ -361,8 +360,8 @@ async def process_phone_otp_step(event):
         state["session"] = session_str
         state["step"] = "choose_country"
         existing = await get_existing_countries()
-        btns = [[Button.inline(c, f"country_select_{c}")] for c in existing]
-        btns.append([Button.inline("➕ New Country", b"select_country")])
+        btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
+        btns.append([Button.inline("➕ New Country", b"addcountry_new")])
         btns.append([Button.inline("🔙 Cancel", b"admin")])
         await temp_client.disconnect()
         await event.respond("🌍 Select country or add new:", buttons=btns)
@@ -376,8 +375,8 @@ async def process_phone_otp_step(event):
             state["twofa_password"] = password
             state["step"] = "choose_country"
             existing = await get_existing_countries()
-            btns = [[Button.inline(c, f"country_select_{c}")] for c in existing]
-            btns.append([Button.inline("➕ New Country", b"select_country")])
+            btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
+            btns.append([Button.inline("➕ New Country", b"addcountry_new")])
             btns.append([Button.inline("🔙 Cancel", b"admin")])
             await temp_client.disconnect()
             await event.respond("🌍 Select country or add new:", buttons=btns)
@@ -468,8 +467,8 @@ async def process_session_step(event):
             state["twofa_password"] = answer
         state["step"] = "choose_country"
         existing = await get_existing_countries()
-        btns = [[Button.inline(c, f"country_select_{c}")] for c in existing]
-        btns.append([Button.inline("➕ New Country", b"select_country")])
+        btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
+        btns.append([Button.inline("➕ New Country", b"addcountry_new")])
         btns.append([Button.inline("🔙 Cancel", b"admin")])
         await event.respond("🌍 Select country or add new:", buttons=btns)
     elif step == "country_manual":
@@ -646,7 +645,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started – state management fixed...")
+    logging.info("🚀 Bot started – country selection fixed...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
