@@ -60,7 +60,6 @@ async def get_existing_countries():
 
 # ---------- FORCE JOIN (FIXED) ----------
 async def is_user_member(user_id):
-    """Check if user is member of all force-join channels. Returns True only if all passed."""
     if not FORCE_JOIN_CHAT_IDS:
         return True
     for chat_id in FORCE_JOIN_CHAT_IDS:
@@ -70,15 +69,14 @@ async def is_user_member(user_id):
         except UserNotParticipantError:
             return False
         except Exception as e:
-            # If we can't verify (e.g., bot not admin), assume not a member to be safe
             logging.error(f"Cannot verify membership for {chat_id}: {e}")
             return False
     return True
 
 async def send_join_message(event):
-    """Send a message with inline Join buttons for each public channel + Check Again."""
-    buttons = []
+    """Send message with Join buttons for each public channel, text for private, + Check Again."""
     lines = []
+    buttons = []
     for idx, chat_id in enumerate(FORCE_JOIN_CHAT_IDS, start=1):
         try:
             entity = await bot.get_entity(chat_id)
@@ -91,19 +89,17 @@ async def send_join_message(event):
             lines.append(f"{idx}. [{title}]({link})")
             buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            # Private chat – no direct link
-            lines.append(f"{idx}. Private: {title}")
-            buttons.append([Button.inline(f"🔒 {title} (private, join manually)", b"noop")])  # dummy button
+            # Private chat, no join link
+            lines.append(f"{idx}. Private: {title} (join manually)")
 
     join_text = (
         "🔒 **You must join these channels/groups to use the bot:**\n\n" +
         "\n".join(lines) +
         "\n\nAfter joining all, click the button below."
     )
-    # Remove dummy buttons that do nothing
-    valid_buttons = [row for row in buttons if row[0].data != b"noop"]
-    valid_buttons.append([Button.inline("✅ Check Again", b"check_join")])
-    await event.respond(join_text, buttons=valid_buttons)
+    # Add the Check Again button as last row
+    buttons.append([Button.inline("✅ Check Again", b"check_join")])
+    await event.respond(join_text, buttons=buttons)
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -127,23 +123,16 @@ async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
 
-    # Ignore dummy noop buttons
-    if data == "noop":
-        await event.answer("This channel must be joined manually.", alert=True)
-        return
-
-    # Check join for all except check_join
-    if data != "check_join" and not await is_user_member(user_id):
-        await event.answer("You must join all channels first!", alert=True)
-        await send_join_message(event)
-        return
-
     if data == "check_join":
         if await is_user_member(user_id):
-            # All joined, send welcome menu (like /start)
             await start_cmd(event)
         else:
             await event.answer("You haven't joined all channels yet!", alert=True)
+        return
+
+    if not await is_user_member(user_id):
+        await event.answer("You must join all channels first!", alert=True)
+        await send_join_message(event)
         return
 
     # Top-level callbacks clear any existing state
@@ -600,7 +589,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (unchanged) ----------
+# ---------- DEPOSIT FLOW ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -722,7 +711,7 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND (WITHOUT ADMIN LINE) ----------
+# ---------- /start COMMAND ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     user_id = event.sender_id
@@ -764,7 +753,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with fixed force join + inline Join buttons...")
+    logging.info("🚀 Bot started with fixed force join...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
