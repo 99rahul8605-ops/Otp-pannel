@@ -61,13 +61,19 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- CALLBACK HANDLER ----------
+# ---------- CALLBACK HANDLER (FIXED) ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
-    user_states.pop(user_id, None)
 
+    # Top-level callbacks clear any existing state
+    if data in ("main", "buy", "balance", "deposit", "orders", "admin",
+                "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
+                "admin_deposits", "admin_setprice"):
+        user_states.pop(user_id, None)
+
+    # --- User purchase flow ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -79,13 +85,10 @@ async def callback_handler(event):
 
     elif data.startswith("country_"):
         country = data.split("_", 1)[1]
-        # Get total stock count for this country
         total_count = await accounts_col.count_documents({"country": country, "status": "available"})
         if total_count == 0:
             await event.answer("No accounts left.", alert=True)
             return
-
-        # Get price-wise grouping
         pipeline = [
             {"$match": {"country": country, "status": "available"}},
             {"$group": {"_id": "$price", "count": {"$sum": 1}}},
@@ -98,8 +101,6 @@ async def callback_handler(event):
             count = item["count"]
             btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}")])
         btns.append([Button.inline("🔙 Back", b"buy")])
-
-        # 🆕 Show total stock in description
         await event.edit(
             f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
             buttons=btns
@@ -208,6 +209,7 @@ async def callback_handler(event):
             [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
             [Button.inline("📋 List Accounts", b"admin_list")],
             [Button.inline("💰 Add Balance", b"admin_addbal")],
+            [Button.inline("💲 Set Price", b"admin_setprice")],
             [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
             [Button.inline("🔙 Back", b"main")],
         ]
@@ -286,38 +288,33 @@ async def callback_handler(event):
     elif data == "main":
         await send_main_menu(event)
 
-    # ---------- Country selection callback for admin add flows ----------
+    # ---------- Country selection callbacks (used in add flows) ----------
     elif data == "select_country":
+        # User wants to add new country manually
         state = user_states.get(user_id)
-        if not state or (state.get("action") not in ("add_phone_otp", "add_session")):
-            await event.answer("Invalid state", alert=True)
+        if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+            await event.answer("❌ Session expired or invalid action. Please start again.", alert=True)
             return
         state["step"] = "country_manual"
         await event.edit("🌍 Send the new country code (e.g., IN):",
                          buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
     elif data.startswith("country_select_"):
-        country = data.split("_", 2)[2]  # country_select_IN
+        # User selected an existing country
+        country = data.split("_", 2)[2]  # format: country_select_IN
         state = user_states.get(user_id)
-        if not state:
-            await event.answer("Invalid state", alert=True)
+        if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+            await event.answer("❌ Session expired or invalid action. Please start again.", alert=True)
             return
         state["country"] = country
-        if state["action"] == "add_phone_otp":
-            state["step"] = "price"
-            await event.edit("💵 Send price for this number (e.g., 50):",
-                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-        elif state["action"] == "add_session":
-            state["step"] = "price"
-            await event.edit("💵 Send price for this number (e.g., 50):",
-                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-        else:
-            await event.answer("Unknown action", alert=True)
+        state["step"] = "price"
+        await event.edit("💵 Send price for this number (e.g., 50):",
+                         buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
     else:
         await event.answer("Unknown action", alert=True)
 
-# ---------- ADD PHONE (OTP) FLOW (with country list selection) ----------
+# ---------- ADD PHONE (OTP) FLOW ----------
 async def start_add_phone_flow(event):
     user_states[event.sender_id] = {"action": "add_phone_otp", "step": "phone"}
     await event.edit("📱 Send the phone number in international format (e.g., +919876543210):",
@@ -364,9 +361,7 @@ async def process_phone_otp_step(event):
         state["session"] = session_str
         state["step"] = "choose_country"
         existing = await get_existing_countries()
-        btns = []
-        for c in existing:
-            btns.append([Button.inline(c, f"country_select_{c}")])
+        btns = [[Button.inline(c, f"country_select_{c}")] for c in existing]
         btns.append([Button.inline("➕ New Country", b"select_country")])
         btns.append([Button.inline("🔙 Cancel", b"admin")])
         await temp_client.disconnect()
@@ -425,7 +420,7 @@ async def process_phone_otp_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- ADD SESSION FLOW (with country list selection) ----------
+# ---------- ADD SESSION FLOW ----------
 async def start_add_session_flow(event):
     user_states[event.sender_id] = {"action": "add_session", "step": "session"}
     await event.edit("🔑 Send the session string:",
@@ -651,7 +646,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started – total stock shown in country description...")
+    logging.info("🚀 Bot started – state management fixed...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
