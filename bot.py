@@ -21,7 +21,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 UPI_ID = os.getenv("UPI_ID", "example@upi")
-PAYEE_NAME = os.getenv("PAYEE_NAME", "PPTShop")
+PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
+DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete!")
@@ -30,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------- MongoDB Setup ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
-db = mongo_client['PPT_bot']
+db = mongo_client['otp_bot']
 accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
@@ -41,7 +42,7 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 
 # ---------- STATE MACHINE ----------
 user_states = {}
-pending_PPT_requests = {}  # (user_id, phone) -> bool
+pending_otp_requests = {}
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -54,7 +55,7 @@ async def send_main_menu(event):
     ]
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
-    await event.respond("🌟 **PPT Bot Main Menu**", buttons=buttons)
+    await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -74,32 +75,42 @@ async def callback_handler(event):
 
     elif data.startswith("country_"):
         country = data.split("_", 1)[1]
-        count = await accounts_col.count_documents({"country": country, "status": "available"})
-        price = 50
-        if count == 0:
+        # Count and find cheapest price for display
+        pipeline = [
+            {"$match": {"country": country, "status": "available"}},
+            {"$group": {"_id": None, "count": {"$sum": 1}, "min_price": {"$min": "$price"}}}
+        ]
+        agg = await accounts_col.aggregate(pipeline).to_list(length=1)
+        if not agg:
             await event.answer("No accounts left.", alert=True)
             return
+        count = agg[0]["count"]
+        min_price = agg[0].get("min_price", DEFAULT_PRICE)
+        # Show available and minimum price
         btns = [
-            [Button.inline(f"✅ Buy (₹{price})", f"confirm_{country}")],
+            [Button.inline(f"✅ Buy (from ₹{min_price})", f"confirm_{country}")],
             [Button.inline("🔙 Back", b"buy")],
         ]
-        await event.edit(f"🌍 Country: {country}\n📦 Available: {count}\n💵 Price: {price}", buttons=btns)
+        await event.edit(f"🌍 Country: {country}\n📦 Available: {count}\n💵 Price from: ₹{min_price}", buttons=btns)
 
     elif data.startswith("confirm_"):
         country = data.split("_", 1)[1]
         user = await users_col.find_one({"user_id": user_id})
         balance = user["balance"] if user else 0
-        price = 50
-        if balance < price:
-            await event.answer("❌ Insufficient balance!", alert=True)
-            return
 
+        # Pick the cheapest available account
         acc = await accounts_col.find_one_and_update(
             {"country": country, "status": "available"},
-            {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
+            {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}},
+            sort=[("price", 1)]
         )
         if not acc:
             await event.answer("❌ Just sold out!", alert=True)
+            return
+
+        price = acc.get("price", DEFAULT_PRICE)
+        if balance < price:
+            await event.answer(f"❌ Insufficient balance! Need ₹{price}, have ₹{balance}.", alert=True)
             return
 
         await users_col.update_one(
@@ -124,14 +135,14 @@ async def callback_handler(event):
         if twofa_password:
             success_text += f"🔒 **2FA Password:** `{twofa_password}`\n\n"
         success_text += (
-            "Now login to Telegram with this number. PPT will appear here automatically.\n"
-            "If you need a new PPT later, click below."
+            "Now login to Telegram with this number. OTP will appear here automatically.\n"
+            "If you need a new OTP later, click below."
         )
 
         await event.edit(
             success_text,
             buttons=[
-                [Button.inline("🔄 Request New PPT", f"resend_{phone}")],
+                [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
                 [Button.inline("🔙 Main Menu", b"main")]
             ]
         )
@@ -139,17 +150,17 @@ async def callback_handler(event):
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
         if phone not in acc_mgr.clients:
-            await event.answer("❌ Session expired. Cannot receive PPT. Contact admin.", alert=True)
+            await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
             return
-        pending_PPT_requests[(user_id, phone)] = True
-        await event.answer("✅ Waiting for new PPT. Now try to log in again.", alert=True)
+        pending_otp_requests[(user_id, phone)] = True
+        await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
         async def clear_pending():
             await asyncio.sleep(90)
             key = (user_id, phone)
-            if key in pending_PPT_requests:
-                del pending_PPT_requests[key]
+            if key in pending_otp_requests:
+                del pending_otp_requests[key]
                 try:
-                    await bot.send_message(user_id, "⏰ No PPT received within 90 seconds. Please try again.")
+                    await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
                 except:
                     pass
         asyncio.create_task(clear_pending())
@@ -182,7 +193,7 @@ async def callback_handler(event):
             await event.answer("❌ Unauthorized", alert=True)
             return
         btns = [
-            [Button.inline("➕ Add Account (PPT)", b"admin_add_PPT")],
+            [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
             [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
             [Button.inline("📋 List Accounts", b"admin_list")],
             [Button.inline("💰 Add Balance", b"admin_addbal")],
@@ -191,7 +202,7 @@ async def callback_handler(event):
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
 
-    elif data == "admin_add_PPT":
+    elif data == "admin_add_otp":
         await start_add_phone_flow(event)
     elif data == "admin_add_sess":
         await start_add_session_flow(event)
@@ -203,7 +214,7 @@ async def callback_handler(event):
             txt = "No accounts."
         else:
             txt = "📋 **Accounts:**\n" + "\n".join(
-                f"`{a['phone']}` | {a['country']} | {a['status']}" +
+                f"`{a['phone']}` | {a['country']} | {a['status']} | ₹{a.get('price', '?')}" +
                 (f" (buyer:{a['buyer_id']})" if a.get('buyer_id') else "")
                 for a in accounts
             )
@@ -267,16 +278,16 @@ async def callback_handler(event):
     else:
         await event.answer("Unknown action", alert=True)
 
-# ---------- ADD PHONE (PPT) FLOW (unchanged) ----------
+# ---------- ADD PHONE (OTP) FLOW (price step added) ----------
 async def start_add_phone_flow(event):
-    user_states[event.sender_id] = {"action": "add_phone_PPT", "step": "phone"}
+    user_states[event.sender_id] = {"action": "add_phone_otp", "step": "phone"}
     await event.edit("📱 Send the phone number in international format (e.g., +919876543210):",
                      buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
-async def process_phone_PPT_step(event):
+async def process_phone_otp_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
-    if not state or state["action"] != "add_phone_PPT":
+    if not state or state["action"] != "add_phone_otp":
         return
     step = state["step"]
     if step == "phone":
@@ -288,14 +299,14 @@ async def process_phone_PPT_step(event):
             sent = await temp_client.send_code_request(phone)
             state["temp_client"] = temp_client
             state["phone_code_hash"] = sent.phone_code_hash
-            state["step"] = "PPT"
-            await event.respond("✉️ PPT sent! Send the code:",
+            state["step"] = "otp"
+            await event.respond("✉️ OTP sent! Send the code:",
                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
         except Exception as e:
             await temp_client.disconnect()
             await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             user_states.pop(user_id, None)
-    elif step == "PPT":
+    elif step == "otp":
         code = event.message.text.strip()
         temp_client = state["temp_client"]
         try:
@@ -334,24 +345,41 @@ async def process_phone_PPT_step(event):
             user_states.pop(user_id, None)
     elif step == "country":
         country = event.message.text.strip().upper()
-        session_str = state["session"]
+        state["country"] = country
+        state["step"] = "price"
+        await event.respond(f"💵 Send price for this number (e.g., 50):",
+                            buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+    elif step == "price":
+        try:
+            price = float(event.message.text)
+            if price <= 0:
+                raise ValueError
+        except:
+            await event.respond("❌ Invalid price. Send a positive number:",
+                                buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
+        state["price"] = price
+        # Save everything
         phone = state["phone"]
+        country = state["country"]
+        session_str = state["session"]
         twofa_password = state.get("twofa_password")
         insert_data = {
             "phone": phone,
             "country": country,
             "session_string": session_str,
-            "status": "available"
+            "status": "available",
+            "price": price
         }
         if twofa_password:
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, session_str)
-        await event.respond(f"✅ Account `{phone}` ({country}) added successfully!",
+        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- ADD SESSION FLOW (NOW ASKS FOR 2FA PASSWORD MANUALLY) ----------
+# ---------- ADD SESSION FLOW (price step added) ----------
 async def start_add_session_flow(event):
     user_states[event.sender_id] = {"action": "add_session", "step": "session"}
     await event.edit("🔑 Send the session string:",
@@ -370,11 +398,10 @@ async def process_session_step(event):
         try:
             await temp_client.connect()
             if not await temp_client.is_user_authorized():
-                # Session valid but not authorized – likely incomplete login
                 await temp_client.disconnect()
                 await event.respond(
                     "❌ Session authorized nahi hai. Kya aapne incomplete session diya hai?\n"
-                    "Is account ko add karne ke liye 'Add Account (PPT)' use karein.",
+                    "Is account ko add karne ke liye 'Add Account (OTP)' use karein.",
                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]]
                 )
                 user_states.pop(user_id, None)
@@ -383,7 +410,7 @@ async def process_session_step(event):
             phone = me.phone
             state["phone"] = phone
             state["client"] = temp_client
-            state["step"] = "ask_2fa"  # ask for 2FA password manually
+            state["step"] = "ask_2fa"
             await event.respond(
                 f"📱 Number: {phone}\n\n"
                 "🔐 Kya is account ka koi 2FA password hai?\n"
@@ -403,7 +430,21 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
     elif step == "country":
         country = event.message.text.strip().upper()
+        state["country"] = country
+        state["step"] = "price"
+        await event.respond(f"💵 Send price for this number (e.g., 50):",
+                            buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+    elif step == "price":
+        try:
+            price = float(event.message.text)
+            if price <= 0:
+                raise ValueError
+        except:
+            await event.respond("❌ Invalid price. Send a positive number:",
+                                buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
         phone = state["phone"]
+        country = state["country"]
         session_str = state["session_str"]
         client = state["client"]
         new_session = client.session.save()
@@ -412,18 +453,19 @@ async def process_session_step(event):
             "phone": phone,
             "country": country,
             "session_string": new_session,
-            "status": "available"
+            "status": "available",
+            "price": price
         }
         if twofa_password:
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, new_session)
         await client.disconnect()
-        await event.respond(f"✅ Account `{phone}` ({country}) added!",
+        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (QR + admin notify) ----------
+# ---------- DEPOSIT FLOW (screenshot, same) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -440,7 +482,7 @@ async def process_deposit_step(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
         state["amount"] = amount
-        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=PPT_Deposit"
+        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -450,31 +492,45 @@ async def process_deposit_step(event):
             event.chat_id,
             buf,
             caption=f"💳 **Deposit ₹{amount}**\nScan QR or use UPI ID: `{UPI_ID}`\n\n"
-                    "Payment karke Transaction ID yahan bhejo (ya 'done' type karo).",
+                    "Payment karne ke baad uska **screenshot yahan bhejo**.",
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
-        state["step"] = "txn_id"
+        state["step"] = "screenshot"
 
-    elif step == "txn_id":
-        txn_id = event.message.text.strip()
+    elif step == "screenshot":
+        if not event.message.photo:
+            await event.respond("❌ Kripya payment ka screenshot bhejein, text nahi.",
+                                buttons=[[Button.inline("🔙 Cancel", b"main")]])
+            return
         amount = state["amount"]
-        await deposits_col.insert_one({
+        result = await deposits_col.insert_one({
             "user_id": user_id,
             "amount": amount,
-            "transaction_id": txn_id,
+            "proof_type": "screenshot",
             "status": "pending",
             "created_at": datetime.utcnow()
         })
-        # Notify all admins
+        dep_id = result.inserted_id
+
+        photo_bytes = await event.message.download_media(file=bytes)
+        photo_io = io.BytesIO(photo_bytes)
+        photo_io.name = "payment_proof.jpg"
+
         for admin in ADMIN_IDS:
             try:
-                await bot.send_message(admin,
-                    f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTransaction ID: `{txn_id}`\nCheck /admin panel to approve/reject.")
+                await bot.send_file(admin,
+                    photo_io,
+                    caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nProof: Screenshot",
+                    buttons=[
+                        [Button.inline("✅ Approve", f"approve_{dep_id}"),
+                         Button.inline("❌ Reject", f"reject_{dep_id}")]
+                    ])
+                photo_io.seek(0)
             except:
                 pass
+
         await event.respond(
-            f"✅ Deposit request sent!\nAmount: ₹{amount}\nTransaction ID: {txn_id}\n"
-            "Admin will verify and approve shortly.",
+            f"✅ Deposit request submitted!\nAmount: ₹{amount}\nAdmin will verify your screenshot and approve.",
             buttons=[[Button.inline("🔙 Main Menu", b"main")]]
         )
         user_states.pop(user_id, None)
@@ -489,8 +545,8 @@ async def handle_message(event):
         return
 
     action = state.get("action")
-    if action == "add_phone_PPT":
-        await process_phone_PPT_step(event)
+    if action == "add_phone_otp":
+        await process_phone_otp_step(event)
     elif action == "add_session":
         await process_session_step(event)
     elif action == "add_balance":
@@ -542,15 +598,11 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_PPT_requests)
-
-    # Optional: unique indexes
-    # await accounts_col.create_index("phone", unique=True)
-    # await users_col.create_index("user_id", unique=True)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started – session 2FA manual, PPT flow perfect, deposit alert...")
+    logging.info("🚀 Bot started – individual account pricing...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
