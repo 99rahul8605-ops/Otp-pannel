@@ -23,7 +23,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
-# Force join: single (backward) ya multiple
+
+# Force join (multiple channels)
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -57,10 +58,11 @@ pending_otp_requests = {}
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (multiple channels) ----------
+# ---------- FORCE JOIN (FIXED) ----------
 async def is_user_member(user_id):
+    """Check if user is member of all force-join channels. Returns True only if all passed."""
     if not FORCE_JOIN_CHAT_IDS:
-        return True  # no force join
+        return True
     for chat_id in FORCE_JOIN_CHAT_IDS:
         try:
             chat = await bot.get_entity(chat_id)
@@ -68,29 +70,42 @@ async def is_user_member(user_id):
         except UserNotParticipantError:
             return False
         except Exception as e:
-            logging.error(f"Membership check failed for {chat_id}: {e}")
-            # If we can't check, consider as not joined to be safe
+            # If we can't verify (e.g., bot not admin), assume not a member to be safe
+            logging.error(f"Cannot verify membership for {chat_id}: {e}")
             return False
     return True
 
 async def send_join_message(event):
-    """Send a message listing all required channels/group and a Check Again button."""
+    """Send a message with inline Join buttons for each public channel + Check Again."""
+    buttons = []
     lines = []
     for idx, chat_id in enumerate(FORCE_JOIN_CHAT_IDS, start=1):
+        try:
+            entity = await bot.get_entity(chat_id)
+            title = getattr(entity, 'title', chat_id)
+        except:
+            title = chat_id
+
         if chat_id.startswith('@'):
             link = f"https://t.me/{chat_id[1:]}"
-            lines.append(f"{idx}. [{chat_id}]({link})")
+            lines.append(f"{idx}. [{title}]({link})")
+            buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            # Private ID, no direct link
-            lines.append(f"{idx}. Private chat `{chat_id}`")
+            # Private chat – no direct link
+            lines.append(f"{idx}. Private: {title}")
+            buttons.append([Button.inline(f"🔒 {title} (private, join manually)", b"noop")])  # dummy button
+
     join_text = (
         "🔒 **You must join these channels/groups to use the bot:**\n\n" +
         "\n".join(lines) +
         "\n\nAfter joining all, click the button below."
     )
-    await event.respond(join_text, buttons=[Button.inline("✅ Check Again", b"check_join")])
+    # Remove dummy buttons that do nothing
+    valid_buttons = [row for row in buttons if row[0].data != b"noop"]
+    valid_buttons.append([Button.inline("✅ Check Again", b"check_join")])
+    await event.respond(join_text, buttons=valid_buttons)
 
-# ---------- MAIN MENU (simpler for "Main Menu" button) ----------
+# ---------- MAIN MENU ----------
 async def send_main_menu(event):
     user_id = event.sender_id
     if not await is_user_member(user_id):
@@ -112,7 +127,12 @@ async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
 
-    # Force join check for all callbacks except check_join
+    # Ignore dummy noop buttons
+    if data == "noop":
+        await event.answer("This channel must be joined manually.", alert=True)
+        return
+
+    # Check join for all except check_join
     if data != "check_join" and not await is_user_member(user_id):
         await event.answer("You must join all channels first!", alert=True)
         await send_join_message(event)
@@ -120,7 +140,7 @@ async def callback_handler(event):
 
     if data == "check_join":
         if await is_user_member(user_id):
-            # They are now member, send welcome and main menu (like /start)
+            # All joined, send welcome menu (like /start)
             await start_cmd(event)
         else:
             await event.answer("You haven't joined all channels yet!", alert=True)
@@ -218,7 +238,7 @@ async def callback_handler(event):
             ]
         )
 
-        # Notify all admins about the purchase
+        # Notify admins
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -744,7 +764,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with multiple force join channels...")
+    logging.info("🚀 Bot started with fixed force join + inline Join buttons...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
