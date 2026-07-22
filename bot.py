@@ -6,7 +6,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, UserNotParticipantError
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
@@ -23,6 +23,15 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
+# Force join: single (backward) ya multiple
+FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
+FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
+if FORCE_JOIN_LIST_RAW:
+    FORCE_JOIN_CHAT_IDS = [x.strip() for x in FORCE_JOIN_LIST_RAW.split(",") if x.strip()]
+elif FORCE_JOIN_SINGLE:
+    FORCE_JOIN_CHAT_IDS = [FORCE_JOIN_SINGLE]
+else:
+    FORCE_JOIN_CHAT_IDS = []
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete!")
@@ -48,9 +57,45 @@ pending_otp_requests = {}
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
+# ---------- FORCE JOIN (multiple channels) ----------
+async def is_user_member(user_id):
+    if not FORCE_JOIN_CHAT_IDS:
+        return True  # no force join
+    for chat_id in FORCE_JOIN_CHAT_IDS:
+        try:
+            chat = await bot.get_entity(chat_id)
+            await bot.get_permissions(chat, user_id)
+        except UserNotParticipantError:
+            return False
+        except Exception as e:
+            logging.error(f"Membership check failed for {chat_id}: {e}")
+            # If we can't check, consider as not joined to be safe
+            return False
+    return True
+
+async def send_join_message(event):
+    """Send a message listing all required channels/group and a Check Again button."""
+    lines = []
+    for idx, chat_id in enumerate(FORCE_JOIN_CHAT_IDS, start=1):
+        if chat_id.startswith('@'):
+            link = f"https://t.me/{chat_id[1:]}"
+            lines.append(f"{idx}. [{chat_id}]({link})")
+        else:
+            # Private ID, no direct link
+            lines.append(f"{idx}. Private chat `{chat_id}`")
+    join_text = (
+        "🔒 **You must join these channels/groups to use the bot:**\n\n" +
+        "\n".join(lines) +
+        "\n\nAfter joining all, click the button below."
+    )
+    await event.respond(join_text, buttons=[Button.inline("✅ Check Again", b"check_join")])
+
 # ---------- MAIN MENU (simpler for "Main Menu" button) ----------
 async def send_main_menu(event):
     user_id = event.sender_id
+    if not await is_user_member(user_id):
+        await send_join_message(event)
+        return
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy")],
         [Button.inline("💰 My Balance", b"balance")],
@@ -66,6 +111,20 @@ async def send_main_menu(event):
 async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
+
+    # Force join check for all callbacks except check_join
+    if data != "check_join" and not await is_user_member(user_id):
+        await event.answer("You must join all channels first!", alert=True)
+        await send_join_message(event)
+        return
+
+    if data == "check_join":
+        if await is_user_member(user_id):
+            # They are now member, send welcome and main menu (like /start)
+            await start_cmd(event)
+        else:
+            await event.answer("You haven't joined all channels yet!", alert=True)
+        return
 
     # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
@@ -158,6 +217,20 @@ async def callback_handler(event):
                 [Button.inline("🔙 Main Menu", b"main")]
             ]
         )
+
+        # Notify all admins about the purchase
+        for admin in ADMIN_IDS:
+            try:
+                await bot.send_message(admin,
+                    f"🛒 **New Purchase**\n"
+                    f"Buyer: `{user_id}`\n"
+                    f"Phone: `{phone}`\n"
+                    f"Country: {country}\n"
+                    f"Price: ₹{price}\n"
+                    f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                )
+            except:
+                pass
 
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
@@ -581,6 +654,10 @@ async def process_deposit_step(event):
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
     user_id = event.sender_id
+    if not await is_user_member(user_id):
+        await send_join_message(event)
+        return
+
     state = user_states.get(user_id)
     if not state:
         await send_main_menu(event)
@@ -625,22 +702,25 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND (NOW WITH WELCOME + BUTTONS) ----------
+# ---------- /start COMMAND (WITHOUT ADMIN LINE) ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
+    user_id = event.sender_id
     await users_col.update_one(
-        {"user_id": event.sender_id},
+        {"user_id": user_id},
         {"$setOnInsert": {"balance": 0, "joined_at": datetime.utcnow()}},
         upsert=True
     )
 
-    # Detailed welcome message with inline buttons
+    if not await is_user_member(user_id):
+        await send_join_message(event)
+        return
+
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
         "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
-        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n"
-        "⚙️ **Admin Panel** – Manage accounts, set prices, approve deposits.\n\n"
+        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
         "Use the buttons below to get started."
     )
 
@@ -650,7 +730,7 @@ async def start_cmd(event):
         [Button.inline("💳 Deposit", b"deposit")],
         [Button.inline("📜 Order History", b"orders")],
     ]
-    if event.sender_id in ADMIN_IDS:
+    if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
 
     await event.respond(welcome_msg, buttons=buttons)
@@ -664,7 +744,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with detailed welcome message...")
+    logging.info("🚀 Bot started with multiple force join channels...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
