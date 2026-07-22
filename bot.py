@@ -66,7 +66,7 @@ pending_otp_requests = {}
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (with auto invite links) ----------
+# ---------- FORCE JOIN (with auto invite links, only buttons) ----------
 def parse_chat_id(raw_id: str):
     raw = raw_id.strip()
     if raw.startswith('@'):
@@ -108,9 +108,9 @@ async def is_user_member(user_id: int) -> bool:
     return True
 
 async def send_join_message(event):
-    lines = []
+    """Sirf inline buttons, koi channel name/text nahi."""
     buttons = []
-    for idx, raw_id in enumerate(RAW_CHAT_IDS):
+    for raw_id in RAW_CHAT_IDS:
         title = raw_id
         try:
             parsed = parse_chat_id(raw_id)
@@ -121,38 +121,30 @@ async def send_join_message(event):
 
         if raw_id.startswith('@'):
             link = f"https://t.me/{raw_id[1:]}"
-            lines.append(f"{idx+1}. [{title}]({link})")
             buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            # Private chat – auto-generate invite link if bot is admin
+            # Private chat – generate invite link if possible
             invite_link = None
             try:
                 result = await bot(functions.messages.ExportChatInviteRequest(
                     peer=entity,
-                    expire_date=None,      # no expiry
-                    usage_limit=0          # unlimited
+                    expire_date=None,
+                    usage_limit=0
                 ))
                 invite_link = result.link
             except ChatAdminRequiredError:
                 logging.error(f"Bot is not admin in '{raw_id}', cannot generate invite link.")
-            except InviteHashInvalidError:
-                logging.error(f"Invite hash invalid for '{raw_id}'.")
             except Exception as e:
                 logging.error(f"Failed to export invite for '{raw_id}': {type(e).__name__}: {e}")
 
             if invite_link:
-                lines.append(f"{idx+1}. [{title}]({invite_link})")
                 buttons.append([Button.url(f"📢 Join {title}", invite_link)])
             else:
-                lines.append(f"{idx+1}. Private: {title} (join manually)")
+                # No link – dummy button
+                buttons.append([Button.inline(f"🔒 {title} (join manually)", b"noop")])
 
-    join_text = (
-        "🔒 **You must join these channels/groups to use the bot:**\n\n" +
-        "\n".join(lines) +
-        "\n\nAfter joining all, click the button below."
-    )
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
-    await event.respond(join_text, buttons=buttons)
+    await event.respond("🔒 **You must join the channels below to use the bot.**", buttons=buttons)
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -188,6 +180,7 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
+    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice"):
@@ -824,7 +817,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started – auto invite link generation + referral...")
+    logging.info("🚀 Bot started – force join with only buttons, auto invite, referral...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
