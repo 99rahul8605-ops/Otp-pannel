@@ -9,7 +9,7 @@ from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# ---------- Load .env ----------
+# ---------- .env LOAD ----------
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID"))
@@ -19,18 +19,18 @@ MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
-    raise ValueError("Missing required environment variables. Check your .env file.")
+    raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS.")
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------- MongoDB Setup ----------
+# ---------- MONGODB SETUP ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client['otp_bot']
 accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
 
-# ---------- ACCOUNT CLIENT MANAGER (OTP interceptor) ----------
+# ---------- ACCOUNT CLIENT MANAGER ----------
 class AccountManager:
     def __init__(self):
         self.clients = {}
@@ -45,6 +45,7 @@ class AccountManager:
         @client.on(events.NewMessage(from_users=777000))
         async def otp_handler(event):
             text = event.message.message
+            # OTP patterns
             code_match = re.search(r'\b(\d{5,6})\b', text)
             if not code_match:
                 code_match = re.search(r'Login code:\s*(\d+)', text, re.I)
@@ -75,8 +76,8 @@ class AccountManager:
 
 acc_mgr = AccountManager()
 
-# ---------- BOT ----------
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# ---------- BOT INSTANCE (without starting) ----------
+bot = TelegramClient('bot_session', API_ID, API_HASH)
 
 # ---------- STATE MACHINE ----------
 user_states = {}
@@ -92,12 +93,12 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- CALLBACK HANDLER ----------
+# ---------- CALLBACK QUERY HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
-    user_states.pop(user_id, None)
+    user_states.pop(user_id, None)  # clear any ongoing state
 
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
@@ -111,7 +112,7 @@ async def callback_handler(event):
     elif data.startswith("country_"):
         country = data.split("_", 1)[1]
         count = await accounts_col.count_documents({"country": country, "status": "available"})
-        price = 50
+        price = 50  # fixed price, you can make it dynamic
         if count == 0:
             await event.answer("No accounts left.", alert=True)
             return
@@ -130,6 +131,7 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
+        # atomically pick an account
         acc = await accounts_col.find_one_and_update(
             {"country": country, "status": "available"},
             {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
@@ -138,11 +140,13 @@ async def callback_handler(event):
             await event.answer("❌ Just sold out!", alert=True)
             return
 
+        # deduct balance
         await users_col.update_one(
             {"user_id": user_id},
             {"$inc": {"balance": -price}},
             upsert=True
         )
+        # record order
         await orders_col.insert_one({
             "user_id": user_id,
             "account_id": str(acc["_id"]),
@@ -150,6 +154,7 @@ async def callback_handler(event):
             "status": "completed",
             "created_at": datetime.utcnow()
         })
+
         phone = acc["phone"]
         await event.edit(
             f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n\n"
@@ -183,7 +188,7 @@ async def callback_handler(event):
 
     elif data == "admin_list":
         cursor = accounts_col.find({})
-        accounts = await cursor.to_list(length=100)
+        accounts = await cursor.to_list(length=100)  # limit
         if not accounts:
             txt = "No accounts."
         else:
@@ -330,11 +335,10 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- HANDLE ALL MESSAGES ----------
+# ---------- HANDLE ALL TEXT MESSAGES ----------
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
     user_id = event.sender_id
-    text = event.message.text
     state = user_states.get(user_id)
     if not state:
         await send_main_menu(event)
@@ -349,7 +353,7 @@ async def handle_message(event):
         step = state["step"]
         if step == "await_user_id":
             try:
-                uid = int(text)
+                uid = int(event.message.text)
             except:
                 await event.respond("❌ Invalid user ID. Send a numeric ID:",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
@@ -360,7 +364,7 @@ async def handle_message(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
         elif step == "await_amount":
             try:
-                amt = float(text)
+                amt = float(event.message.text)
             except:
                 await event.respond("❌ Invalid amount. Try again:",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
@@ -375,7 +379,7 @@ async def handle_message(event):
                                 buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             user_states.pop(user_id, None)
 
-# ---------- /start command ----------
+# ---------- /start COMMAND ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     await users_col.update_one(
@@ -385,13 +389,19 @@ async def start_cmd(event):
     )
     await send_main_menu(event)
 
-# ---------- MAIN ----------
+# ---------- MAIN FUNCTION ----------
 async def main():
-    # Optional: unique index creation
+    # Start the bot client in the correct event loop
+    await bot.start(bot_token=BOT_TOKEN)
+
+    # Optional: create indexes (uncomment if needed)
     # await accounts_col.create_index("phone", unique=True)
     # await users_col.create_index("user_id", unique=True)
+
+    # Load all available account sessions
     await acc_mgr.load_all()
-    logging.info("Bot started with .env, MongoDB and inline buttons...")
+
+    logging.info("🚀 Bot started with .env + MongoDB + Inline Buttons...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
