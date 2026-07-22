@@ -21,7 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 UPI_ID = os.getenv("UPI_ID", "example@upi")
-PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
+PAYEE_NAME = os.getenv("PAYEE_NAME", "PPTShop")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete!")
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------- MongoDB Setup ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
-db = mongo_client['otp_bot']
+db = mongo_client['PPT_bot']
 accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
@@ -41,7 +41,7 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 
 # ---------- STATE MACHINE ----------
 user_states = {}
-pending_otp_requests = {}  # (user_id, phone) -> bool
+pending_PPT_requests = {}  # (user_id, phone) -> bool
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -54,7 +54,7 @@ async def send_main_menu(event):
     ]
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
-    await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
+    await event.respond("🌟 **PPT Bot Main Menu**", buttons=buttons)
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -124,14 +124,14 @@ async def callback_handler(event):
         if twofa_password:
             success_text += f"🔒 **2FA Password:** `{twofa_password}`\n\n"
         success_text += (
-            "Now login to Telegram with this number. OTP will appear here automatically.\n"
-            "If you need a new OTP later, click below."
+            "Now login to Telegram with this number. PPT will appear here automatically.\n"
+            "If you need a new PPT later, click below."
         )
 
         await event.edit(
             success_text,
             buttons=[
-                [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
+                [Button.inline("🔄 Request New PPT", f"resend_{phone}")],
                 [Button.inline("🔙 Main Menu", b"main")]
             ]
         )
@@ -139,17 +139,17 @@ async def callback_handler(event):
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
         if phone not in acc_mgr.clients:
-            await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
+            await event.answer("❌ Session expired. Cannot receive PPT. Contact admin.", alert=True)
             return
-        pending_otp_requests[(user_id, phone)] = True
-        await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
+        pending_PPT_requests[(user_id, phone)] = True
+        await event.answer("✅ Waiting for new PPT. Now try to log in again.", alert=True)
         async def clear_pending():
             await asyncio.sleep(90)
             key = (user_id, phone)
-            if key in pending_otp_requests:
-                del pending_otp_requests[key]
+            if key in pending_PPT_requests:
+                del pending_PPT_requests[key]
                 try:
-                    await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
+                    await bot.send_message(user_id, "⏰ No PPT received within 90 seconds. Please try again.")
                 except:
                     pass
         asyncio.create_task(clear_pending())
@@ -182,7 +182,7 @@ async def callback_handler(event):
             await event.answer("❌ Unauthorized", alert=True)
             return
         btns = [
-            [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
+            [Button.inline("➕ Add Account (PPT)", b"admin_add_PPT")],
             [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
             [Button.inline("📋 List Accounts", b"admin_list")],
             [Button.inline("💰 Add Balance", b"admin_addbal")],
@@ -191,7 +191,7 @@ async def callback_handler(event):
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
 
-    elif data == "admin_add_otp":
+    elif data == "admin_add_PPT":
         await start_add_phone_flow(event)
     elif data == "admin_add_sess":
         await start_add_session_flow(event)
@@ -267,16 +267,16 @@ async def callback_handler(event):
     else:
         await event.answer("Unknown action", alert=True)
 
-# ---------- ADD PHONE (OTP) FLOW (unchanged) ----------
+# ---------- ADD PHONE (PPT) FLOW (unchanged) ----------
 async def start_add_phone_flow(event):
-    user_states[event.sender_id] = {"action": "add_phone_otp", "step": "phone"}
+    user_states[event.sender_id] = {"action": "add_phone_PPT", "step": "phone"}
     await event.edit("📱 Send the phone number in international format (e.g., +919876543210):",
                      buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
-async def process_phone_otp_step(event):
+async def process_phone_PPT_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
-    if not state or state["action"] != "add_phone_otp":
+    if not state or state["action"] != "add_phone_PPT":
         return
     step = state["step"]
     if step == "phone":
@@ -288,14 +288,14 @@ async def process_phone_otp_step(event):
             sent = await temp_client.send_code_request(phone)
             state["temp_client"] = temp_client
             state["phone_code_hash"] = sent.phone_code_hash
-            state["step"] = "otp"
-            await event.respond("✉️ OTP sent! Send the code:",
+            state["step"] = "PPT"
+            await event.respond("✉️ PPT sent! Send the code:",
                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
         except Exception as e:
             await temp_client.disconnect()
             await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             user_states.pop(user_id, None)
-    elif step == "otp":
+    elif step == "PPT":
         code = event.message.text.strip()
         temp_client = state["temp_client"]
         try:
@@ -374,7 +374,7 @@ async def process_session_step(event):
                 await temp_client.disconnect()
                 await event.respond(
                     "❌ Session authorized nahi hai. Kya aapne incomplete session diya hai?\n"
-                    "Is account ko add karne ke liye 'Add Account (OTP)' use karein.",
+                    "Is account ko add karne ke liye 'Add Account (PPT)' use karein.",
                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]]
                 )
                 user_states.pop(user_id, None)
@@ -440,7 +440,7 @@ async def process_deposit_step(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
         state["amount"] = amount
-        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
+        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=PPT_Deposit"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -489,8 +489,8 @@ async def handle_message(event):
         return
 
     action = state.get("action")
-    if action == "add_phone_otp":
-        await process_phone_otp_step(event)
+    if action == "add_phone_PPT":
+        await process_phone_PPT_step(event)
     elif action == "add_session":
         await process_session_step(event)
     elif action == "add_balance":
@@ -542,7 +542,7 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_PPT_requests)
 
     # Optional: unique indexes
     # await accounts_col.create_index("phone", unique=True)
@@ -550,7 +550,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started – session 2FA manual, OTP flow perfect, deposit alert...")
+    logging.info("🚀 Bot started – session 2FA manual, PPT flow perfect, deposit alert...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
