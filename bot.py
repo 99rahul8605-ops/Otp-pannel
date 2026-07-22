@@ -61,7 +61,7 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- CALLBACK HANDLER (FIXED) ----------
+# ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
@@ -290,7 +290,6 @@ async def callback_handler(event):
 
     # ---------- Country selection for admin add flows ----------
     elif data.startswith("addcountry_"):
-        # Format: addcountry_IN (existing) or addcountry_new (new)
         if data == "addcountry_new":
             state = user_states.get(user_id)
             if not state or state.get("action") not in ("add_phone_otp", "add_session"):
@@ -300,7 +299,7 @@ async def callback_handler(event):
             await event.edit("🌍 Send the new country code (e.g., IN):",
                              buttons=[[Button.inline("🔙 Cancel", b"admin")]])
         else:
-            country = data[len("addcountry_"):]  # e.g., "IN"
+            country = data[len("addcountry_"):]
             state = user_states.get(user_id)
             if not state or state.get("action") not in ("add_phone_otp", "add_session"):
                 await event.answer("❌ Session expired. Please start again.", alert=True)
@@ -626,7 +625,7 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- /start COMMAND ----------
+# ---------- /start COMMAND (Updated with detailed welcome) ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     await users_col.update_one(
@@ -634,6 +633,15 @@ async def start_cmd(event):
         {"$setOnInsert": {"balance": 0, "joined_at": datetime.utcnow()}},
         upsert=True
     )
+    welcome_msg = (
+        "👋 **Welcome to the OTP Shop Bot!**\n\n"
+        "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
+        "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
+        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n"
+        "⚙️ **Admin Panel** – Manage accounts, set prices, approve deposits.\n\n"
+        "Use the buttons below to get started."
+    )
+    await event.respond(welcome_msg)
     await send_main_menu(event)
 
 # ---------- MAIN FUNCTION ----------
@@ -645,7 +653,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started – country selection fixed...")
+    logging.info("🚀 Bot started with detailed start message...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
