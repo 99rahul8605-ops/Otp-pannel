@@ -118,9 +118,8 @@ async def callback_handler(event):
         })
 
         phone = acc["phone"]
-        twofa_password = acc.get("twofa_password")  # may be None
+        twofa_password = acc.get("twofa_password")
 
-        # Compose success message
         success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
         if twofa_password:
             success_text += f"🔒 **2FA Password:** `{twofa_password}`\n\n"
@@ -268,7 +267,7 @@ async def callback_handler(event):
     else:
         await event.answer("Unknown action", alert=True)
 
-# ---------- ADD PHONE (OTP) FLOW ----------
+# ---------- ADD PHONE (OTP) FLOW (unchanged) ----------
 async def start_add_phone_flow(event):
     user_states[event.sender_id] = {"action": "add_phone_otp", "step": "phone"}
     await event.edit("📱 Send the phone number in international format (e.g., +919876543210):",
@@ -324,7 +323,7 @@ async def process_phone_otp_step(event):
             await temp_client.sign_in(password=password)
             session_str = temp_client.session.save()
             state["session"] = session_str
-            state["twofa_password"] = password  # Store the password
+            state["twofa_password"] = password
             state["step"] = "country"
             await temp_client.disconnect()
             await event.respond("🌍 Send country code (e.g., IN, US):",
@@ -337,7 +336,7 @@ async def process_phone_otp_step(event):
         country = event.message.text.strip().upper()
         session_str = state["session"]
         phone = state["phone"]
-        twofa_password = state.get("twofa_password")  # may be None
+        twofa_password = state.get("twofa_password")
         insert_data = {
             "phone": phone,
             "country": country,
@@ -352,7 +351,7 @@ async def process_phone_otp_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- ADD SESSION FLOW (2FA handled) ----------
+# ---------- ADD SESSION FLOW (NOW ASKS FOR 2FA PASSWORD MANUALLY) ----------
 async def start_add_session_flow(event):
     user_states[event.sender_id] = {"action": "add_session", "step": "session"}
     await event.edit("🔑 Send the session string:",
@@ -368,37 +367,40 @@ async def process_session_step(event):
         session_str = event.message.text.strip()
         state["session_str"] = session_str
         temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        password_future = asyncio.get_event_loop().create_future()
-
-        async def get_password():
-            await event.respond("🔒 This account has 2FA. Please send the password:",
-                                buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            state["step"] = "await_password"
-            state["client"] = temp_client
-            state["future"] = password_future
-            return await password_future
-
         try:
-            await temp_client.start(password=get_password)
+            await temp_client.connect()
+            if not await temp_client.is_user_authorized():
+                # Session valid but not authorized – likely incomplete login
+                await temp_client.disconnect()
+                await event.respond(
+                    "❌ Session authorized nahi hai. Kya aapne incomplete session diya hai?\n"
+                    "Is account ko add karne ke liye 'Add Account (OTP)' use karein.",
+                    buttons=[[Button.inline("🔙 Admin Menu", b"admin")]]
+                )
+                user_states.pop(user_id, None)
+                return
             me = await temp_client.get_me()
             phone = me.phone
             state["phone"] = phone
             state["client"] = temp_client
-            state["step"] = "country"
-            await event.respond(f"📱 Number: {phone}\n🌍 Send country code (e.g., IN):",
-                                buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            state["step"] = "ask_2fa"  # ask for 2FA password manually
+            await event.respond(
+                f"📱 Number: {phone}\n\n"
+                "🔐 Kya is account ka koi 2FA password hai?\n"
+                "Password bhejo, ya 'skip' type karo.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
         except Exception as e:
             await temp_client.disconnect()
             await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             user_states.pop(user_id, None)
-    elif step == "await_password":
-        password = event.message.text.strip()
-        future = state.get("future")
-        if future and not future.done():
-            future.set_result(password)
-            # Also store password in state
-            state["twofa_password"] = password
-        return
+    elif step == "ask_2fa":
+        answer = event.message.text.strip()
+        if answer.lower() != "skip":
+            state["twofa_password"] = answer
+        state["step"] = "country"
+        await event.respond("🌍 Send country code (e.g., IN):",
+                            buttons=[[Button.inline("🔙 Cancel", b"admin")]])
     elif step == "country":
         country = event.message.text.strip().upper()
         phone = state["phone"]
@@ -548,7 +550,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with 2FA password delivery + admin deposit alert...")
+    logging.info("🚀 Bot started – session 2FA manual, OTP flow perfect, deposit alert...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
