@@ -1,3 +1,4 @@
+# bot.py
 import os
 import io
 import asyncio
@@ -41,6 +42,7 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 
 # ---------- STATE MACHINE ----------
 user_states = {}
+pending_otp_requests = {}  # (user_id, phone) -> bool (for resend OTP feature)
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -117,11 +119,37 @@ async def callback_handler(event):
         })
 
         phone = acc["phone"]
+        # Send success message with Resend OTP button
         await event.edit(
             f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n\n"
-            "Now login to Telegram with this number, OTP will appear here automatically.",
-            buttons=[[Button.inline("🔙 Main Menu", b"main")]]
+            "Now login to Telegram with this number. OTP will appear here automatically.\n"
+            "If you need a new OTP later, click below.",
+            buttons=[
+                [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
+                [Button.inline("🔙 Main Menu", b"main")]
+            ]
         )
+
+    elif data.startswith("resend_"):
+        phone = data.split("_", 1)[1]
+        # Check if bot is still logged into this account
+        if phone not in acc_mgr.clients:
+            await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
+            return
+        # Set a pending request for this user+phone (will be cleared when OTP arrives)
+        pending_otp_requests[(user_id, phone)] = True
+        await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
+        # Optionally, set a timeout to clear pending if no OTP within 90 seconds
+        async def clear_pending():
+            await asyncio.sleep(90)
+            key = (user_id, phone)
+            if key in pending_otp_requests:
+                del pending_otp_requests[key]
+                try:
+                    await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
+                except:
+                    pass
+        asyncio.create_task(clear_pending())
 
     elif data == "balance":
         user = await users_col.find_one({"user_id": user_id})
@@ -384,7 +412,7 @@ async def process_deposit_step(event):
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
-        buf.name = "qr_code.png"   # 📌 Photo detect karne ke liye
+        buf.name = "qr_code.png"
         await bot.send_file(
             event.chat_id,
             buf,
@@ -474,7 +502,7 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
 
     # Optional: unique indexes
     # await accounts_col.create_index("phone", unique=True)
@@ -482,7 +510,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with QR photo fix...")
+    logging.info("🚀 Bot started with Resend OTP feature...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
