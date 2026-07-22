@@ -75,7 +75,7 @@ async def get_bot_username():
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (with auto invite links, only buttons) ----------
+# ---------- FORCE JOIN (improved) ----------
 def parse_chat_id(raw_id: str):
     raw = raw_id.strip()
     if raw.startswith('@'):
@@ -86,40 +86,42 @@ def parse_chat_id(raw_id: str):
         logging.error(f"Invalid chat ID format: {raw}")
         return None
 
+async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
+    """Check if user is member of a single chat (raw ID)."""
+    parsed = parse_chat_id(chat_id_raw)
+    if parsed is None:
+        return False
+    try:
+        entity = await bot.get_entity(parsed)
+        await bot.get_permissions(entity, user_id)
+        return True
+    except UserNotParticipantError:
+        return False
+    except (ChatAdminRequiredError, ChannelPrivateError) as e:
+        logging.error(f"Cannot verify membership for '{chat_id_raw}': {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Error checking '{chat_id_raw}': {type(e).__name__}: {e}")
+        return False
+
 async def is_user_member(user_id: int) -> bool:
+    """True only if user is member of ALL force-join chats."""
     if not RAW_CHAT_IDS:
         return True
     for raw_id in RAW_CHAT_IDS:
-        parsed = parse_chat_id(raw_id)
-        if parsed is None:
-            continue
-        try:
-            entity = await bot.get_entity(parsed)
-        except ValueError as e:
-            logging.error(f"get_entity failed for '{raw_id}': {e}")
-            return False
-        except Exception as e:
-            logging.error(f"Unexpected error resolving entity '{raw_id}': {type(e).__name__}: {e}")
-            return False
-        try:
-            await bot.get_permissions(entity, user_id)
-        except UserNotParticipantError:
-            return False
-        except ChatAdminRequiredError:
-            logging.error(f"Bot is not admin in '{raw_id}'. Membership check impossible. Make the bot admin.")
-            return False
-        except ChannelPrivateError:
-            logging.error(f"Bot cannot access private channel '{raw_id}'. Add bot as admin.")
-            return False
-        except Exception as e:
-            logging.error(f"Error checking membership for '{raw_id}': {type(e).__name__}: {e}")
+        if not await is_user_member_of(raw_id, user_id):
             return False
     return True
 
 async def send_join_message(event):
-    """Sirf inline buttons, koi channel name/text nahi."""
+    """Sirf unhi chats ke liye Join button dikhaye jo abhi tak join nahi hue."""
     buttons = []
+    # Check each chat and add only those not joined
     for raw_id in RAW_CHAT_IDS:
+        # Skip if already member
+        if await is_user_member_of(raw_id, event.sender_id):
+            continue
+
         title = raw_id
         try:
             parsed = parse_chat_id(raw_id)
@@ -132,7 +134,6 @@ async def send_join_message(event):
             link = f"https://t.me/{raw_id[1:]}"
             buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            # Private chat – generate invite link if possible
             invite_link = None
             try:
                 result = await bot(functions.messages.ExportChatInviteRequest(
@@ -149,11 +150,45 @@ async def send_join_message(event):
             if invite_link:
                 buttons.append([Button.url(f"📢 Join {title}", invite_link)])
             else:
-                # No link – dummy button
                 buttons.append([Button.inline(f"🔒 {title} (join manually)", b"noop")])
+
+    if not buttons:
+        # All joined – no join message needed; this case is handled before calling this function.
+        return
 
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
     await event.respond("🔒 **You must join the channels below to use the bot.**", buttons=buttons)
+
+# ---------- WELCOME MENU (used by both /start and check_join) ----------
+async def show_welcome_menu(event, user_id):
+    """Send welcome message with buttons, suitable for both message and callback events."""
+    # Get dynamic bot username
+    username = await get_bot_username()
+    ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
+
+    welcome_msg = (
+        "👋 **Welcome to the OTP Shop Bot!**\n\n"
+        "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
+        "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
+        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
+        "Use the buttons below to get started."
+    )
+
+    buttons = [
+        [Button.inline("🛒 Buy Account", b"buy")],
+        [Button.inline("💰 My Balance", b"balance")],
+        [Button.inline("💳 Deposit", b"deposit")],
+        [Button.inline("📜 Order History", b"orders")],
+        [Button.inline("👥 Referral Program", b"referral_info")],
+    ]
+    if user_id in ADMIN_IDS:
+        buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
+
+    # If called from a callback, we edit the existing message; otherwise respond
+    if hasattr(event, 'edit'):
+        await event.edit(welcome_msg, buttons=buttons)
+    else:
+        await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN MENU ----------
 async def send_main_menu(event):
@@ -179,9 +214,12 @@ async def callback_handler(event):
 
     if data == "check_join":
         if await is_user_member(user_id):
-            await start_cmd(event)
+            # All joined – show welcome menu, not start_cmd
+            await show_welcome_menu(event, user_id)
         else:
             await event.answer("You haven't joined all channels yet!", alert=True)
+            # Re-send updated join message (only remaining channels)
+            await send_join_message(event)
         return
 
     if not await is_user_member(user_id):
@@ -414,10 +452,7 @@ async def callback_handler(event):
         user_id_dep = deposit["user_id"]
         amount = deposit["amount"]
 
-        # Update deposit status
         await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "approved"}})
-
-        # Add balance to user
         await users_col.update_one(
             {"user_id": user_id_dep},
             {"$inc": {"balance": amount}},
@@ -842,25 +877,7 @@ async def start_cmd(event):
         await send_join_message(event)
         return
 
-    welcome_msg = (
-        "👋 **Welcome to the OTP Shop Bot!**\n\n"
-        "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
-        "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
-        "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
-        "Use the buttons below to get started."
-    )
-
-    buttons = [
-        [Button.inline("🛒 Buy Account", b"buy")],
-        [Button.inline("💰 My Balance", b"balance")],
-        [Button.inline("💳 Deposit", b"deposit")],
-        [Button.inline("📜 Order History", b"orders")],
-        [Button.inline("👥 Referral Program", b"referral_info")],
-    ]
-    if user_id in ADMIN_IDS:
-        buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
-
-    await event.respond(welcome_msg, buttons=buttons)
+    await show_welcome_menu(event, user_id)
 
 # ---------- MAIN FUNCTION ----------
 async def main():
@@ -868,7 +885,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with clean referral button...")
+    logging.info("🚀 Bot started with fixed Check Again & filtered join list...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
