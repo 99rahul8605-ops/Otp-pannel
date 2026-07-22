@@ -1,3 +1,4 @@
+# account_manager.py
 import re
 import logging
 from telethon import TelegramClient, events
@@ -6,12 +7,13 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(self, accounts_col, bot_client, api_id, api_hash):
+    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
         self.api_hash = api_hash
         self.clients = {}
+        self.pending_requests = pending_requests  # dict of (user_id, phone) -> bool
 
     async def add_client(self, phone, session_str):
         if phone in self.clients:
@@ -28,14 +30,20 @@ class AccountManager:
                 code_match = re.search(r'Login code:\s*(\d+)', text, re.I)
             if code_match:
                 otp = code_match.group(1)
-                # Find buyer from MongoDB
                 buyer = await self.accounts_col.find_one({"phone": phone, "status": "sold"})
                 buyer_id = buyer["buyer_id"] if buyer else None
                 if buyer_id:
                     try:
+                        # Always send OTP to buyer (auto-forward)
                         await self.bot.send_message(buyer_id, f"🔐 **Login OTP:** `{otp}`\n(Account: {phone})")
                     except Exception as e:
                         logging.error(f"Failed to send OTP to {buyer_id}: {e}")
+                    # Check if there is a pending request for this user+phone
+                    key = (buyer_id, phone)
+                    if key in self.pending_requests:
+                        # Clear the pending flag and notify user (already sent above)
+                        del self.pending_requests[key]
+                        logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
         logging.info(f"✅ Client started for {phone}")
 
     async def remove_client(self, phone):
