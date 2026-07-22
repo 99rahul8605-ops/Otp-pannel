@@ -6,7 +6,12 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, UserNotParticipantError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    UserNotParticipantError,
+    ChatAdminRequiredError,
+    ChannelPrivateError
+)
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
@@ -24,15 +29,15 @@ UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
 
-# Force join (multiple channels)
+# Force join (multiple channels, support for username & numeric ID)
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
-    FORCE_JOIN_CHAT_IDS = [x.strip() for x in FORCE_JOIN_LIST_RAW.split(",") if x.strip()]
+    RAW_CHAT_IDS = [x.strip() for x in FORCE_JOIN_LIST_RAW.split(",") if x.strip()]
 elif FORCE_JOIN_SINGLE:
-    FORCE_JOIN_CHAT_IDS = [FORCE_JOIN_SINGLE]
+    RAW_CHAT_IDS = [FORCE_JOIN_SINGLE]
 else:
-    FORCE_JOIN_CHAT_IDS = []
+    RAW_CHAT_IDS = []
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete!")
@@ -54,55 +59,78 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 user_states = {}
 pending_otp_requests = {}
 
-# ---------- HELPER ----------
+# ---------- HELPER: Get existing countries ----------
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (GRACEFUL HANDLING) ----------
-async def is_user_member(user_id):
-    if not FORCE_JOIN_CHAT_IDS:
-        return True
-    for chat_id in FORCE_JOIN_CHAT_IDS:
+# ---------- FORCE JOIN (IMPROVED) ----------
+def parse_chat_id(raw_id: str):
+    """Convert raw ID string to a format Telethon can use (str for username, int for numeric ID)."""
+    raw = raw_id.strip()
+    if raw.startswith('@'):
+        return raw  # username, Telethon accepts as string
+    try:
+        chat_id_int = int(raw)
+    except ValueError:
+        logging.error(f"Invalid chat ID format: {raw}")
+        return None
+    # Telethon's get_entity can handle integer IDs (including -100 prefix)
+    return chat_id_int
+
+async def is_user_member(user_id: int) -> bool:
+    """Check if user is member of all force-join chats. Returns True only if all passed."""
+    if not RAW_CHAT_IDS:
+        return True  # force join disabled
+    for raw_id in RAW_CHAT_IDS:
+        parsed = parse_chat_id(raw_id)
+        if parsed is None:
+            continue  # skip invalid IDs (already logged)
         try:
-            chat = await bot.get_entity(chat_id)
-            await bot.get_permissions(chat, user_id)
-        except UserNotParticipantError:
+            entity = await bot.get_entity(parsed)
+        except ValueError as e:
+            logging.error(f"get_entity failed for '{raw_id}': {e}")
             return False
         except Exception as e:
-            # Agar bot entity/resolve nahi kar sakta ya permission nahi le sakta, to is chat ko verify nahi kar sakte.
-            # Treat as not joined to be safe, aur log me batao.
-            logging.error(f"Cannot verify membership for {chat_id}: {e}")
+            logging.error(f"Unexpected error resolving entity '{raw_id}': {type(e).__name__}: {e}")
+            return False
+        try:
+            await bot.get_permissions(entity, user_id)
+        except UserNotParticipantError:
+            return False  # user not a member
+        except ChatAdminRequiredError:
+            logging.error(f"Bot is not admin in '{raw_id}'. Membership check impossible. Make the bot admin.")
+            return False
+        except ChannelPrivateError:
+            logging.error(f"Bot cannot access private channel '{raw_id}'. Add bot as admin.")
+            return False
+        except Exception as e:
+            logging.error(f"Error checking membership for '{raw_id}': {type(e).__name__}: {e}")
             return False
     return True
 
 async def send_join_message(event):
-    """Join prompt with inline buttons for public channels/group, text for private."""
+    """Send a message listing required channels with Join buttons (public) and a Check Again button."""
     lines = []
     buttons = []
-    for idx, chat_id in enumerate(FORCE_JOIN_CHAT_IDS, start=1):
-        # Try to get entity for nice name
-        title = chat_id
+    for idx, raw_id in enumerate(RAW_CHAT_IDS, start=1):
+        title = raw_id
         try:
-            entity = await bot.get_entity(chat_id)
-            title = getattr(entity, 'title', chat_id)
+            parsed = parse_chat_id(raw_id)
+            entity = await bot.get_entity(parsed)
+            title = getattr(entity, 'title', raw_id)
         except Exception as e:
-            logging.warning(f"Could not get entity for {chat_id}: {e}")
-            title = chat_id
-
-        if chat_id.startswith('@'):
-            link = f"https://t.me/{chat_id[1:]}"
+            logging.warning(f"Could not get title for {raw_id}: {e}")
+        if raw_id.startswith('@'):
+            link = f"https://t.me/{raw_id[1:]}"
             lines.append(f"{idx}. [{title}]({link})")
             buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            # Private: no direct join link
             lines.append(f"{idx}. Private: {title} (join manually)")
-
     join_text = (
         "🔒 **You must join these channels/groups to use the bot:**\n\n" +
         "\n".join(lines) +
         "\n\nAfter joining all, click the button below."
     )
-    # Add Check Again button
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
     await event.respond(join_text, buttons=buttons)
 
@@ -128,6 +156,7 @@ async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
 
+    # Always allow check_join
     if data == "check_join":
         if await is_user_member(user_id):
             await start_cmd(event)
@@ -135,6 +164,7 @@ async def callback_handler(event):
             await event.answer("You haven't joined all channels yet!", alert=True)
         return
 
+    # For all other callbacks, verify membership
     if not await is_user_member(user_id):
         await event.answer("You must join all channels first!", alert=True)
         await send_join_message(event)
@@ -232,7 +262,7 @@ async def callback_handler(event):
             ]
         )
 
-        # Notify admins
+        # Notify all admins
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -594,7 +624,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW ----------
+# ---------- DEPOSIT FLOW (Screenshot) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -625,7 +655,6 @@ async def process_deposit_step(event):
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
         state["step"] = "screenshot"
-
     elif step == "screenshot":
         if not event.message.photo:
             await event.respond("❌ Kripya payment ka screenshot bhejein, text nahi.",
@@ -640,11 +669,9 @@ async def process_deposit_step(event):
             "created_at": datetime.utcnow()
         })
         dep_id = result.inserted_id
-
         photo_bytes = await event.message.download_media(file=bytes)
         photo_io = io.BytesIO(photo_bytes)
         photo_io.name = "payment_proof.jpg"
-
         for admin in ADMIN_IDS:
             try:
                 await bot.send_file(admin,
@@ -657,7 +684,6 @@ async def process_deposit_step(event):
                 photo_io.seek(0)
             except:
                 pass
-
         await event.respond(
             f"✅ Deposit request submitted!\nAmount: ₹{amount}\nAdmin will verify your screenshot and approve.",
             buttons=[[Button.inline("🔙 Main Menu", b"main")]]
@@ -671,12 +697,10 @@ async def handle_message(event):
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
-
     state = user_states.get(user_id)
     if not state:
         await send_main_menu(event)
         return
-
     action = state.get("action")
     if action == "add_phone_otp":
         await process_phone_otp_step(event)
@@ -725,11 +749,9 @@ async def start_cmd(event):
         {"$setOnInsert": {"balance": 0, "joined_at": datetime.utcnow()}},
         upsert=True
     )
-
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
-
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
@@ -737,7 +759,6 @@ async def start_cmd(event):
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
         "Use the buttons below to get started."
     )
-
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy")],
         [Button.inline("💰 My Balance", b"balance")],
@@ -746,19 +767,15 @@ async def start_cmd(event):
     ]
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
-
     await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN FUNCTION ----------
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
-
     await acc_mgr.load_all()
-
-    logging.info("🚀 Bot started with force join (private channel support)...")
+    logging.info("🚀 Bot started with bulletproof force join...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
