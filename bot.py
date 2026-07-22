@@ -362,7 +362,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (QR photo bhejega) ----------
+# ---------- DEPOSIT FLOW (QR photo fix) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -384,15 +384,13 @@ async def process_deposit_step(event):
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
-        # 🔥 QR as photo, not file
+        buf.name = "qr_code.png"   # 📌 Photo detect karne ke liye
         await bot.send_file(
             event.chat_id,
             buf,
             caption=f"💳 **Deposit ₹{amount}**\nScan QR or use UPI ID: `{UPI_ID}`\n\n"
                     "Payment karke Transaction ID yahan bhejo (ya 'done' type karo).",
-            buttons=[[Button.inline("🔙 Cancel", b"main")]],
-            file_name="qr_code.png",   # ← important
-            force_document=False       # photo ke roop mein
+            buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
         state["step"] = "txn_id"
 
