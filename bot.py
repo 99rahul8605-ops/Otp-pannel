@@ -10,7 +10,7 @@ from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
-from account_manager import AccountManager   # <-- yahan import karo
+from account_manager import AccountManager   # alag file se import
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -310,7 +310,6 @@ async def process_phone_otp_step(event):
             "session_string": session_str,
             "status": "available"
         })
-        # Add to account manager
         await acc_mgr.add_client(phone, session_str)
         await event.respond(f"✅ Account `{phone}` ({country}) added successfully!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
@@ -363,7 +362,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (with QR) ----------
+# ---------- DEPOSIT FLOW (FIXED) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -385,8 +384,10 @@ async def process_deposit_step(event):
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
-        await event.respond(
-            file=buf,
+        # FIX: Use send_file instead of event.respond for file + caption
+        await bot.send_file(
+            event.chat_id,
+            buf,
             caption=f"💳 **Deposit ₹{amount}**\nScan QR or use UPI ID: `{UPI_ID}`\n\n"
                     "Payment karke Transaction ID yahan bhejo (ya 'done' type karo).",
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
@@ -470,18 +471,15 @@ async def start_cmd(event):
 
 # ---------- MAIN FUNCTION ----------
 async def main():
-    # Start bot client
     await bot.start(bot_token=BOT_TOKEN)
 
-    # Initialize account manager with required references
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH)
 
-    # Optional: create indexes
+    # Optional indexes
     # await accounts_col.create_index("phone", unique=True)
     # await users_col.create_index("user_id", unique=True)
 
-    # Load all available account sessions
     await acc_mgr.load_all()
 
     logging.info("🚀 Bot started with separate OTP manager...")
