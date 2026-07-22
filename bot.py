@@ -79,26 +79,33 @@ async def callback_handler(event):
 
     elif data.startswith("country_"):
         country = data.split("_", 1)[1]
-        # Group available accounts by price
+        # Get total stock count for this country
+        total_count = await accounts_col.count_documents({"country": country, "status": "available"})
+        if total_count == 0:
+            await event.answer("No accounts left.", alert=True)
+            return
+
+        # Get price-wise grouping
         pipeline = [
             {"$match": {"country": country, "status": "available"}},
             {"$group": {"_id": "$price", "count": {"$sum": 1}}},
             {"$sort": {"_id": 1}}
         ]
         agg = await accounts_col.aggregate(pipeline).to_list(length=None)
-        if not agg:
-            await event.answer("No accounts left.", alert=True)
-            return
         btns = []
         for item in agg:
             price = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
             count = item["count"]
             btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}")])
         btns.append([Button.inline("🔙 Back", b"buy")])
-        await event.edit(f"🌍 Country: {country}\n💵 Select a price:", buttons=btns)
+
+        # 🆕 Show total stock in description
+        await event.edit(
+            f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
+            buttons=btns
+        )
 
     elif data.startswith("price_"):
-        # Example: price_IN_50
         parts = data.split("_", 2)
         country = parts[1]
         price = float(parts[2])
@@ -108,7 +115,6 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        # Pick one available account with exact price
         acc = await accounts_col.find_one_and_update(
             {"country": country, "status": "available", "price": price},
             {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}},
@@ -280,11 +286,10 @@ async def callback_handler(event):
     elif data == "main":
         await send_main_menu(event)
 
-    # ---------- NEW: Country selection callback for admin add flows ----------
+    # ---------- Country selection callback for admin add flows ----------
     elif data == "select_country":
-        # Admin selected "➕ New Country" from country list during addition
         state = user_states.get(user_id)
-        if not state or ("action" not in state and "add_phone_otp" not in state.get("action","") and "add_session" not in state.get("action","")):
+        if not state or (state.get("action") not in ("add_phone_otp", "add_session")):
             await event.answer("Invalid state", alert=True)
             return
         state["step"] = "country_manual"
@@ -292,8 +297,7 @@ async def callback_handler(event):
                          buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
     elif data.startswith("country_select_"):
-        # Admin selected an existing country from the list
-        country = data.split("_", 2)[2]  # format: country_select_IN
+        country = data.split("_", 2)[2]  # country_select_IN
         state = user_states.get(user_id)
         if not state:
             await event.answer("Invalid state", alert=True)
@@ -359,7 +363,6 @@ async def process_phone_otp_step(event):
         session_str = temp_client.session.save()
         state["session"] = session_str
         state["step"] = "choose_country"
-        # Show existing countries + New Country button
         existing = await get_existing_countries()
         btns = []
         for c in existing:
@@ -648,7 +651,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started – flexible country picker + price-based buying...")
+    logging.info("🚀 Bot started – total stock shown in country description...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
