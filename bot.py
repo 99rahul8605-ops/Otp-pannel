@@ -58,7 +58,7 @@ pending_otp_requests = {}
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (FIXED) ----------
+# ---------- FORCE JOIN (GRACEFUL HANDLING) ----------
 async def is_user_member(user_id):
     if not FORCE_JOIN_CHAT_IDS:
         return True
@@ -69,19 +69,24 @@ async def is_user_member(user_id):
         except UserNotParticipantError:
             return False
         except Exception as e:
+            # Agar bot entity/resolve nahi kar sakta ya permission nahi le sakta, to is chat ko verify nahi kar sakte.
+            # Treat as not joined to be safe, aur log me batao.
             logging.error(f"Cannot verify membership for {chat_id}: {e}")
             return False
     return True
 
 async def send_join_message(event):
-    """Send message with Join buttons for each public channel, text for private, + Check Again."""
+    """Join prompt with inline buttons for public channels/group, text for private."""
     lines = []
     buttons = []
     for idx, chat_id in enumerate(FORCE_JOIN_CHAT_IDS, start=1):
+        # Try to get entity for nice name
+        title = chat_id
         try:
             entity = await bot.get_entity(chat_id)
             title = getattr(entity, 'title', chat_id)
-        except:
+        except Exception as e:
+            logging.warning(f"Could not get entity for {chat_id}: {e}")
             title = chat_id
 
         if chat_id.startswith('@'):
@@ -89,7 +94,7 @@ async def send_join_message(event):
             lines.append(f"{idx}. [{title}]({link})")
             buttons.append([Button.url(f"📢 Join {title}", link)])
         else:
-            # Private chat, no join link
+            # Private: no direct join link
             lines.append(f"{idx}. Private: {title} (join manually)")
 
     join_text = (
@@ -97,7 +102,7 @@ async def send_join_message(event):
         "\n".join(lines) +
         "\n\nAfter joining all, click the button below."
     )
-    # Add the Check Again button as last row
+    # Add Check Again button
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
     await event.respond(join_text, buttons=buttons)
 
@@ -753,7 +758,7 @@ async def main():
 
     await acc_mgr.load_all()
 
-    logging.info("🚀 Bot started with fixed force join...")
+    logging.info("🚀 Bot started with force join (private channel support)...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
