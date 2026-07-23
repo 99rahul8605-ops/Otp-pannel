@@ -12,7 +12,7 @@ class AccountManager:
         self.api_id = api_id
         self.api_hash = api_hash
         self.clients = {}
-        self.pending_requests = pending_requests  # dict (user_id, phone) -> bool
+        self.pending_requests = pending_requests
 
     async def add_client(self, phone, session_str):
         if phone in self.clients:
@@ -30,7 +30,7 @@ class AccountManager:
             if code_match:
                 otp = code_match.group(1)
 
-                # 🔧 Always get the most recent buyer (in case number resold)
+                # 🔧 Always get the most recent buyer
                 buyer_doc = await self.accounts_col.find_one(
                     {"phone": phone, "status": "sold"},
                     sort=[("sold_at", -1)]
@@ -44,8 +44,11 @@ class AccountManager:
                         msg += f"\n🔐 **Password:** `{twofa_password}`"
                     msg += "\n\n⚠️ Note: The Re‑Request button is active for 72 hours. After that, you'll need to request a new number."
 
-                    # Logout button for this number
-                    buttons = [[Button.inline("🔓 Logout", f"logout_{phone}")]]
+                    # 🔥 Both buttons: Request New OTP & Logout from Bot
+                    buttons = [[
+                        Button.inline("🔄 Request New OTP", f"resend_{phone}"),
+                        Button.inline("🔓 Logout from Bot", f"logout_{phone}")
+                    ]]
 
                     try:
                         await self.bot.send_message(buyer_id, msg, buttons=buttons)
