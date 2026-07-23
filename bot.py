@@ -213,7 +213,7 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- CALLBACK HANDLER (abbreviated for brevity, same as before except deposit) ----------
+# ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
@@ -232,13 +232,11 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
-    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice"):
         user_states.pop(user_id, None)
 
-    # --- Referral Info Button ---
     if data == "referral_info":
         username = await get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -255,7 +253,6 @@ async def callback_handler(event):
         await event.edit(text, buttons=[[Button.inline("🔙 Back", b"main")]])
         return
 
-    # --- User purchase flow (same as before) ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -451,7 +448,7 @@ async def callback_handler(event):
 
     elif data == "deposit":
         user_states[user_id] = {"action": "deposit", "step": "amount"}
-        await event.edit("💵 Enter the amount you want to deposit (₹):",
+        await event.edit(f"💵 Enter the amount you want to deposit (Min ₹{MIN_DEPOSIT}):",
                          buttons=[[Button.inline("🔙 Cancel", b"main")]])
 
     elif data == "orders":
@@ -822,7 +819,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (with min deposit limit & proper QR) ----------
+# ---------- DEPOSIT FLOW (min deposit check & QR) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -839,22 +836,18 @@ async def process_deposit_step(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
 
-        # Minimum deposit check
         if amount < MIN_DEPOSIT:
             await event.respond(f"❌ Minimum deposit amount is ₹{MIN_DEPOSIT}. Please enter a higher amount.",
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
 
         state["amount"] = amount
-
-        # Generate UPI QR code
         upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
-        buf.name = "qr_code.png"   # ensures photo, not file
-
+        buf.name = "qr_code.png"
         await bot.send_file(
             event.chat_id,
             buf,
@@ -996,7 +989,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with min deposit limit & QR fix...")
+    logging.info("🚀 Bot started with min deposit message & QR fix...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
