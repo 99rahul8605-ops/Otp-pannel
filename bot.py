@@ -30,6 +30,15 @@ UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5"))
+LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
+if LOGS_CHANNEL_ID:
+    try:
+        LOGS_CHANNEL_ID = int(LOGS_CHANNEL_ID)
+    except ValueError:
+        LOGS_CHANNEL_ID = None
+        logging.warning("LOGS_CHANNEL_ID is not a valid integer, logs disabled.")
+else:
+    LOGS_CHANNEL_ID = None
 
 # Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
@@ -70,6 +79,14 @@ async def get_bot_username():
         me = await bot.get_me()
         bot_username = me.username
     return bot_username
+
+# ---------- LOGS CHANNEL HELPER ----------
+async def log_event(text):
+    if LOGS_CHANNEL_ID:
+        try:
+            await bot.send_message(LOGS_CHANNEL_ID, text)
+        except Exception as e:
+            logging.error(f"Failed to send log to channel: {e}")
 
 # ---------- HELPER ----------
 async def get_existing_countries():
@@ -265,12 +282,10 @@ async def callback_handler(event):
         )
 
     elif data.startswith("price_"):
-        # Show confirmation message
         parts = data.split("_", 2)
         country = parts[1]
         price = float(parts[2])
         stock = await accounts_col.count_documents({"country": country, "status": "available", "price": price})
-        # Store intent in state
         user_states[user_id] = {"action": "awaiting_confirmation", "country": country, "price": price}
         confirm_text = (
             "👋 Dear customer, after you agree to the terms and click the confirm button, "
@@ -294,7 +309,7 @@ async def callback_handler(event):
             return
         country = state["country"]
         price = state["price"]
-        # Perform purchase
+
         user = await users_col.find_one({"user_id": user_id})
         balance = user["balance"] if user else 0
         if balance < price:
@@ -344,25 +359,45 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
-        # Notify admins
+        # Buyer info for logs and admin notification
+        try:
+            buyer_entity = await bot.get_entity(user_id)
+            buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
+        except:
+            buyer_name = str(user_id)
+
+        updated_user = await users_col.find_one({"user_id": user_id})
+        new_balance = updated_user["balance"] if updated_user else 0
+
+        # Admin notification
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
                     f"🛒 **New Purchase**\n"
-                    f"Buyer: `{user_id}`\n"
+                    f"Buyer: `{user_id}` - {buyer_name}\n"
                     f"Phone: `{phone}`\n"
                     f"Country: {country}\n"
                     f"Price: ₹{price}\n"
+                    f"Balance After Purchase: ₹{new_balance}\n"
                     f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
                 )
             except:
                 pass
 
+        # Log to channel
+        await log_event(
+            f"🛒 **Purchase**\n"
+            f"Buyer: [{buyer_name}](tg://user?id={user_id}) (`{user_id}`)\n"
+            f"Phone: `{phone}`\n"
+            f"Country: {country}\n"
+            f"Price: ₹{price}\n"
+            f"Balance After: ₹{new_balance}\n"
+            f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+        )
+
     elif data == "cancel_purchase":
-        # Clear state and go back to price selection for that country (if available)
         state = user_states.pop(user_id, None)
         if state and state.get("action") == "awaiting_confirmation":
-            # Go back to the price list for the same country
             country = state["country"]
             total_count = await accounts_col.count_documents({"country": country, "status": "available"})
             if total_count == 0:
@@ -497,6 +532,8 @@ async def callback_handler(event):
             upsert=True
         )
 
+        # Referral bonus logic
+        bonus_paid = False
         user_doc = await users_col.find_one({"user_id": user_id_dep})
         if user_doc and user_doc.get("referred_by"):
             if not user_doc.get("referral_bonus_paid"):
@@ -515,12 +552,21 @@ async def callback_handler(event):
                         {"user_id": user_id_dep},
                         {"$set": {"referral_bonus_paid": True}}
                     )
+                    bonus_paid = True
                     try:
                         await bot.send_message(referrer_id,
                             f"🎉 Your referral {user_id_dep} has deposited ₹{total}.\n"
                             f"You earned ₹{REFERRAL_BONUS} referral bonus!")
                     except:
                         pass
+                    # Log referral bonus
+                    await log_event(
+                        f"🎁 **Referral Bonus**\n"
+                        f"Referrer: [{referrer_id}](tg://user?id={referrer_id})\n"
+                        f"Referred User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
+                        f"Total Deposits: ₹{total}\n"
+                        f"Bonus: ₹{REFERRAL_BONUS}"
+                    )
 
         try:
             await bot.send_message(user_id_dep,
@@ -529,6 +575,15 @@ async def callback_handler(event):
             pass
 
         await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+
+        # Log deposit approval
+        await log_event(
+            f"✅ **Deposit Approved**\n"
+            f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
+            f"Amount: ₹{amount}\n"
+            f"Referral Bonus: {'Yes' if bonus_paid else 'No'}\n"
+            f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+        )
 
     elif data.startswith("reject_"):
         dep_id = data.split("_", 1)[1]
@@ -832,6 +887,14 @@ async def process_deposit_step(event):
         )
         user_states.pop(user_id, None)
 
+        # Log deposit request
+        await log_event(
+            f"💳 **Deposit Request**\n"
+            f"User: [{user_id}](tg://user?id={user_id})\n"
+            f"Amount: ₹{amount}\n"
+            f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+        )
+
 # ---------- HANDLE ALL TEXT MESSAGES ----------
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
@@ -922,7 +985,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with confirmation step before purchase...")
+    logging.info("🚀 Bot started with logs channel...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
