@@ -1,6 +1,6 @@
 import re
 import logging
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +30,7 @@ class AccountManager:
             if code_match:
                 otp = code_match.group(1)
 
-                # 🔧 FIX: find the MOST RECENT buyer for this phone (sort by sold_at descending)
+                # 🔧 Always get the most recent buyer (in case number resold)
                 buyer_doc = await self.accounts_col.find_one(
                     {"phone": phone, "status": "sold"},
                     sort=[("sold_at", -1)]
@@ -38,18 +38,35 @@ class AccountManager:
                 buyer_id = buyer_doc["buyer_id"] if buyer_doc else None
 
                 if buyer_id:
+                    msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
+                    twofa_password = buyer_doc.get("twofa_password")
+                    if twofa_password:
+                        msg += f"\n🔐 **Password:** `{twofa_password}`"
+                    msg += "\n\n⚠️ Note: The Re‑Request button is active for 72 hours. After that, you'll need to request a new number."
+
+                    # Logout button for this number
+                    buttons = [[Button.inline("🔓 Logout", f"logout_{phone}")]]
+
                     try:
-                        await self.bot.send_message(buyer_id, f"🔐 **Login OTP:** `{otp}`\n(Account: {phone})")
+                        await self.bot.send_message(buyer_id, msg, buttons=buttons)
                     except Exception as e:
                         logging.error(f"Failed to send OTP to {buyer_id}: {e}")
 
-                    # If there's a pending resend request for this user+phone, clear it
                     key = (buyer_id, phone)
                     if key in self.pending_requests:
                         del self.pending_requests[key]
                         logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
 
         logging.info(f"✅ Client started for {phone}")
+
+    async def logout_client(self, phone):
+        """Terminate the Telethon client for this phone number."""
+        if phone in self.clients:
+            await self.clients[phone].disconnect()
+            del self.clients[phone]
+            logging.info(f"Client for {phone} logged out by user request.")
+        else:
+            logging.warning(f"Attempt to logout non-existent client {phone}")
 
     async def remove_client(self, phone):
         if phone in self.clients:
