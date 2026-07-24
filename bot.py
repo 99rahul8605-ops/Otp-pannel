@@ -62,6 +62,7 @@ accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
 deposits_col = db['deposits']
+settings_col = db['settings']  # Added for dynamic settings like support link
 
 # ---------- BOT INSTANCE ----------
 bot = TelegramClient('bot_session', API_ID, API_HASH)
@@ -79,6 +80,22 @@ async def get_bot_username():
         me = await bot.get_me()
         bot_username = me.username
     return bot_username
+
+# ---------- SETTINGS HELPERS ----------
+async def get_support_link():
+    """Fetch the support link from DB, fallback to env or None."""
+    setting = await settings_col.find_one({"key": "support_link"})
+    if setting:
+        return setting.get("value")
+    return os.getenv("SUPPORT_LINK", "").strip() or None
+
+async def set_support_link(link: str):
+    """Update or insert the support link in DB."""
+    await settings_col.update_one(
+        {"key": "support_link"},
+        {"$set": {"value": link, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
 
 # ---------- LOGS CHANNEL HELPER ----------
 async def log_event(text):
@@ -183,6 +200,10 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("📜 Order History", b"orders")],
         [Button.inline("👥 Referral Program", b"referral_info")],
     ]
+    # Add dynamic Support button
+    support_link = await get_support_link()
+    if support_link:
+        buttons.append([Button.url("📞 Support", support_link)])
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     if isinstance(event, events.CallbackQuery.Event):
@@ -202,6 +223,10 @@ async def send_main_menu(event):
         [Button.inline("💳 Deposit", b"deposit")],
         [Button.inline("📜 Order History", b"orders")],
     ]
+    # Add dynamic Support button
+    support_link = await get_support_link()
+    if support_link:
+        buttons.append([Button.url("📞 Support", support_link)])
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
@@ -228,7 +253,7 @@ async def callback_handler(event):
     # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
-                "admin_deposits", "admin_setprice"):
+                "admin_deposits", "admin_setprice", "admin_support"):
         user_states.pop(user_id, None)
 
     # --- Logout button callback ---
@@ -486,6 +511,7 @@ async def callback_handler(event):
             [Button.inline("💰 Add Balance", b"admin_addbal")],
             [Button.inline("💲 Set Price", b"admin_setprice")],
             [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
+            [Button.inline("📞 Set Support Link", b"admin_support")],  # NEW
             [Button.inline("🔙 Back", b"main")],
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
@@ -612,6 +638,22 @@ async def callback_handler(event):
 
     elif data == "main":
         await send_main_menu(event)
+
+    # ---------- NEW: Admin Set Support Link ----------
+    elif data == "admin_support":
+        if user_id not in ADMIN_IDS:
+            await event.answer("❌ Unauthorized", alert=True)
+            return
+        current = await get_support_link()
+        current_display = f"`{current}`" if current else "*Not set*"
+        user_states[user_id] = {"action": "set_support_link", "step": "await_link"}
+        await event.edit(
+            f"📞 **Set Support Link**\n\n"
+            f"Current: {current_display}\n\n"
+            f"Send the new support link (e.g., `https://t.me/your_support_username` or `t.me/...`).\n"
+            f"Send `remove` to delete the support link.",
+            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+        )
 
     # ---------- Country selection for admin add flows ----------
     elif data.startswith("addcountry_"):
@@ -953,6 +995,26 @@ async def handle_message(event):
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
+    elif action == "set_support_link":  # NEW
+        step = state.get("step")
+        if step == "await_link":
+            link = event.message.text.strip()
+            if link.lower() == "remove":
+                await settings_col.delete_one({"key": "support_link"})
+                await event.respond("✅ Support link removed.",
+                                    buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            else:
+                # Basic validation
+                if not (link.startswith("http://") or link.startswith("https://") or link.startswith("t.me/")):
+                    await event.respond(
+                        "❌ Invalid link. Please send a valid URL starting with `http://`, `https://`, or `t.me/`.\nTry again:",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                    )
+                    return
+                await set_support_link(link)
+                await event.respond(f"✅ Support link updated to:\n`{link}`",
+                                    buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            user_states.pop(user_id, None)
     else:
         await send_main_menu(event)
 
