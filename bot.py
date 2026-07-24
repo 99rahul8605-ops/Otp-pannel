@@ -30,6 +30,9 @@ UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5"))
+# NEW: Minimum deposit amount
+MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10"))
+
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
 if LOGS_CHANNEL_ID:
     try:
@@ -487,8 +490,11 @@ async def callback_handler(event):
 
     elif data == "deposit":
         user_states[user_id] = {"action": "deposit", "step": "amount"}
-        await event.edit("💵 Enter the amount you want to deposit (₹):",
-                         buttons=[[Button.inline("🔙 Cancel", b"main")]])
+        # Show minimum deposit amount in prompt
+        await event.edit(
+            f"💵 Enter the amount you want to deposit (₹) – Minimum deposit is ₹{MIN_DEPOSIT}:",
+            buttons=[[Button.inline("🔙 Cancel", b"main")]]
+        )
 
     elif data == "orders":
         cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
@@ -889,9 +895,18 @@ async def process_deposit_step(event):
             amount = float(event.message.text)
             if amount <= 0:
                 raise ValueError
+            # NEW: Check minimum deposit
+            if amount < MIN_DEPOSIT:
+                await event.respond(
+                    f"❌ Minimum deposit is ₹{MIN_DEPOSIT}. Please enter a valid amount:",
+                    buttons=[[Button.inline("🔙 Cancel", b"main")]]
+                )
+                return
         except:
-            await event.respond("❌ Invalid amount. Enter again:",
-                                buttons=[[Button.inline("🔙 Cancel", b"main")]])
+            await event.respond(
+                f"❌ Invalid amount. Minimum is ₹{MIN_DEPOSIT}. Enter again:",
+                buttons=[[Button.inline("🔙 Cancel", b"main")]]
+            )
             return
         state["amount"] = amount
         upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
@@ -998,7 +1013,7 @@ async def handle_message(event):
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
-    elif action == "set_support_link":  # NEW
+    elif action == "set_support_link":
         step = state.get("step")
         if step == "await_link":
             link = event.message.text.strip()
