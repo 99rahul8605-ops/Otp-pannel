@@ -65,7 +65,10 @@ deposits_col = db['deposits']
 settings_col = db['settings']  # Added for dynamic settings like support link
 
 # ---------- BOT INSTANCE ----------
-bot = TelegramClient('bot_session', API_ID, API_HASH)
+# Use bot token hash as part of session name so changing token creates fresh session
+import hashlib
+session_name = "bot_session_" + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:8]
+bot = TelegramClient(session_name, API_ID, API_HASH)
 
 # ---------- STATE MACHINE ----------
 user_states = {}
