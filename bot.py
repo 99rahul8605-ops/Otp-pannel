@@ -113,27 +113,40 @@ async def log_event(text):
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- SESSION VALIDATION (YOUR LOGIC) ----------
+# ---------- SESSION VALIDATION (FIXED - uses persistent client if available) ----------
 async def is_session_valid(phone: str) -> bool:
-    """Check if the session for the given phone is still active."""
+    """Check if the session for the given phone is still active.
+    Uses the persistent client if it exists to avoid disconnecting it."""
     account = await accounts_col.find_one({"phone": phone})
     if not account or not account.get("session_string"):
         return False
 
-    session_str = account["session_string"]
-    temp = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    try:
-        await temp.connect()
-        await temp.get_me()                # Primary check
-        await temp.get_dialogs(limit=1)    # Extra verification
-        return True
-    except Exception:
-        return False
-    finally:
+    # Prefer the persistent client if it is loaded
+    client = acc_mgr.clients.get(phone)
+    if client:
         try:
-            await temp.disconnect()
-        except:
-            pass
+            if not client.is_connected():
+                await client.connect()
+            await client.get_me()                # Primary check
+            return True
+        except Exception:
+            return False
+    else:
+        # No persistent client → create a temporary one (will be disconnected)
+        session_str = account["session_string"]
+        temp = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        try:
+            await temp.connect()
+            await temp.get_me()
+            await temp.get_dialogs(limit=1)     # Extra verification
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                await temp.disconnect()
+            except:
+                pass
 
 # ---------- FORCE JOIN (unchanged) ----------
 def parse_chat_id(raw_id: str):
@@ -393,14 +406,14 @@ async def callback_handler(event):
         for acc in available_accounts:
             phone = acc["phone"]
 
-            # REAL session check using your is_session_valid
+            # REAL session check using persistent client if possible
             if not await is_session_valid(phone):
                 # Mark invalid and remove from cache if present
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "invalid", "invalid_reason": "session_inactive"}}
                 )
-                # Remove from acc_mgr.clients if it exists
+                # Remove from acc_mgr.clients if it exists (and disconnect)
                 if acc_mgr and phone in acc_mgr.clients:
                     try:
                         await acc_mgr.clients[phone].disconnect()
@@ -1125,7 +1138,7 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with strict session validation (your logic).")
+    logging.info("🚀 Bot started with strict session validation (preserving OTP).")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
