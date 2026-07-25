@@ -47,6 +47,17 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
+# NEW: Update channel for public updates (masked)
+UPDATE_CHANNEL_ID = os.getenv("UPDATE_CHANNEL_ID", "").strip()
+if UPDATE_CHANNEL_ID:
+    try:
+        UPDATE_CHANNEL_ID = int(UPDATE_CHANNEL_ID)
+    except ValueError:
+        UPDATE_CHANNEL_ID = None
+        logging.warning("UPDATE_CHANNEL_ID is not a valid integer, updates disabled.")
+else:
+    UPDATE_CHANNEL_ID = None
+
 BROADCAST_CHANNEL_ID = os.getenv("BROADCAST_CHANNEL_ID", "").strip()
 if BROADCAST_CHANNEL_ID:
     try:
@@ -111,42 +122,49 @@ async def set_support_link(link: str):
     )
 
 def mask_phone(phone: str) -> str:
-    """Mask phone number: show first 2-3 digits and last 4 digits."""
+    """Mask phone number: show country code and last 4 digits."""
     if not phone:
         return "Unknown"
-    # Remove any non-digit characters? Keep as is but we assume format like +919876543210
-    # Show country code and last 4 digits
     if len(phone) <= 6:
-        return phone  # too short, show as is
-    # If starts with '+', keep that and first 2-3 digits
+        return phone
     if phone.startswith('+'):
-        # e.g., +919876543210 -> +91*****3210
         country_code = phone[:3] if len(phone) > 3 else phone[:2]
         last4 = phone[-4:]
         return f"{country_code}*****{last4}"
     else:
-        # No country code, just show first 2 and last 4
         return f"{phone[:2]}*****{phone[-4:]}"
 
+# ---------- LOGGING ----------
 async def log_event(text: str):
-    """Send a log message to the logs channel with masked phone numbers and bot username."""
+    """Send full‑detail log to LOGS_CHANNEL_ID (no masking)."""
     if not LOGS_CHANNEL_ID:
         return
-    # Mask phone numbers in the text (simple regex replacement)
-    # Find all phone-like patterns: +XX... or just digits with length > 6
-    import re
-    def replacer(match):
-        full = match.group(0)
-        return mask_phone(full)
-    # This regex finds + followed by digits or just digits (at least 7 digits)
-    masked_text = re.sub(r'(\+\d+|\d{7,})', replacer, text)
-    # Add bot username
     bot_name = await get_bot_username()
-    final_text = f"🤖 @{bot_name}\n{masked_text}"
+    final_text = f"🤖 @{bot_name}\n{text}"
     try:
         await bot.send_message(LOGS_CHANNEL_ID, final_text)
     except Exception as e:
         logging.error(f"Failed to send log to channel: {e}")
+
+async def log_update(text: str):
+    """Send public update to UPDATE_CHANNEL_ID with masked phone numbers and no user IDs."""
+    if not UPDATE_CHANNEL_ID:
+        return
+    # Mask phone numbers
+    import re
+    def replacer(match):
+        full = match.group(0)
+        return mask_phone(full)
+    masked_text = re.sub(r'(\+\d+|\d{7,})', replacer, text)
+    # Remove any user ID references (like `user_id:` or `tg://user?id=...`)
+    masked_text = re.sub(r'user_id:\s*\d+', '', masked_text, flags=re.IGNORECASE)
+    masked_text = re.sub(r'\[.*?\]\(tg://user\?id=\d+\)', 'User', masked_text)
+    bot_name = await get_bot_username()
+    final_text = f"🤖 @{bot_name}\n{masked_text}"
+    try:
+        await bot.send_message(UPDATE_CHANNEL_ID, final_text)
+    except Exception as e:
+        logging.error(f"Failed to send update: {e}")
 
 # ---------- FORCE JOIN ----------
 def parse_chat_id(raw_id: str):
@@ -505,8 +523,10 @@ async def callback_handler(event):
                         await bot.send_message(admin, msg_full)
                     except:
                         pass
-                # Channel log: masked phone
+                # Logs channel: full details
                 await log_event(f"⚠️ Account expired & removed\nPhone: {phone}\nCountry: {country}\nPrice: ₹{price}")
+                # Update channel: masked
+                await log_update(f"⚠️ An account was removed (expired) – Country: {country}")
                 continue
             else:
                 result = await accounts_col.find_one_and_update(
@@ -560,7 +580,7 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
-        # Admin DMs: full details (unmasked)
+        # --- LOGGING ---
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -570,6 +590,7 @@ async def callback_handler(event):
         updated_user = await users_col.find_one({"user_id": user_id})
         new_balance = updated_user["balance"] if updated_user else 0
 
+        # Admin DMs: full details
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -584,15 +605,23 @@ async def callback_handler(event):
             except:
                 pass
 
-        # Channel log: masked phone, no user ID
+        # Logs channel: full details
         await log_event(
             f"🛒 **Purchase**\n"
-            f"Buyer: {buyer_name}\n"
-            f"Phone: {phone}\n"
+            f"Buyer: {buyer_name} (ID: {user_id})\n"
+            f"Phone: `{phone}`\n"
             f"Country: {country}\n"
             f"Price: ₹{price}\n"
             f"Balance After: ₹{new_balance}\n"
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+        )
+
+        # Update channel: public (masked, no user ID)
+        await log_update(
+            f"🛒 **New Purchase**\n"
+            f"Country: {country}\n"
+            f"Price: ₹{price}\n"
+            f"Phone: {phone}\n"  # will be masked by log_update
         )
 
     elif data == "cancel_purchase":
@@ -795,7 +824,7 @@ async def callback_handler(event):
                             f"You earned ₹{REFERRAL_BONUS} referral bonus!")
                     except:
                         pass
-                    # Channel log: masked user IDs?
+                    # Logs channel: full details (including referrer)
                     await log_event(
                         f"🎁 **Referral Bonus**\n"
                         f"Referrer ID: {referrer_id}\n"
@@ -803,6 +832,8 @@ async def callback_handler(event):
                         f"Total Deposits: ₹{total}\n"
                         f"Bonus: ₹{REFERRAL_BONUS}"
                     )
+                    # Update channel: just a summary (no IDs)
+                    await log_update(f"🎁 Referral bonus paid: ₹{REFERRAL_BONUS}")
 
         # Admin DMs: full details
         for admin in ADMIN_IDS:
@@ -816,6 +847,18 @@ async def callback_handler(event):
             except:
                 pass
 
+        # Logs channel: full details
+        await log_event(
+            f"✅ **Deposit Approved**\n"
+            f"User ID: {user_id_dep}\n"
+            f"Amount: ₹{amount}\n"
+            f"Referral Bonus: {'Yes' if bonus_paid else 'No'}\n"
+            f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+        )
+
+        # Update channel: public (only deposit approved)
+        await log_update(f"✅ **Deposit Approved**\nAmount: ₹{amount}")
+
         try:
             await bot.send_message(user_id_dep,
                                    f"✅ Deposit of ₹{amount} approved! Balance updated.")
@@ -823,7 +866,6 @@ async def callback_handler(event):
             pass
 
         await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-        # Channel log: masked user ID? we can keep it but we'll mask phone numbers only – user IDs are already not shown in channel logs.
 
     elif data.startswith("reject_"):
         dep_id = data.split("_", 1)[1]
@@ -1139,13 +1181,14 @@ async def process_deposit_step(event):
             buttons=[[Button.inline("🔙 Main Menu", b"main")]]
         )
         user_states.pop(user_id, None)
-        # Channel log: masked phone (not shown here because no phone in deposit)
+        # Logs channel: full details
         await log_event(
             f"💳 **Deposit Request**\n"
             f"User ID: {user_id}\n"
             f"Amount: ₹{amount}\n"
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
+        # Update channel: we only send on approval, not on request
 
 # ---------- BROADCAST ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s+.*)'))
@@ -1354,7 +1397,7 @@ async def main():
         logging.error(f"❌ Failed to start bot: {e}")
         return
 
-    logging.info("🚀 Bot ready. Logs channel will show masked phone numbers and bot username.")
+    logging.info("🚀 Bot ready. Logs channel: full details | Update channel: public (masked)")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
