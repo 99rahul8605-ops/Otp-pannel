@@ -11,7 +11,8 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    InviteHashInvalidError
+    InviteHashInvalidError,
+    FloodWaitError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -30,7 +31,6 @@ UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5"))
-# NEW: Minimum deposit amount
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10"))
 
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
@@ -42,6 +42,17 @@ if LOGS_CHANNEL_ID:
         logging.warning("LOGS_CHANNEL_ID is not a valid integer, logs disabled.")
 else:
     LOGS_CHANNEL_ID = None
+
+# Broadcast channel for pinning
+BROADCAST_CHANNEL_ID = os.getenv("BROADCAST_CHANNEL_ID", "").strip()
+if BROADCAST_CHANNEL_ID:
+    try:
+        BROADCAST_CHANNEL_ID = int(BROADCAST_CHANNEL_ID)
+    except ValueError:
+        BROADCAST_CHANNEL_ID = None
+        logging.warning("BROADCAST_CHANNEL_ID is not a valid integer, pin disabled.")
+else:
+    BROADCAST_CHANNEL_ID = None
 
 # Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
@@ -65,10 +76,9 @@ accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
 deposits_col = db['deposits']
-settings_col = db['settings']  # Added for dynamic settings like support link
+settings_col = db['settings']
 
 # ---------- BOT INSTANCE ----------
-# Use bot token hash as part of session name so changing token creates fresh session
 import hashlib
 session_name = "bot_session_" + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:8]
 bot = TelegramClient(session_name, API_ID, API_HASH)
@@ -89,14 +99,12 @@ async def get_bot_username():
 
 # ---------- SETTINGS HELPERS ----------
 async def get_support_link():
-    """Fetch the support link from DB, fallback to env or None."""
     setting = await settings_col.find_one({"key": "support_link"})
     if setting:
         return setting.get("value")
     return os.getenv("SUPPORT_LINK", "").strip() or None
 
 async def set_support_link(link: str):
-    """Update or insert the support link in DB."""
     await settings_col.update_one(
         {"key": "support_link"},
         {"$set": {"value": link, "updated_at": datetime.utcnow()}},
@@ -115,7 +123,7 @@ async def log_event(text):
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN (improved) ----------
+# ---------- FORCE JOIN ----------
 def parse_chat_id(raw_id: str):
     raw = raw_id.strip()
     if raw.startswith('@'):
@@ -206,7 +214,6 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("📜 Order History", b"orders")],
         [Button.inline("👥 Referral Program", b"referral_info")],
     ]
-    # Add dynamic Support button
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
@@ -229,13 +236,38 @@ async def send_main_menu(event):
         [Button.inline("💳 Deposit", b"deposit")],
         [Button.inline("📜 Order History", b"orders")],
     ]
-    # Add dynamic Support button
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
+
+# ---------- SESSION VALIDITY CHECK ----------
+async def is_account_session_valid(phone: str) -> bool:
+    client = acc_mgr.clients.get(phone)
+    if client:
+        try:
+            if not client.is_connected():
+                await client.connect()
+            return await client.is_user_authorized()
+        except Exception as e:
+            logging.error(f"Error checking existing client for {phone}: {e}")
+            return False
+    else:
+        account = await accounts_col.find_one({"phone": phone})
+        if not account or not account.get("session_string"):
+            return False
+        session_str = account["session_string"]
+        temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        try:
+            await temp_client.connect()
+            valid = await temp_client.is_user_authorized()
+            await temp_client.disconnect()
+            return valid
+        except Exception as e:
+            logging.error(f"Error checking temp client for {phone}: {e}")
+            return False
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -256,7 +288,6 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
-    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice", "admin_support"):
@@ -274,7 +305,7 @@ async def callback_handler(event):
             pass
         return
 
-    # --- Referral Info Button ---
+    # --- Referral Info ---
     if data == "referral_info":
         username = await get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -291,7 +322,7 @@ async def callback_handler(event):
         await event.edit(text, buttons=[[Button.inline("🔙 Back", b"main")]])
         return
 
-    # --- User purchase flow ---
+    # --- Buy flow ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -345,6 +376,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
+    # ---------- UPDATED PURCHASE LOGIC WITH SESSION VALIDATION ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -359,14 +391,54 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        acc = await accounts_col.find_one_and_update(
-            {"country": country, "status": "available", "price": price},
-            {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}},
-            sort=[("price", 1)]
-        )
-        if not acc:
-            await event.answer("❌ Just sold out!", alert=True)
+        cursor = accounts_col.find({
+            "country": country,
+            "status": "available",
+            "price": price
+        }).sort("_id", 1)
+
+        accounts = await cursor.to_list(length=None)
+        if not accounts:
+            await event.answer("❌ No accounts available for this selection.", alert=True)
             return
+
+        sold_account = None
+        for acc in accounts:
+            phone = acc["phone"]
+            if not await is_account_session_valid(phone):
+                await accounts_col.update_one(
+                    {"_id": acc["_id"]},
+                    {"$set": {"status": "invalid", "invalid_reason": "session_expired"}}
+                )
+                msg = f"⚠️ **Account expired**\nPhone: `{phone}`\nCountry: {country}\nPrice: ₹{price}\nRemoved from stock."
+                for admin in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin, msg)
+                    except:
+                        pass
+                await log_event(msg)
+                continue
+            else:
+                result = await accounts_col.find_one_and_update(
+                    {"_id": acc["_id"], "status": "available"},
+                    {"$set": {
+                        "status": "sold",
+                        "buyer_id": user_id,
+                        "sold_at": datetime.utcnow()
+                    }}
+                )
+                if result:
+                    sold_account = result
+                    break
+                else:
+                    continue
+
+        if not sold_account:
+            await event.answer("❌ No valid accounts left. Please try another country or price.", alert=True)
+            return
+
+        phone = sold_account["phone"]
+        twofa_password = sold_account.get("twofa_password")
 
         await users_col.update_one(
             {"user_id": user_id},
@@ -375,16 +447,13 @@ async def callback_handler(event):
         )
         await orders_col.insert_one({
             "user_id": user_id,
-            "account_id": str(acc["_id"]),
-            "phone": acc["phone"],
+            "account_id": str(sold_account["_id"]),
+            "phone": phone,
             "country": country,
             "amount": price,
             "status": "completed",
             "created_at": datetime.utcnow()
         })
-
-        phone = acc["phone"]
-        twofa_password = acc.get("twofa_password")
 
         success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
         if twofa_password:
@@ -402,7 +471,6 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
-        # Buyer info for logs and admin notification
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -412,7 +480,6 @@ async def callback_handler(event):
         updated_user = await users_col.find_one({"user_id": user_id})
         new_balance = updated_user["balance"] if updated_user else 0
 
-        # Admin notification
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -427,7 +494,6 @@ async def callback_handler(event):
             except:
                 pass
 
-        # Log to channel
         await log_event(
             f"🛒 **Purchase**\n"
             f"Buyer: [{buyer_name}](tg://user?id={user_id}) (`{user_id}`)\n"
@@ -490,7 +556,6 @@ async def callback_handler(event):
 
     elif data == "deposit":
         user_states[user_id] = {"action": "deposit", "step": "amount"}
-        # Show minimum deposit amount in prompt
         await event.edit(
             f"💵 Enter the amount you want to deposit (₹) – Minimum deposit is ₹{MIN_DEPOSIT}:",
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
@@ -520,7 +585,7 @@ async def callback_handler(event):
             [Button.inline("💰 Add Balance", b"admin_addbal")],
             [Button.inline("💲 Set Price", b"admin_setprice")],
             [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
-            [Button.inline("📞 Set Support Link", b"admin_support")],  # NEW
+            [Button.inline("📞 Set Support Link", b"admin_support")],
             [Button.inline("🔙 Back", b"main")],
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
@@ -579,7 +644,6 @@ async def callback_handler(event):
             upsert=True
         )
 
-        # Referral bonus logic
         bonus_paid = False
         user_doc = await users_col.find_one({"user_id": user_id_dep})
         if user_doc and user_doc.get("referred_by"):
@@ -621,8 +685,6 @@ async def callback_handler(event):
             pass
 
         await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-
-        # Log deposit approval
         await log_event(
             f"✅ **Deposit Approved**\n"
             f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
@@ -648,7 +710,7 @@ async def callback_handler(event):
     elif data == "main":
         await send_main_menu(event)
 
-    # ---------- NEW: Admin Set Support Link ----------
+    # ---------- Admin Support Link ----------
     elif data == "admin_support":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -895,7 +957,6 @@ async def process_deposit_step(event):
             amount = float(event.message.text)
             if amount <= 0:
                 raise ValueError
-            # NEW: Check minimum deposit
             if amount < MIN_DEPOSIT:
                 await event.respond(
                     f"❌ Minimum deposit is ₹{MIN_DEPOSIT}. Please enter a valid amount:",
@@ -957,14 +1018,130 @@ async def process_deposit_step(event):
             buttons=[[Button.inline("🔙 Main Menu", b"main")]]
         )
         user_states.pop(user_id, None)
-
-        # Log deposit request
         await log_event(
             f"💳 **Deposit Request**\n"
             f"User: [{user_id}](tg://user?id={user_id})\n"
             f"Amount: ₹{amount}\n"
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
+
+# ---------- BROADCAST COMMAND ----------
+@bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s+.*)'))
+async def broadcast_command(event):
+    user_id = event.sender_id
+    if user_id not in ADMIN_IDS:
+        await event.respond("❌ You are not authorized to use this command.")
+        return
+
+    # Parse flags
+    args = event.message.text.split()
+    flags = set()
+    text_parts = []
+    for arg in args[1:]:
+        if arg.startswith('--'):
+            flags.add(arg[2:])
+        else:
+            text_parts.append(arg)
+    text = ' '.join(text_parts)
+
+    # Determine if we are replying to a message
+    reply = await event.get_reply_message()
+    if reply:
+        if 'f' in flags:
+            # Forward the replied message
+            message_to_send = reply
+        else:
+            # Send the text of the replied message (or the text of the original message)
+            if reply.text:
+                message_to_send = reply.text
+            else:
+                await event.respond("❌ The replied message has no text to broadcast.")
+                return
+    else:
+        if not text:
+            await event.respond("❌ Please provide a message to broadcast, or reply to a message.")
+            return
+        message_to_send = text
+
+    # Get all users
+    all_users = await users_col.find({}, {"user_id": 1}).to_list(length=None)
+    if not all_users:
+        await event.respond("❌ No users in database.")
+        return
+
+    # Confirm
+    confirm_msg = await event.respond(
+        f"📢 **Broadcast to {len(all_users)} users**\n"
+        f"Flags: {', '.join(flags) if flags else 'None'}\n"
+        f"Message preview: {str(message_to_send)[:100]}...\n\n"
+        "Reply with **yes** to confirm, or **no** to cancel."
+    )
+
+    # Wait for admin's confirmation reply
+    @bot.on(events.NewMessage(from_users=user_id, func=lambda e: e.is_private and e.text.lower() in ('yes', 'no')))
+    async def confirm_handler(confirm_event):
+        if confirm_event.text.lower() == 'no':
+            await confirm_event.respond("❌ Broadcast cancelled.")
+            return
+        # Proceed with broadcast
+        await confirm_event.respond(f"🔄 Broadcasting to {len(all_users)} users...")
+        success = 0
+        failed = 0
+        semaphore = asyncio.Semaphore(50)  # limit concurrent sends
+
+        async def send_one(user_doc):
+            nonlocal success, failed
+            uid = user_doc['user_id']
+            try:
+                async with semaphore:
+                    if isinstance(message_to_send, str):
+                        await bot.send_message(uid, message_to_send)
+                    else:
+                        # Forward the message
+                        await bot.forward_messages(uid, message_to_send)
+                    success += 1
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds)
+                # retry once
+                try:
+                    if isinstance(message_to_send, str):
+                        await bot.send_message(uid, message_to_send)
+                    else:
+                        await bot.forward_messages(uid, message_to_send)
+                    success += 1
+                except:
+                    failed += 1
+            except:
+                failed += 1
+
+        # Send in batches with progress
+        tasks = [send_one(u) for u in all_users]
+        await asyncio.gather(*tasks)
+
+        # If --p flag, pin the broadcast in the broadcast channel
+        if 'p' in flags and BROADCAST_CHANNEL_ID:
+            try:
+                pin_msg = f"📢 **Broadcast sent**\nSent to {success} users, {failed} failed."
+                pin_entity = await bot.get_entity(BROADCAST_CHANNEL_ID)
+                await bot.send_message(pin_entity, pin_msg)
+                await bot.pin_message(pin_entity, pin_msg, notify=False)
+            except Exception as e:
+                logging.error(f"Failed to pin broadcast: {e}")
+
+        await confirm_event.respond(f"✅ Broadcast complete.\n✅ Sent to {success} users.\n❌ Failed: {failed}.")
+        # Remove listener
+        confirm_handler.remove()
+
+    # Set a timeout for confirmation
+    async def timeout():
+        await asyncio.sleep(60)
+        # Remove listener if still active
+        confirm_handler.remove()
+        try:
+            await event.respond("⏰ Broadcast confirmation timed out.")
+        except:
+            pass
+    asyncio.create_task(timeout())
 
 # ---------- HANDLE ALL TEXT MESSAGES ----------
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
@@ -1022,7 +1199,6 @@ async def handle_message(event):
                 await event.respond("✅ Support link removed.",
                                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             else:
-                # Basic validation
                 if not (link.startswith("http://") or link.startswith("https://") or link.startswith("t.me/")):
                     await event.respond(
                         "❌ Invalid link. Please send a valid URL starting with `http://`, `https://`, or `t.me/`.\nTry again:",
@@ -1076,7 +1252,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with logout button on OTP...")
+    logging.info("🚀 Bot started with session validation, min deposit, and broadcast command.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
