@@ -113,20 +113,24 @@ async def log_event(text):
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- SESSION VALIDATION (SIMPLE & SAFE) ----------
+# ---------- SESSION VALIDATION (SAFE – uses persistent client) ----------
 async def is_session_valid(phone: str) -> bool:
     """
-    Check if the account is loaded in AccountManager and its session is active.
-    Uses the persistent client – no temporary connection, so OTP forwarding is never broken.
+    Check if the account's persistent client is connected and authorized.
+    Uses the existing client – no temporary connections, so OTP forwarding is never broken.
     """
     client = acc_mgr.clients.get(phone)
     if not client:
+        logging.warning(f"No client in memory for {phone}")
         return False
     try:
         if not client.is_connected():
             await client.connect()
-        return await client.is_user_authorized()
-    except Exception:
+        # Real server check – will raise if session invalid/revoked
+        await client.get_me()
+        return True
+    except Exception as e:
+        logging.warning(f"Session check failed for {phone}: {e}")
         return False
 
 # ---------- FORCE JOIN (unchanged) ----------
@@ -387,7 +391,7 @@ async def callback_handler(event):
         for acc in available_accounts:
             phone = acc["phone"]
 
-            # Simple validation: check if loaded and authorized
+            # REAL session check using persistent client (no disconnection)
             if not await is_session_valid(phone):
                 # Mark invalid and remove from cache if present
                 await accounts_col.update_one(
@@ -1119,7 +1123,7 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with simple session validation (OTP safe).")
+    logging.info("🚀 Bot started – session validation uses persistent clients, OTP safe.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
