@@ -11,7 +11,6 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    InviteHashInvalidError,
     AccessTokenInvalidError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -19,7 +18,7 @@ import qrcode
 from bson import ObjectId
 from account_manager import AccountManager
 
-# ---------- .env LOAD (FIXED: strip added) ----------
+# ---------- .env LOAD ----------
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0").strip())
@@ -232,6 +231,78 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
+# ---------- BROADCAST COMMAND ----------
+@bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
+async def broadcast_cmd(event):
+    user_id = event.sender_id
+    if user_id not in ADMIN_IDS:
+        await event.respond("❌ Unauthorized.")
+        return
+
+    args = event.message.text.split()
+    is_forward = "--f" in args
+    is_pin = "--pin" in args
+    # Remove flags from text
+    msg_text = " ".join([arg for arg in args if not arg.startswith("--")])
+    # Remove "/broadcast" from start
+    if msg_text.startswith("/broadcast"):
+        msg_text = msg_text[len("/broadcast"):].strip()
+
+    # If forward flag, we need a replied message
+    if is_forward:
+        if not event.message.is_reply:
+            await event.respond("❌ Please reply to a message to forward.")
+            return
+        replied = await event.message.get_reply_message()
+        if not replied:
+            await event.respond("❌ Could not get replied message.")
+            return
+
+    # Get all user IDs
+    cursor = users_col.find({}, {"user_id": 1})
+    users = await cursor.to_list(length=None)
+    user_ids = [u["user_id"] for u in users]
+
+    if not user_ids:
+        await event.respond("❌ No users found.")
+        return
+
+    # Confirm broadcast with user count
+    await event.respond(f"📢 Broadcasting to {len(user_ids)} users... (this may take a while)")
+
+    # Send to logs channel and pin if needed
+    pin_msg = None
+    if is_pin and LOGS_CHANNEL_ID:
+        try:
+            if is_forward:
+                pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
+            else:
+                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text or "Broadcast message")
+            await bot.pin_message(LOGS_CHANNEL_ID, pin_msg)
+            await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
+        except Exception as e:
+            logging.error(f"Failed to pin broadcast: {e}")
+            await event.respond(f"⚠️ Could not pin: {e}")
+
+    # Send to all users in batches
+    batch_size = 30
+    total = len(user_ids)
+    for i in range(0, total, batch_size):
+        batch = user_ids[i:i+batch_size]
+        tasks = []
+        for uid in batch:
+            try:
+                if is_forward:
+                    tasks.append(bot.forward_messages(uid, replied))
+                else:
+                    tasks.append(bot.send_message(uid, msg_text or "Broadcast message"))
+            except:
+                pass
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(1)  # avoid flood
+
+    await event.respond(f"✅ Broadcast sent to {total} users.")
+
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -340,7 +411,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- MODIFIED: confirm_purchase with session validation ----------
+    # ---------- confirm_purchase with session validation + admin report ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -373,16 +444,61 @@ async def callback_handler(event):
             phone = acc["phone"]
             client = acc_mgr.clients.get(phone)
             valid = False
+            error_msg = None
+
             if client:
                 try:
                     await client.get_me()
                     valid = True
                 except Exception as e:
+                    error_msg = str(e)[:150]
                     logging.warning(f"Session invalid for {phone}: {e}")
                     await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
+                    
+                    for admin in ADMIN_IDS:
+                        try:
+                            await bot.send_message(admin,
+                                f"⚠️ **Inactive Session Detected!**\n"
+                                f"📱 Phone: `{phone}`\n"
+                                f"🌍 Country: {country}\n"
+                                f"💰 Price: ₹{price}\n"
+                                f"❌ Error: `{error_msg}`\n"
+                                f"🔄 Status: Marked as `inactive` in DB.\n"
+                                f"🕒 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                            )
+                        except:
+                            pass
+                    await log_event(
+                        f"⚠️ **Inactive Session**\n"
+                        f"Phone: `{phone}`\n"
+                        f"Country: {country}\n"
+                        f"Price: ₹{price}\n"
+                        f"Error: `{error_msg}`\n"
+                        f"Status: Marked inactive"
+                    )
                     continue
             else:
                 await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
+                for admin in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin,
+                            f"⚠️ **Client Missing in Memory!**\n"
+                            f"📱 Phone: `{phone}`\n"
+                            f"🌍 Country: {country}\n"
+                            f"💰 Price: ₹{price}\n"
+                            f"❌ Error: Client not loaded / session string missing.\n"
+                            f"🔄 Status: Marked as `inactive` in DB.\n"
+                            f"🕒 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                        )
+                    except:
+                        pass
+                await log_event(
+                    f"⚠️ **Client Missing**\n"
+                    f"Phone: `{phone}`\n"
+                    f"Country: {country}\n"
+                    f"Price: ₹{price}\n"
+                    f"Status: Marked inactive (client not found)"
+                )
                 continue
 
             selected_acc = updated
@@ -517,16 +633,51 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
 
+    # ---------- MODIFIED: Orders + Deposit History combined ----------
     elif data == "orders":
-        cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
-        orders = await cursor.to_list(length=10)
-        if not orders:
-            txt = "📜 No orders yet."
+        # Fetch purchases
+        orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
+        orders = await orders_cursor.to_list(length=20)
+        # Fetch approved deposits
+        deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1)
+        deposits = await deposits_cursor.to_list(length=20)
+
+        # Combine and sort by created_at
+        combined = []
+        for o in orders:
+            combined.append({
+                "type": "Purchase",
+                "phone": o.get("phone", "N/A"),
+                "country": o.get("country", "N/A"),
+                "amount": o.get("amount", 0),
+                "date": o["created_at"],
+                "status": "Completed"
+            })
+        for d in deposits:
+            combined.append({
+                "type": "Deposit",
+                "phone": "N/A",
+                "country": "N/A",
+                "amount": d.get("amount", 0),
+                "date": d["created_at"],
+                "status": "Approved"
+            })
+
+        combined.sort(key=lambda x: x["date"], reverse=True)
+        combined = combined[:20]  # latest 20
+
+        if not combined:
+            txt = "📜 No transactions yet."
         else:
-            txt = "📜 **Your Orders:**\n" + "\n".join(
-                f"🔹 {o['phone']} ({o['country']}) - ₹{o['amount']} - {o['created_at'].strftime('%d/%m/%Y')}"
-                for o in orders
-            )
+            lines = []
+            for item in combined:
+                date_str = item["date"].strftime('%d/%m/%Y')
+                if item["type"] == "Purchase":
+                    lines.append(f"🛒 {item['phone']} ({item['country']}) - ₹{item['amount']} - {date_str}")
+                else:
+                    lines.append(f"💰 Deposit +₹{item['amount']} - {date_str}")
+            txt = "📜 **Transaction History:**\n" + "\n".join(lines)
+
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
 
     # ---------- ADMIN CALLBACKS ----------
@@ -663,7 +814,7 @@ async def callback_handler(event):
             pass
         await event.edit("❌ Deposit rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
 
-    # ---------- NEW: Admin Set Price ----------
+    # ---------- Admin Set Price ----------
     elif data == "admin_setprice":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -1116,7 +1267,7 @@ async def start_cmd(event):
 
     await show_welcome_menu(event, user_id)
 
-# ---------- MAIN FUNCTION (FIXED: token check + error handling) ----------
+# ---------- MAIN FUNCTION ----------
 async def main():
     if not BOT_TOKEN:
         logging.error("❌ BOT_TOKEN is empty or missing in .env file!")
