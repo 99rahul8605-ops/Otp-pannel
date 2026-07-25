@@ -47,14 +47,12 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
-# NEW: Update channel for public updates (masked)
 UPDATE_CHANNEL_ID = os.getenv("UPDATE_CHANNEL_ID", "").strip()
 if UPDATE_CHANNEL_ID:
     try:
         UPDATE_CHANNEL_ID = int(UPDATE_CHANNEL_ID)
     except ValueError:
         UPDATE_CHANNEL_ID = None
-        logging.warning("UPDATE_CHANNEL_ID is not a valid integer, updates disabled.")
 else:
     UPDATE_CHANNEL_ID = None
 
@@ -134,9 +132,13 @@ def mask_phone(phone: str) -> str:
     else:
         return f"{phone[:2]}*****{phone[-4:]}"
 
+async def get_existing_countries():
+    """Return distinct country codes from available accounts."""
+    return await accounts_col.distinct("country", {"status": "available"})
+
 # ---------- LOGGING ----------
 async def log_event(text: str):
-    """Send full‑detail log to LOGS_CHANNEL_ID (no masking)."""
+    """Send full‑detail log to LOGS_CHANNEL_ID."""
     if not LOGS_CHANNEL_ID:
         return
     bot_name = await get_bot_username()
@@ -150,13 +152,10 @@ async def log_update(text: str):
     """Send public update to UPDATE_CHANNEL_ID with masked phone numbers and no user IDs."""
     if not UPDATE_CHANNEL_ID:
         return
-    # Mask phone numbers
-    import re
     def replacer(match):
         full = match.group(0)
         return mask_phone(full)
     masked_text = re.sub(r'(\+\d+|\d{7,})', replacer, text)
-    # Remove any user ID references (like `user_id:` or `tg://user?id=...`)
     masked_text = re.sub(r'user_id:\s*\d+', '', masked_text, flags=re.IGNORECASE)
     masked_text = re.sub(r'\[.*?\]\(tg://user\?id=\d+\)', 'User', masked_text)
     bot_name = await get_bot_username()
@@ -621,7 +620,7 @@ async def callback_handler(event):
             f"🛒 **New Purchase**\n"
             f"Country: {country}\n"
             f"Price: ₹{price}\n"
-            f"Phone: {phone}\n"  # will be masked by log_update
+            f"Phone: {phone}\n"
         )
 
     elif data == "cancel_purchase":
@@ -824,7 +823,7 @@ async def callback_handler(event):
                             f"You earned ₹{REFERRAL_BONUS} referral bonus!")
                     except:
                         pass
-                    # Logs channel: full details (including referrer)
+                    # Logs channel: full details
                     await log_event(
                         f"🎁 **Referral Bonus**\n"
                         f"Referrer ID: {referrer_id}\n"
@@ -832,7 +831,7 @@ async def callback_handler(event):
                         f"Total Deposits: ₹{total}\n"
                         f"Bonus: ₹{REFERRAL_BONUS}"
                     )
-                    # Update channel: just a summary (no IDs)
+                    # Update channel: summary (no IDs)
                     await log_update(f"🎁 Referral bonus paid: ₹{REFERRAL_BONUS}")
 
         # Admin DMs: full details
@@ -1188,7 +1187,6 @@ async def process_deposit_step(event):
             f"Amount: ₹{amount}\n"
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
-        # Update channel: we only send on approval, not on request
 
 # ---------- BROADCAST ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s+.*)'))
