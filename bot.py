@@ -11,26 +11,27 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    InviteHashInvalidError
+    InviteHashInvalidError,
+    AccessTokenInvalidError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
 from account_manager import AccountManager
 
-# ---------- .env LOAD ----------
+# ---------- .env LOAD (FIXED: strip added) ----------
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+API_ID = int(os.getenv("API_ID", "0").strip())
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017").strip()
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-UPI_ID = os.getenv("UPI_ID", "example@upi")
-PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
-DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
-REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5"))
-MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10"))
+UPI_ID = os.getenv("UPI_ID", "example@upi").strip()
+PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop").strip()
+DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50").strip())
+REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5").strip())
+MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
 
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
 if LOGS_CHANNEL_ID:
@@ -53,7 +54,7 @@ else:
     RAW_CHAT_IDS = []
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
-    raise ValueError("❌ .env file incomplete!")
+    raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -354,7 +355,6 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        # 1️⃣ Fetch all available accounts for this country & price
         cursor = accounts_col.find({"country": country, "status": "available", "price": price})
         accounts = await cursor.to_list(length=None)
         if not accounts:
@@ -363,34 +363,29 @@ async def callback_handler(event):
 
         selected_acc = None
         for acc in accounts:
-            # 2️⃣ Try to atomically mark this account as sold
             updated = await accounts_col.find_one_and_update(
                 {"_id": acc["_id"], "status": "available"},
                 {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
             )
             if updated is None:
-                continue  # someone else took it
+                continue
 
             phone = acc["phone"]
-            # 3️⃣ Check if session is active
             client = acc_mgr.clients.get(phone)
             valid = False
             if client:
                 try:
-                    await client.get_me()  # this will connect and verify authorization
+                    await client.get_me()
                     valid = True
                 except Exception as e:
                     logging.warning(f"Session invalid for {phone}: {e}")
-                    # mark as inactive
                     await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
                     continue
             else:
-                # no client means invalid
                 await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
                 continue
 
-            # ✅ Valid account found
-            selected_acc = updated  # updated contains the sold doc
+            selected_acc = updated
             break
 
         if selected_acc is None:
@@ -401,7 +396,6 @@ async def callback_handler(event):
         phone = acc["phone"]
         twofa_password = acc.get("twofa_password")
 
-        # 4️⃣ Deduct balance
         await users_col.update_one(
             {"user_id": user_id},
             {"$inc": {"balance": -price}},
@@ -433,7 +427,6 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
-        # 5️⃣ Admin notification & logs
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -802,7 +795,7 @@ async def process_phone_otp_step(event):
                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
     elif step == "price":
         try:
-            price = float(event.message.text)
+            price = float(event.message.text.strip())
             if price <= 0:
                 raise ValueError
         except:
@@ -889,7 +882,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
     elif step == "price":
         try:
-            price = float(event.message.text)
+            price = float(event.message.text.strip())
             if price <= 0:
                 raise ValueError
         except:
@@ -927,7 +920,7 @@ async def process_deposit_step(event):
     step = state["step"]
     if step == "amount":
         try:
-            amount = float(event.message.text)
+            amount = float(event.message.text.strip())
             if amount <= 0:
                 raise ValueError
             if amount < MIN_DEPOSIT:
@@ -1019,7 +1012,7 @@ async def handle_message(event):
         step = state["step"]
         if step == "await_user_id":
             try:
-                uid = int(event.message.text)
+                uid = int(event.message.text.strip())
             except:
                 await event.respond("❌ Invalid user ID. Send a numeric ID:",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
@@ -1030,7 +1023,7 @@ async def handle_message(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
         elif step == "await_amount":
             try:
-                amt = float(event.message.text)
+                amt = float(event.message.text.strip())
             except:
                 await event.respond("❌ Invalid amount. Try again:",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
@@ -1065,7 +1058,6 @@ async def handle_message(event):
                 await event.respond(f"✅ Support link updated to:\n`{link}`",
                                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             user_states.pop(user_id, None)
-    # ---------- NEW: Admin Set Price handler ----------
     elif action == "set_price":
         step = state.get("step")
         if step == "await_price":
@@ -1077,13 +1069,11 @@ async def handle_message(event):
                 await event.respond("❌ Invalid price. Send a positive number (e.g., 50):",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
                 return
-            # Update DEFAULT_PRICE in DB or env? We'll store in settings collection
             await settings_col.update_one(
                 {"key": "default_price"},
                 {"$set": {"value": new_price, "updated_at": datetime.utcnow()}},
                 upsert=True
             )
-            # Also update global variable so it reflects immediately
             global DEFAULT_PRICE
             DEFAULT_PRICE = new_price
             await event.respond(f"✅ Default price updated to ₹{new_price}.",
@@ -1126,13 +1116,25 @@ async def start_cmd(event):
 
     await show_welcome_menu(event, user_id)
 
-# ---------- MAIN FUNCTION ----------
+# ---------- MAIN FUNCTION (FIXED: token check + error handling) ----------
 async def main():
-    await bot.start(bot_token=BOT_TOKEN)
+    if not BOT_TOKEN:
+        logging.error("❌ BOT_TOKEN is empty or missing in .env file!")
+        return
+
+    try:
+        await bot.start(bot_token=BOT_TOKEN)
+    except AccessTokenInvalidError:
+        logging.error("❌ Invalid BOT_TOKEN! Please check your .env file.")
+        return
+    except Exception as e:
+        logging.error(f"❌ Failed to start bot: {e}")
+        return
+
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with logout button on OTP...")
+    logging.info("🚀 Bot started successfully...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
