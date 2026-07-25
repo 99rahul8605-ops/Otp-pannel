@@ -240,7 +240,7 @@ async def send_main_menu(event):
     else:
         await event.respond(msg, buttons=buttons)
 
-# ---------- BROADCAST COMMAND (with DM pin via --p) ----------
+# ---------- BROADCAST COMMAND (as per your fixed code) ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
     user_id = event.sender_id
@@ -251,10 +251,9 @@ async def broadcast_cmd(event):
     args = event.message.text.split()
     is_forward = "--f" in args
     pin_dm = "--p" in args          # DM pin
-    pin_logs = ("--pin" in args)    # logs channel pin (old --pin)
-    # Also allow --p as alias for --pin? No, we now separate: --p = DM pin, --pin = logs pin.
-    # If user wants both, they can use both flags.
-    
+    pin_logs = "--pin" in args      # logs channel pin
+
+    # Remove flags and command
     msg_parts = [arg for arg in args if not arg.startswith("--")]
     if msg_parts and msg_parts[0] == "/broadcast":
         msg_parts = msg_parts[1:]
@@ -281,10 +280,12 @@ async def broadcast_cmd(event):
         else:
             forward_mode = False
             if not msg_text:
-                await event.respond("❌ Please provide a message to broadcast, or reply to a message to forward it.")
+                await event.respond(
+                    "❌ Please provide a message to broadcast, or reply to a message to forward it."
+                )
                 return
 
-    # Get all users
+    # Get all users from DB
     cursor = users_col.find({}, {"user_id": 1})
     users = await cursor.to_list(length=None)
     user_ids = [u["user_id"] for u in users]
@@ -301,17 +302,17 @@ async def broadcast_cmd(event):
         "msg_text": msg_text if not forward_mode else None,
         "replied_msg": replied if forward_mode else None,
         "user_ids": user_ids,
-        "total": len(user_ids)
+        "total": len(user_ids),
     }
 
     # Show preview
-    preview = f"📢 **Broadcast Preview**\n\n"
+    preview = "📢 **Broadcast Preview**\n\n"
     preview += f"👥 **Recipients:** {len(user_ids)} users\n"
     if forward_mode:
         preview += "🔄 **Mode:** Forward (replied message will be sent)\n"
-        if replied.text:
+        if replied and replied.text:
             preview += f"📝 **Preview of replied message:**\n`{replied.text[:200]}`\n"
-        if replied.media:
+        if replied and replied.media:
             preview += "📎 *Media will be forwarded.*\n"
     else:
         preview += f"📝 **Message:**\n`{msg_text[:500]}`\n"
@@ -323,15 +324,112 @@ async def broadcast_cmd(event):
 
     buttons = [
         [Button.inline("✅ Confirm", b"broadcast_confirm")],
-        [Button.inline("❌ Cancel", b"broadcast_cancel")]
+        [Button.inline("❌ Cancel", b"broadcast_cancel")],
     ]
     await event.respond(preview, buttons=buttons)
 
-# ---------- CALLBACK HANDLER ----------
+
+# ---------- Broadcast confirmation callbacks ----------
+@bot.on(events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
+async def broadcast_callback(event):
+    user_id = event.sender_id
+    if user_id not in ADMIN_IDS:
+        await event.answer("❌ Unauthorized.", alert=True)
+        return
+
+    data = event.data.decode()
+
+    if data == "broadcast_cancel":
+        state = user_states.pop(user_id, None)
+        if state and state.get("action") == "broadcast_confirm":
+            await event.edit("❌ Broadcast cancelled.")
+            await event.answer("Cancelled", alert=True)
+        else:
+            await event.answer("No broadcast to cancel.", alert=True)
+        return
+
+    # data == "broadcast_confirm"
+    state = user_states.get(user_id)
+    if not state or state.get("action") != "broadcast_confirm":
+        await event.answer("No pending broadcast.", alert=True)
+        return
+
+    is_forward = state["is_forward"]
+    pin_dm = state["pin_dm"]
+    pin_logs = state["pin_logs"]
+    msg_text = state["msg_text"]
+    replied = state["replied_msg"]
+    user_ids = state["user_ids"]
+    total = len(user_ids)
+
+    await event.edit("⏳ **Sending broadcast...** (this may take a while)")
+    await event.answer("Broadcast started!", alert=True)
+
+    # Pin to logs channel if requested
+    if pin_logs and LOGS_CHANNEL_ID:
+        try:
+            if is_forward:
+                pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
+            else:
+                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
+            await bot.pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
+            await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
+        except Exception as e:
+            logging.error(f"Failed to pin broadcast in logs channel: {e}")
+            await event.respond(f"⚠️ Could not pin in logs channel: {e}")
+
+    # Send to users in batches
+    batch_size = 30
+    sent_count = 0
+    pin_success = 0
+    pin_failed = 0
+
+    for i in range(0, total, batch_size):
+        batch = user_ids[i:i + batch_size]
+
+        async def send_one(uid):
+            if is_forward:
+                return await bot.forward_messages(uid, replied)
+            return await bot.send_message(uid, msg_text, parse_mode="markdown")
+
+        results = await asyncio.gather(*(send_one(uid) for uid in batch), return_exceptions=True)
+
+        for uid, res in zip(batch, results):
+            if isinstance(res, Exception):
+                logging.warning(f"Send failed for {uid}: {res}")
+                continue
+
+            sent_count += 1
+
+            if pin_dm:
+                try:
+                    await bot.pin_message(uid, res, notify=False)
+                    pin_success += 1
+                except Exception as e:
+                    pin_failed += 1
+                    logging.warning(f"DM pin failed for {uid}: {e}")
+
+        await asyncio.sleep(1)
+
+    final = "✅ **Broadcast completed!**\n"
+    final += f"📤 Sent to {sent_count} out of {total} users.\n"
+    if pin_dm:
+        final += f"📌 DM pins: {pin_success} success, {pin_failed} failed.\n"
+    if pin_logs and LOGS_CHANNEL_ID:
+        final += "📌 Logs pin: Done (if successful).\n"
+
+    await event.edit(final)
+    user_states.pop(user_id, None)
+
+# ---------- CALLBACK HANDLER (all other callbacks) ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
+
+    # Skip broadcast callbacks (they are handled by specific pattern)
+    if data.startswith("broadcast_"):
+        return
 
     if data == "check_join":
         if await is_user_member(user_id):
@@ -346,97 +444,7 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
-    # --- Broadcast confirmation callbacks ---
-    if data == "broadcast_confirm":
-        state = user_states.get(user_id)
-        if not state or state.get("action") != "broadcast_confirm":
-            await event.answer("No pending broadcast.", alert=True)
-            return
-        
-        is_forward = state["is_forward"]
-        pin_dm = state["pin_dm"]
-        pin_logs = state["pin_logs"]
-        msg_text = state["msg_text"]
-        replied = state["replied_msg"]
-        user_ids = state["user_ids"]
-        total = len(user_ids)
-
-        await event.edit("⏳ **Sending broadcast...** (this may take a while)")
-        await event.answer("Broadcast started!", alert=True)
-
-        # Pin to logs channel if requested
-        pin_msg = None
-        if pin_logs and LOGS_CHANNEL_ID:
-            try:
-                if is_forward:
-                    pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
-                else:
-                    pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode='markdown')
-                await bot.pin_message(LOGS_CHANNEL_ID, pin_msg)
-                await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
-            except Exception as e:
-                logging.error(f"Failed to pin broadcast: {e}")
-                await event.respond(f"⚠️ Could not pin in logs channel: {e}")
-
-        # Send to users in batches
-        batch_size = 30
-        sent_count = 0
-        pin_success = 0
-        pin_failed = 0
-
-        for i in range(0, total, batch_size):
-            batch = user_ids[i:i+batch_size]
-            tasks = []
-            for uid in batch:
-                try:
-                    if is_forward:
-                        tasks.append(bot.forward_messages(uid, replied))
-                    else:
-                        tasks.append(bot.send_message(uid, msg_text, parse_mode='markdown'))
-                except:
-                    pass
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            # results is a list of messages (or exceptions)
-            for idx, res in enumerate(results):
-                if isinstance(res, Exception):
-                    continue
-                # message sent successfully
-                sent_count += 1
-                # pin in DM if requested
-                if pin_dm:
-                    try:
-                        # res is the sent message object
-                        await bot.pin_chat_message(
-                            chat_id=user_ids[i+idx],
-                            message_id=res.id,
-                            disable_notification=True
-                        )
-                        pin_success += 1
-                    except Exception as e:
-                        pin_failed += 1
-                        logging.warning(f"DM pin failed for {user_ids[i+idx]}: {e}")
-            await asyncio.sleep(1)
-
-        # Build final message
-        final = f"✅ **Broadcast completed!**\n"
-        final += f"📤 Sent to {sent_count} out of {total} users.\n"
-        if pin_dm:
-            final += f"📌 DM pins: {pin_success} success, {pin_failed} failed.\n"
-        if pin_logs and LOGS_CHANNEL_ID:
-            final += "📌 Logs pin: Done (if successful).\n"
-        await event.edit(final)
-        user_states.pop(user_id, None)
-
-    elif data == "broadcast_cancel":
-        state = user_states.pop(user_id, None)
-        if state and state.get("action") == "broadcast_confirm":
-            await event.edit("❌ Broadcast cancelled.")
-            await event.answer("Cancelled", alert=True)
-        else:
-            await event.answer("No broadcast to cancel.", alert=True)
-        return
-
-    # Top-level callbacks clear any existing state (except broadcast)
+    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice", "admin_support"):
