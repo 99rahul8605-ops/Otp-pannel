@@ -25,9 +25,13 @@ from account_manager import AccountManager
 # ---------- .env LOAD ----------
 load_dotenv()
 
+# ---- REQUIRED ----
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN is missing in .env file!")
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 UPI_ID = os.getenv("UPI_ID", "example@upi")
@@ -248,50 +252,35 @@ async def send_main_menu(event):
 async def is_account_session_valid(phone: str) -> bool:
     """
     Check if the session for the given phone is still active.
-    Uses get_me(force=True) and also fetches a dialog to be absolutely sure.
-    Returns True only if both succeed; otherwise False.
+    We create a fresh temporary client from the session string stored in DB.
+    This guarantees we test the actual session that will be used.
     """
-    client = acc_mgr.clients.get(phone)
-    if client:
+    account = await accounts_col.find_one({"phone": phone})
+    if not account or not account.get("session_string"):
+        logging.warning(f"No session string in DB for {phone}")
+        return False
+
+    session_str = account["session_string"]
+    temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await temp_client.connect()
+        # The ultimate test: fetch the current user
+        await temp_client.get_me()
+        # Also ensure we can do a simple action (like getting dialogs)
+        await temp_client.get_dialogs(limit=1)
+        await temp_client.disconnect()
+        return True
+    except (UnauthorizedError, AuthKeyError, RPCError) as e:
+        logging.warning(f"Session for {phone} is invalid: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error checking session for {phone}: {e}")
+        return False
+    finally:
         try:
-            if not client.is_connected():
-                await client.connect()
-            # Force a fresh request to the server
-            await client.get_me(force=True)
-            # Additional check: fetch first dialog to confirm session is alive
-            await client.get_dialogs(limit=1)
-            return True
-        except (UnauthorizedError, AuthKeyError, RPCError) as e:
-            logging.warning(f"Session for {phone} is invalid (client check failed): {e}")
-            return False
-        except Exception as e:
-            logging.error(f"Unexpected error checking session for {phone}: {e}")
-            return False
-    else:
-        # Not in memory – fetch session string from DB
-        account = await accounts_col.find_one({"phone": phone})
-        if not account or not account.get("session_string"):
-            logging.warning(f"No session string in DB for {phone}")
-            return False
-        session_str = account["session_string"]
-        temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        try:
-            await temp_client.connect()
-            await temp_client.get_me(force=True)
-            await temp_client.get_dialogs(limit=1)
             await temp_client.disconnect()
-            return True
-        except (UnauthorizedError, AuthKeyError, RPCError) as e:
-            logging.warning(f"Temp session for {phone} is invalid: {e}")
-            return False
-        except Exception as e:
-            logging.error(f"Error checking temp client for {phone}: {e}")
-            return False
-        finally:
-            try:
-                await temp_client.disconnect()
-            except:
-                pass
+        except:
+            pass
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -435,7 +424,7 @@ async def callback_handler(event):
         sold_account = None
         for acc in accounts:
             phone = acc["phone"]
-            # 🔥 Validate session
+            # 🔥 Validate session using the session string from DB
             if not await is_account_session_valid(phone):
                 # Mark as invalid
                 await accounts_col.update_one(
@@ -1272,11 +1261,17 @@ async def start_cmd(event):
 
 # ---------- MAIN FUNCTION ----------
 async def main():
-    await bot.start(bot_token=BOT_TOKEN)
+    try:
+        await bot.start(bot_token=BOT_TOKEN)
+        logging.info("✅ Bot started with bot token.")
+    except Exception as e:
+        logging.error(f"❌ Failed to start bot: {e}")
+        return
+
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with ultra‑strict session validation, min deposit, and broadcast.")
+    logging.info("🚀 Bot is running with ultra‑strict session validation and all features.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
