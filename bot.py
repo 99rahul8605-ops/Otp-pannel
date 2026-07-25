@@ -148,6 +148,7 @@ async def is_user_member(user_id: int) -> bool:
     return True
 
 async def send_join_message(event):
+    is_callback = isinstance(event, events.CallbackQuery.Event)
     buttons = []
     for raw_id in RAW_CHAT_IDS:
         if await is_user_member_of(raw_id, event.sender_id):
@@ -182,7 +183,11 @@ async def send_join_message(event):
     if not buttons:
         return
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
-    await event.respond("🔒 **You must join the channels below to use the bot.**", buttons=buttons)
+    msg = "🔒 **You must join the channels below to use the bot.**"
+    if is_callback:
+        await event.edit(msg, buttons=buttons)
+    else:
+        await event.respond(msg, buttons=buttons)
 
 # ---------- WELCOME MENU ----------
 async def show_welcome_menu(event, user_id):
@@ -229,7 +234,11 @@ async def send_main_menu(event):
         buttons.append([Button.url("📞 Support", support_link)])
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
-    await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
+    msg = "🌟 **OTP Bot Main Menu**"
+    if isinstance(event, events.CallbackQuery.Event):
+        await event.edit(msg, buttons=buttons)
+    else:
+        await event.respond(msg, buttons=buttons)
 
 # ---------- BROADCAST COMMAND ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
@@ -242,23 +251,24 @@ async def broadcast_cmd(event):
     args = event.message.text.split()
     is_forward = "--f" in args
     is_pin = "--pin" in args
-    # Remove flags from text
-    msg_text = " ".join([arg for arg in args if not arg.startswith("--")])
-    # Remove "/broadcast" from start
-    if msg_text.startswith("/broadcast"):
-        msg_text = msg_text[len("/broadcast"):].strip()
+    msg_parts = [arg for arg in args if not arg.startswith("--")]
+    if msg_parts and msg_parts[0] == "/broadcast":
+        msg_parts = msg_parts[1:]
+    msg_text = " ".join(msg_parts).strip()
 
-    # If forward flag, we need a replied message
     if is_forward:
         if not event.message.is_reply:
-            await event.respond("❌ Please reply to a message to forward.")
+            await event.respond("❌ Please reply to a message to forward with --f.")
             return
         replied = await event.message.get_reply_message()
         if not replied:
             await event.respond("❌ Could not get replied message.")
             return
+    else:
+        if not msg_text:
+            await event.respond("❌ Please provide a message to broadcast, or use --f to forward a replied message.")
+            return
 
-    # Get all user IDs
     cursor = users_col.find({}, {"user_id": 1})
     users = await cursor.to_list(length=None)
     user_ids = [u["user_id"] for u in users]
@@ -267,24 +277,21 @@ async def broadcast_cmd(event):
         await event.respond("❌ No users found.")
         return
 
-    # Confirm broadcast with user count
     await event.respond(f"📢 Broadcasting to {len(user_ids)} users... (this may take a while)")
 
-    # Send to logs channel and pin if needed
     pin_msg = None
     if is_pin and LOGS_CHANNEL_ID:
         try:
             if is_forward:
                 pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
             else:
-                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text or "Broadcast message")
+                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text)
             await bot.pin_message(LOGS_CHANNEL_ID, pin_msg)
             await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
         except Exception as e:
             logging.error(f"Failed to pin broadcast: {e}")
             await event.respond(f"⚠️ Could not pin: {e}")
 
-    # Send to all users in batches
     batch_size = 30
     total = len(user_ids)
     for i in range(0, total, batch_size):
@@ -295,11 +302,11 @@ async def broadcast_cmd(event):
                 if is_forward:
                     tasks.append(bot.forward_messages(uid, replied))
                 else:
-                    tasks.append(bot.send_message(uid, msg_text or "Broadcast message"))
+                    tasks.append(bot.send_message(uid, msg_text))
             except:
                 pass
         await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.sleep(1)  # avoid flood
+        await asyncio.sleep(1)
 
     await event.respond(f"✅ Broadcast sent to {total} users.")
 
@@ -633,16 +640,13 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
 
-    # ---------- MODIFIED: Orders + Deposit History combined ----------
+    # ---------- Orders + Deposit History combined ----------
     elif data == "orders":
-        # Fetch purchases
         orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
         orders = await orders_cursor.to_list(length=20)
-        # Fetch approved deposits
         deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1)
         deposits = await deposits_cursor.to_list(length=20)
 
-        # Combine and sort by created_at
         combined = []
         for o in orders:
             combined.append({
@@ -664,7 +668,7 @@ async def callback_handler(event):
             })
 
         combined.sort(key=lambda x: x["date"], reverse=True)
-        combined = combined[:20]  # latest 20
+        combined = combined[:20]
 
         if not combined:
             txt = "📜 No transactions yet."
@@ -679,6 +683,10 @@ async def callback_handler(event):
             txt = "📜 **Transaction History:**\n" + "\n".join(lines)
 
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
+
+    # ---------- FIXED: Main menu back button ----------
+    elif data == "main":
+        await send_main_menu(event)
 
     # ---------- ADMIN CALLBACKS ----------
     elif data == "admin":
@@ -1279,7 +1287,12 @@ async def main():
         logging.error("❌ Invalid BOT_TOKEN! Please check your .env file.")
         return
     except Exception as e:
-        logging.error(f"❌ Failed to start bot: {e}")
+        error_msg = str(e)
+        if "database is locked" in error_msg or "unable to open database file" in error_msg:
+            logging.error("❌ Database (session file) locked! Probably another bot instance is running.")
+            logging.error("👉 Run: pkill -f bot.py   and then start again.")
+        else:
+            logging.error(f"❌ Failed to start bot: {e}")
         return
 
     global acc_mgr
