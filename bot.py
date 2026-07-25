@@ -113,31 +113,27 @@ async def log_event(text):
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- SESSION VALIDATION (IMPROVED) ----------
-async def is_account_session_active(phone: str) -> bool:
-    """
-    Check if the Telegram session for this phone is really active by calling get_me().
-    Returns True only if the session is live and authorized.
-    """
-    global acc_mgr
-    if acc_mgr is None:
-        logging.error("AccountManager not initialized")
+# ---------- SESSION VALIDATION (YOUR LOGIC) ----------
+async def is_session_valid(phone: str) -> bool:
+    """Check if the session for the given phone is still active."""
+    account = await accounts_col.find_one({"phone": phone})
+    if not account or not account.get("session_string"):
         return False
-    client = acc_mgr.clients.get(phone)
-    if not client:
-        logging.warning(f"No client object for {phone}")
-        return False
+
+    session_str = account["session_string"]
+    temp = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
-        if not client.is_connected():
-            await client.connect()
-        # Real server call – will raise if session invalid/revoked
-        await client.get_me()
+        await temp.connect()
+        await temp.get_me()                # Primary check
+        await temp.get_dialogs(limit=1)    # Extra verification
         return True
-    except Exception as e:
-        logging.warning(f"Session check failed for {phone}: {e}")
-        # Remove the client so we don't keep trying
-        acc_mgr.clients.pop(phone, None)
+    except Exception:
         return False
+    finally:
+        try:
+            await temp.disconnect()
+        except:
+            pass
 
 # ---------- FORCE JOIN (unchanged) ----------
 def parse_chat_id(raw_id: str):
@@ -397,13 +393,20 @@ async def callback_handler(event):
         for acc in available_accounts:
             phone = acc["phone"]
 
-            # REAL session check (calls get_me)
-            if not await is_account_session_active(phone):
-                # Mark invalid and remove from cache
+            # REAL session check using your is_session_valid
+            if not await is_session_valid(phone):
+                # Mark invalid and remove from cache if present
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "invalid", "invalid_reason": "session_inactive"}}
                 )
+                # Remove from acc_mgr.clients if it exists
+                if acc_mgr and phone in acc_mgr.clients:
+                    try:
+                        await acc_mgr.clients[phone].disconnect()
+                    except:
+                        pass
+                    del acc_mgr.clients[phone]
                 await log_event(f"⚠️ Account {phone} marked invalid – session inactive.")
                 continue
 
@@ -1122,7 +1125,7 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with strict session validation.")
+    logging.info("🚀 Bot started with strict session validation (your logic).")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
