@@ -2,6 +2,7 @@ import os
 import io
 import asyncio
 import logging
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
@@ -11,7 +12,6 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    InviteHashInvalidError,
     FloodWaitError,
     UnauthorizedError,
     AuthKeyError,
@@ -223,9 +223,8 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- SESSION VALIDATION (ONLY DURING PURCHASE) ----------
+# ---------- SESSION VALIDATION ----------
 async def is_session_valid(phone: str) -> bool:
-    """Creates a temp client from DB session string and checks get_me()."""
     account = await accounts_col.find_one({"phone": phone})
     if not account or not account.get("session_string"):
         return False
@@ -271,7 +270,6 @@ async def callback_handler(event):
     # --- Logout ---
     if data.startswith("logout_"):
         phone = data[len("logout_"):]
-        # remove from pending OTP requests if any
         for key in list(pending_otp_requests.keys()):
             if key[1] == phone:
                 del pending_otp_requests[key]
@@ -353,7 +351,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- PURCHASE (with validation) ----------
+    # ---------- PURCHASE (only shows "Processing....") ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -368,7 +366,8 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        await event.edit("⏳ **Processing your purchase...**\nChecking account availability...")
+        # Show only "Processing...." - no extra text
+        await event.edit("⏳ **Processing....**")
 
         cursor = accounts_col.find({
             "country": country,
@@ -385,9 +384,7 @@ async def callback_handler(event):
         sold_account = None
         for acc in accounts:
             phone = acc["phone"]
-            # 🔥 Validation happens here – only before purchase
             if not await is_session_valid(phone):
-                # Mark as invalid and notify admin
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "invalid", "invalid_reason": "session_expired"}}
@@ -401,7 +398,6 @@ async def callback_handler(event):
                 await log_event(msg)
                 continue
             else:
-                # Atomic sell
                 result = await accounts_col.find_one_and_update(
                     {"_id": acc["_id"], "status": "available"},
                     {"$set": {
@@ -413,15 +409,12 @@ async def callback_handler(event):
                 if result:
                     sold_account = result
                     break
-                else:
-                    continue
 
         if not sold_account:
             await event.edit("❌ No **valid** accounts left. Please try another country or price.",
                              buttons=[[Button.inline("🔙 Back", b"buy")]])
             return
 
-        # --- Complete sale ---
         phone = sold_account["phone"]
         twofa_password = sold_account.get("twofa_password")
 
@@ -456,7 +449,6 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
-        # Notify admins
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -520,7 +512,6 @@ async def callback_handler(event):
     # ---------- OTP Resend ----------
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
-        # Create a temp client on the fly using the session string from DB
         account = await accounts_col.find_one({"phone": phone})
         if not account or not account.get("session_string"):
             await event.answer("❌ Account session not found. Contact admin.", alert=True)
@@ -533,10 +524,8 @@ async def callback_handler(event):
                 await temp_client.disconnect()
                 await event.answer("❌ Session expired. Contact admin.", alert=True)
                 return
-            # Store client in pending list for OTP listening
             pending_otp_requests[(user_id, phone)] = temp_client
             await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
-            # We don't disconnect; we keep it open to catch OTP
         except Exception as e:
             await temp_client.disconnect()
             await event.answer(f"❌ Error: {str(e)}", alert=True)
@@ -569,15 +558,45 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
 
+    # ---------- UPDATED ORDERS (includes deposits) ----------
     elif data == "orders":
-        cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
-        orders = await cursor.to_list(length=10)
-        if not orders:
-            txt = "📜 No orders yet."
+        user_id = event.sender_id
+
+        orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1).limit(10)
+        orders = await orders_cursor.to_list(length=10)
+
+        deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1).limit(10)
+        deposits = await deposits_cursor.to_list(length=10)
+
+        items = []
+        for o in orders:
+            items.append({
+                "type": "Purchase",
+                "phone": o["phone"],
+                "country": o["country"],
+                "amount": o["amount"],
+                "date": o["created_at"],
+                "status": "Completed"
+            })
+        for d in deposits:
+            items.append({
+                "type": "Deposit",
+                "phone": "-",
+                "country": "-",
+                "amount": d["amount"],
+                "date": d["created_at"],
+                "status": "Approved"
+            })
+
+        items.sort(key=lambda x: x["date"], reverse=True)
+        items = items[:10]
+
+        if not items:
+            txt = "📜 No activity yet."
         else:
-            txt = "📜 **Your Orders:**\n" + "\n".join(
-                f"🔹 {o['phone']} ({o['country']}) - ₹{o['amount']} - {o['created_at'].strftime('%d/%m/%Y')}"
-                for o in orders
+            txt = "📜 **Recent Activity:**\n" + "\n".join(
+                f"🔹 {item['type']}: ₹{item['amount']} - {item['date'].strftime('%d/%m/%Y %H:%M')}"
+                for item in items
             )
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
 
@@ -1223,15 +1242,10 @@ async def start_cmd(event):
 # ---------- OTP LISTENER ----------
 @bot.on(events.NewMessage)
 async def otp_listener(event):
-    """Listens for OTP codes from the temp clients we created."""
-    # Check if this message is from a client we are waiting for
     for (user_id, phone), client in list(pending_otp_requests.items()):
         if event.sender_id == client.sender_id:
-            # This is an OTP message
             text = event.message.text
             if any(x in text.lower() for x in ('code', 'otp', 'login')):
-                # Extract digits
-                import re
                 codes = re.findall(r'\b\d{5,6}\b', text)
                 if codes:
                     code = codes[0]
@@ -1239,7 +1253,6 @@ async def otp_listener(event):
                         await bot.send_message(user_id, f"🔑 **OTP received:** `{code}`")
                     except:
                         pass
-                    # Remove from pending
                     del pending_otp_requests[(user_id, phone)]
                     try:
                         await client.disconnect()
@@ -1256,7 +1269,7 @@ async def main():
         logging.error(f"❌ Failed to start bot: {e}")
         return
 
-    logging.info("🚀 Bot is ready. No validation at startup – only during purchases.")
+    logging.info("🚀 Bot ready. Processing message is minimal.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
