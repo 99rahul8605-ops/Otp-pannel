@@ -240,7 +240,7 @@ async def send_main_menu(event):
     else:
         await event.respond(msg, buttons=buttons)
 
-# ---------- BROADCAST COMMAND (as per your fixed code) ----------
+# ---------- BROADCAST COMMAND (FIXED: reply without --f sends copy text) ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
     user_id = event.sender_id
@@ -259,7 +259,7 @@ async def broadcast_cmd(event):
         msg_parts = msg_parts[1:]
     msg_text = " ".join(msg_parts).strip()
 
-    # Auto-detect forward if reply exists and no text provided
+    # Check reply
     has_reply = event.message.is_reply
     replied = None
     if has_reply:
@@ -270,18 +270,31 @@ async def broadcast_cmd(event):
 
     # Determine mode
     if is_forward:
+        # Explicit forward: must have reply
         if not has_reply:
             await event.respond("❌ Please reply to a message to forward with --f.")
             return
         forward_mode = True
     else:
+        # No --f flag
         if has_reply and not msg_text:
-            forward_mode = True
+            # User replied without text: we want to copy the replied message's text
+            if replied.text:
+                msg_text = replied.text  # use replied text
+                forward_mode = False
+            else:
+                # Replied message has no text (only media, etc.) -> can't copy
+                await event.respond(
+                    "❌ Replied message has no text to copy. Use `--f` to forward media.",
+                    parse_mode='markdown'
+                )
+                return
         else:
+            # Either has custom text, or no reply -> text mode
             forward_mode = False
             if not msg_text:
                 await event.respond(
-                    "❌ Please provide a message to broadcast, or reply to a message to forward it."
+                    "❌ Please provide a message to broadcast, or reply to a message to copy its text."
                 )
                 return
 
@@ -300,7 +313,7 @@ async def broadcast_cmd(event):
         "pin_dm": pin_dm,
         "pin_logs": pin_logs,
         "msg_text": msg_text if not forward_mode else None,
-        "replied_msg": replied if forward_mode else None,
+        "replied_msg": replied if forward_mode else None,  # only needed for forward
         "user_ids": user_ids,
         "total": len(user_ids),
     }
@@ -309,12 +322,13 @@ async def broadcast_cmd(event):
     preview = "📢 **Broadcast Preview**\n\n"
     preview += f"👥 **Recipients:** {len(user_ids)} users\n"
     if forward_mode:
-        preview += "🔄 **Mode:** Forward (replied message will be sent)\n"
+        preview += "🔄 **Mode:** Forward (replied message will be forwarded)\n"
         if replied and replied.text:
             preview += f"📝 **Preview of replied message:**\n`{replied.text[:200]}`\n"
         if replied and replied.media:
             preview += "📎 *Media will be forwarded.*\n"
     else:
+        preview += "📝 **Mode:** Copy text (sender name not included)\n"
         preview += f"📝 **Message:**\n`{msg_text[:500]}`\n"
     if pin_dm:
         preview += "📌 **DM Pin:** Yes (pin in each user's private chat)\n"
