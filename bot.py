@@ -13,8 +13,9 @@ from telethon.errors import (
     ChannelPrivateError,
     InviteHashInvalidError,
     FloodWaitError,
-    UnauthorizedError,          # Explicitly catch
-    AuthKeyError                # Explicitly catch
+    UnauthorizedError,
+    AuthKeyError,
+    RPCError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -243,22 +244,25 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- ENHANCED SESSION VALIDITY CHECK ----------
+# ---------- ROCK‑SOLID SESSION VALIDITY CHECK ----------
 async def is_account_session_valid(phone: str) -> bool:
     """
-    Check if the session for the given phone is still active by calling get_me().
-    Returns True only if get_me() succeeds; otherwise False.
+    Check if the session for the given phone is still active.
+    Uses get_me(force=True) and also fetches a dialog to be absolutely sure.
+    Returns True only if both succeed; otherwise False.
     """
     client = acc_mgr.clients.get(phone)
     if client:
         try:
             if not client.is_connected():
                 await client.connect()
-            # The ultimate test: fetch the current user
-            await client.get_me()
+            # Force a fresh request to the server
+            await client.get_me(force=True)
+            # Additional check: fetch first dialog to confirm session is alive
+            await client.get_dialogs(limit=1)
             return True
-        except (UnauthorizedError, AuthKeyError) as e:
-            logging.warning(f"Session for {phone} is invalid (get_me failed): {e}")
+        except (UnauthorizedError, AuthKeyError, RPCError) as e:
+            logging.warning(f"Session for {phone} is invalid (client check failed): {e}")
             return False
         except Exception as e:
             logging.error(f"Unexpected error checking session for {phone}: {e}")
@@ -273,10 +277,11 @@ async def is_account_session_valid(phone: str) -> bool:
         temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         try:
             await temp_client.connect()
-            await temp_client.get_me()          # This will raise if session is invalid
+            await temp_client.get_me(force=True)
+            await temp_client.get_dialogs(limit=1)
             await temp_client.disconnect()
             return True
-        except (UnauthorizedError, AuthKeyError) as e:
+        except (UnauthorizedError, AuthKeyError, RPCError) as e:
             logging.warning(f"Temp session for {phone} is invalid: {e}")
             return False
         except Exception as e:
@@ -395,7 +400,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- PURCHASE LOGIC WITH IMPROVED SESSION VALIDATION ----------
+    # ---------- PURCHASE LOGIC WITH ROCK‑SOLID VALIDATION ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -404,12 +409,17 @@ async def callback_handler(event):
         country = state["country"]
         price = state["price"]
 
+        # Check balance
         user = await users_col.find_one({"user_id": user_id})
         balance = user["balance"] if user else 0
         if balance < price:
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
+        # Send processing message
+        await event.edit("⏳ **Processing your purchase...**\nChecking account availability...")
+
+        # Fetch all available accounts for this country & price
         cursor = accounts_col.find({
             "country": country,
             "status": "available",
@@ -418,26 +428,28 @@ async def callback_handler(event):
 
         accounts = await cursor.to_list(length=None)
         if not accounts:
-            await event.answer("❌ No accounts available for this selection.", alert=True)
+            await event.edit("❌ No accounts available for this selection.",
+                             buttons=[[Button.inline("🔙 Back", b"buy")]])
             return
 
         sold_account = None
         for acc in accounts:
             phone = acc["phone"]
-            # ENHANCED VALIDATION: now uses get_me()
+            # 🔥 Validate session
             if not await is_account_session_valid(phone):
-                # Mark as invalid and notify admin
+                # Mark as invalid
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "invalid", "invalid_reason": "session_expired"}}
                 )
-                msg = f"⚠️ **Account expired**\nPhone: `{phone}`\nCountry: {country}\nPrice: ₹{price}\nRemoved from stock."
+                msg = f"⚠️ **Account expired & removed**\nPhone: `{phone}`\nCountry: {country}\nPrice: ₹{price}"
                 for admin in ADMIN_IDS:
                     try:
                         await bot.send_message(admin, msg)
                     except:
                         pass
                 await log_event(msg)
+                # Continue to next account
                 continue
             else:
                 # Atomic sell
@@ -457,12 +469,15 @@ async def callback_handler(event):
                     continue
 
         if not sold_account:
-            await event.answer("❌ No valid accounts left. Please try another country or price.", alert=True)
+            await event.edit("❌ No **valid** accounts left. Please try another country or price.",
+                             buttons=[[Button.inline("🔙 Back", b"buy")]])
             return
 
+        # --- Valid account found, complete sale ---
         phone = sold_account["phone"]
         twofa_password = sold_account.get("twofa_password")
 
+        # Deduct balance
         await users_col.update_one(
             {"user_id": user_id},
             {"$inc": {"balance": -price}},
@@ -494,6 +509,7 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
+        # Notify admins & log
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -1260,7 +1276,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with robust session validation (get_me), min deposit, and broadcast.")
+    logging.info("🚀 Bot started with ultra‑strict session validation, min deposit, and broadcast.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
