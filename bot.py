@@ -240,7 +240,7 @@ async def send_main_menu(event):
     else:
         await event.respond(msg, buttons=buttons)
 
-# ---------- BROADCAST COMMAND ----------
+# ---------- IMPROVED BROADCAST COMMAND (with confirmation) ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
     user_id = event.sender_id
@@ -269,46 +269,45 @@ async def broadcast_cmd(event):
             await event.respond("❌ Please provide a message to broadcast, or use --f to forward a replied message.")
             return
 
+    # Get all users
     cursor = users_col.find({}, {"user_id": 1})
     users = await cursor.to_list(length=None)
     user_ids = [u["user_id"] for u in users]
-
     if not user_ids:
         await event.respond("❌ No users found.")
         return
 
-    await event.respond(f"📢 Broadcasting to {len(user_ids)} users... (this may take a while)")
+    # Store broadcast data in user state for confirmation
+    user_states[user_id] = {
+        "action": "broadcast_confirm",
+        "is_forward": is_forward,
+        "is_pin": is_pin,
+        "msg_text": msg_text,
+        "replied_msg": replied if is_forward else None,
+        "user_ids": user_ids,
+        "total": len(user_ids)
+    }
 
-    pin_msg = None
-    if is_pin and LOGS_CHANNEL_ID:
-        try:
-            if is_forward:
-                pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
-            else:
-                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text)
-            await bot.pin_message(LOGS_CHANNEL_ID, pin_msg)
-            await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
-        except Exception as e:
-            logging.error(f"Failed to pin broadcast: {e}")
-            await event.respond(f"⚠️ Could not pin: {e}")
+    # Show preview
+    preview = f"📢 **Broadcast Preview**\n\n"
+    preview += f"👥 **Recipients:** {len(user_ids)} users\n"
+    if is_forward:
+        preview += "🔄 **Mode:** Forward (reply message will be sent)\n"
+        if replied.text:
+            preview += f"📝 **Preview of replied message:**\n`{replied.text[:200]}`\n"
+        if replied.media:
+            preview += "📎 *Media will be forwarded.*\n"
+    else:
+        preview += f"📝 **Message:**\n`{msg_text[:500]}`\n"
+    if is_pin:
+        preview += "📌 **Pin:** Yes (in logs channel)\n"
+    preview += "\nDo you want to send this broadcast?"
 
-    batch_size = 30
-    total = len(user_ids)
-    for i in range(0, total, batch_size):
-        batch = user_ids[i:i+batch_size]
-        tasks = []
-        for uid in batch:
-            try:
-                if is_forward:
-                    tasks.append(bot.forward_messages(uid, replied))
-                else:
-                    tasks.append(bot.send_message(uid, msg_text))
-            except:
-                pass
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.sleep(1)
-
-    await event.respond(f"✅ Broadcast sent to {total} users.")
+    buttons = [
+        [Button.inline("✅ Confirm", b"broadcast_confirm")],
+        [Button.inline("❌ Cancel", b"broadcast_cancel")]
+    ]
+    await event.respond(preview, buttons=buttons)
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -329,7 +328,73 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
-    # Top-level callbacks clear any existing state
+    # --- Broadcast confirmation callbacks ---
+    if data == "broadcast_confirm":
+        state = user_states.get(user_id)
+        if not state or state.get("action") != "broadcast_confirm":
+            await event.answer("No pending broadcast.", alert=True)
+            return
+        
+        is_forward = state["is_forward"]
+        is_pin = state["is_pin"]
+        msg_text = state["msg_text"]
+        replied = state["replied_msg"]
+        user_ids = state["user_ids"]
+        total = len(user_ids)
+
+        await event.edit("⏳ **Sending broadcast...** (this may take a while)")
+        await event.answer("Broadcast started!", alert=True)
+
+        # Pin to logs channel if requested
+        pin_msg = None
+        if is_pin and LOGS_CHANNEL_ID:
+            try:
+                if is_forward:
+                    pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
+                else:
+                    pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode='markdown')
+                await bot.pin_message(LOGS_CHANNEL_ID, pin_msg)
+                await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
+            except Exception as e:
+                logging.error(f"Failed to pin broadcast: {e}")
+                await event.respond(f"⚠️ Could not pin: {e}")
+
+        # Send to users in batches
+        batch_size = 30
+        sent_count = 0
+        for i in range(0, total, batch_size):
+            batch = user_ids[i:i+batch_size]
+            tasks = []
+            for uid in batch:
+                try:
+                    if is_forward:
+                        tasks.append(bot.forward_messages(uid, replied))
+                    else:
+                        tasks.append(bot.send_message(uid, msg_text, parse_mode='markdown'))
+                except:
+                    pass
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Count successful sends (ignore exceptions)
+            for res in results:
+                if not isinstance(res, Exception):
+                    sent_count += 1
+            await asyncio.sleep(1)
+
+        await event.edit(f"✅ **Broadcast completed!**\n"
+                         f"📤 Sent to {sent_count} out of {total} users.\n"
+                         f"📌 Pin: {'Yes' if is_pin else 'No'}")
+        user_states.pop(user_id, None)
+
+    elif data == "broadcast_cancel":
+        state = user_states.pop(user_id, None)
+        if state and state.get("action") == "broadcast_confirm":
+            await event.edit("❌ Broadcast cancelled.")
+            await event.answer("Cancelled", alert=True)
+        else:
+            await event.answer("No broadcast to cancel.", alert=True)
+        return
+
+    # Top-level callbacks clear any existing state (except broadcast)
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice", "admin_support"):
@@ -684,7 +749,7 @@ async def callback_handler(event):
 
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
 
-    # ---------- FIXED: Main menu back button ----------
+    # ---------- Main menu back button ----------
     elif data == "main":
         await send_main_menu(event)
 
