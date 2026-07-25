@@ -20,17 +20,20 @@ from account_manager import AccountManager
 
 # ---------- .env LOAD ----------
 load_dotenv()
-print("🔍 DEBUG:")
-print("API_ID:", repr(API_ID))
-print("API_HASH:", repr(API_HASH))
-print("BOT_TOKEN:", repr(BOT_TOKEN))
-print("ADMIN_IDS:", repr(ADMIN_IDS))
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+print("🔍 DEBUG:")
+print("API_ID:", repr(API_ID))
+print("API_HASH:", repr(API_HASH))
+print("BOT_TOKEN:", repr(BOT_TOKEN))
+print("ADMIN_IDS:", repr(ADMIN_IDS))
+print("MONGO_URL:", repr(MONGO_URL))
+
 UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
