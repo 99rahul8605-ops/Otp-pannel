@@ -86,7 +86,8 @@ bot = TelegramClient(session_name, API_ID, API_HASH)
 
 # ---------- STATE ----------
 user_states = {}
-pending_otp_requests = {}
+# OTP listeners: phone -> (client, task, user_id)
+otp_listeners = {}
 
 # ---------- HELPERS ----------
 async def get_bot_username():
@@ -243,6 +244,83 @@ async def is_session_valid(phone: str) -> bool:
         except:
             pass
 
+# ---------- OTP LISTENER ----------
+async def start_otp_listener(phone: str, user_id: int, session_str: str):
+    """Create a client, connect, and listen for OTP codes."""
+    # If already listening for this phone, cancel old listener
+    if phone in otp_listeners:
+        client, task, _ = otp_listeners[phone]
+        try:
+            task.cancel()
+        except:
+            pass
+        try:
+            await client.disconnect()
+        except:
+            pass
+        del otp_listeners[phone]
+
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return False
+    except Exception as e:
+        logging.error(f"Failed to connect OTP client for {phone}: {e}")
+        return False
+
+    @client.on(events.NewMessage)
+    async def handler(event):
+        text = event.message.text
+        if any(x in text.lower() for x in ('code', 'otp', 'login')):
+            codes = re.findall(r'\b\d{5,6}\b', text)
+            if codes:
+                code = codes[0]
+                try:
+                    await bot.send_message(user_id, f"🔑 **OTP received:** `{code}`")
+                except:
+                    pass
+                # Stop listening after we got code
+                await client.disconnect()
+                if phone in otp_listeners:
+                    del otp_listeners[phone]
+                return
+
+    # Start listening task
+    async def listen():
+        try:
+            await client.run_until_disconnected()
+        except:
+            pass
+        finally:
+            if phone in otp_listeners:
+                del otp_listeners[phone]
+
+    task = asyncio.create_task(listen())
+    otp_listeners[phone] = (client, task, user_id)
+
+    # Timeout after 90 seconds
+    async def timeout():
+        await asyncio.sleep(90)
+        if phone in otp_listeners:
+            c, t, uid = otp_listeners[phone]
+            try:
+                await c.disconnect()
+            except:
+                pass
+            try:
+                t.cancel()
+            except:
+                pass
+            del otp_listeners[phone]
+            try:
+                await bot.send_message(uid, "⏰ No OTP received within 90 seconds. Please try again.")
+            except:
+                pass
+    asyncio.create_task(timeout())
+    return True
+
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -270,9 +348,17 @@ async def callback_handler(event):
     # --- Logout ---
     if data.startswith("logout_"):
         phone = data[len("logout_"):]
-        for key in list(pending_otp_requests.keys()):
-            if key[1] == phone:
-                del pending_otp_requests[key]
+        if phone in otp_listeners:
+            client, task, _ = otp_listeners[phone]
+            try:
+                task.cancel()
+            except:
+                pass
+            try:
+                await client.disconnect()
+            except:
+                pass
+            del otp_listeners[phone]
         await event.answer("🔒 Session terminated.", alert=True)
         try:
             await event.edit(event.message.text + "\n\n🔒 *Session terminated.*", buttons=None)
@@ -351,7 +437,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- PURCHASE (only shows "Processing....") ----------
+    # ---------- PURCHASE ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -366,7 +452,6 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        # Show only "Processing...." - no extra text
         await event.edit("⏳ **Processing....**")
 
         cursor = accounts_col.find({
@@ -509,42 +594,20 @@ async def callback_handler(event):
         else:
             await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
 
-    # ---------- OTP Resend ----------
+    # ---------- OTP Resend (fixed) ----------
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
         account = await accounts_col.find_one({"phone": phone})
         if not account or not account.get("session_string"):
             await event.answer("❌ Account session not found. Contact admin.", alert=True)
             return
-        session_str = account["session_string"]
-        temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        try:
-            await temp_client.connect()
-            if not await temp_client.is_user_authorized():
-                await temp_client.disconnect()
-                await event.answer("❌ Session expired. Contact admin.", alert=True)
-                return
-            pending_otp_requests[(user_id, phone)] = temp_client
-            await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
-        except Exception as e:
-            await temp_client.disconnect()
-            await event.answer(f"❌ Error: {str(e)}", alert=True)
-            return
 
-        async def clear_pending():
-            await asyncio.sleep(90)
-            key = (user_id, phone)
-            if key in pending_otp_requests:
-                client = pending_otp_requests.pop(key)
-                try:
-                    await client.disconnect()
-                except:
-                    pass
-                try:
-                    await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
-                except:
-                    pass
-        asyncio.create_task(clear_pending())
+        # Start OTP listener
+        success = await start_otp_listener(phone, user_id, account["session_string"])
+        if not success:
+            await event.answer("❌ Failed to start OTP listener. Contact admin.", alert=True)
+        else:
+            await event.answer("✅ Listening for OTP. Now try to log in.", alert=True)
 
     elif data == "balance":
         user = await users_col.find_one({"user_id": user_id})
@@ -558,7 +621,7 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
 
-    # ---------- UPDATED ORDERS (includes deposits) ----------
+    # ---------- ORDER HISTORY (including deposits) ----------
     elif data == "orders":
         user_id = event.sender_id
 
@@ -1239,27 +1302,6 @@ async def start_cmd(event):
 
     await show_welcome_menu(event, user_id)
 
-# ---------- OTP LISTENER ----------
-@bot.on(events.NewMessage)
-async def otp_listener(event):
-    for (user_id, phone), client in list(pending_otp_requests.items()):
-        if event.sender_id == client.sender_id:
-            text = event.message.text
-            if any(x in text.lower() for x in ('code', 'otp', 'login')):
-                codes = re.findall(r'\b\d{5,6}\b', text)
-                if codes:
-                    code = codes[0]
-                    try:
-                        await bot.send_message(user_id, f"🔑 **OTP received:** `{code}`")
-                    except:
-                        pass
-                    del pending_otp_requests[(user_id, phone)]
-                    try:
-                        await client.disconnect()
-                    except:
-                        pass
-                    break
-
 # ---------- MAIN ----------
 async def main():
     try:
@@ -1269,7 +1311,7 @@ async def main():
         logging.error(f"❌ Failed to start bot: {e}")
         return
 
-    logging.info("🚀 Bot ready. Processing message is minimal.")
+    logging.info("🚀 Bot ready. OTP delivery is now fixed.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
