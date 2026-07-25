@@ -113,40 +113,21 @@ async def log_event(text):
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- SESSION VALIDATION (FIXED - uses persistent client if available) ----------
+# ---------- SESSION VALIDATION (SIMPLE & SAFE) ----------
 async def is_session_valid(phone: str) -> bool:
-    """Check if the session for the given phone is still active.
-    Uses the persistent client if it exists to avoid disconnecting it."""
-    account = await accounts_col.find_one({"phone": phone})
-    if not account or not account.get("session_string"):
-        return False
-
-    # Prefer the persistent client if it is loaded
+    """
+    Check if the account is loaded in AccountManager and its session is active.
+    Uses the persistent client – no temporary connection, so OTP forwarding is never broken.
+    """
     client = acc_mgr.clients.get(phone)
-    if client:
-        try:
-            if not client.is_connected():
-                await client.connect()
-            await client.get_me()                # Primary check
-            return True
-        except Exception:
-            return False
-    else:
-        # No persistent client → create a temporary one (will be disconnected)
-        session_str = account["session_string"]
-        temp = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        try:
-            await temp.connect()
-            await temp.get_me()
-            await temp.get_dialogs(limit=1)     # Extra verification
-            return True
-        except Exception:
-            return False
-        finally:
-            try:
-                await temp.disconnect()
-            except:
-                pass
+    if not client:
+        return False
+    try:
+        if not client.is_connected():
+            await client.connect()
+        return await client.is_user_authorized()
+    except Exception:
+        return False
 
 # ---------- FORCE JOIN (unchanged) ----------
 def parse_chat_id(raw_id: str):
@@ -406,7 +387,7 @@ async def callback_handler(event):
         for acc in available_accounts:
             phone = acc["phone"]
 
-            # REAL session check using persistent client if possible
+            # Simple validation: check if loaded and authorized
             if not await is_session_valid(phone):
                 # Mark invalid and remove from cache if present
                 await accounts_col.update_one(
@@ -1138,7 +1119,7 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with strict session validation (preserving OTP).")
+    logging.info("🚀 Bot started with simple session validation (OTP safe).")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
