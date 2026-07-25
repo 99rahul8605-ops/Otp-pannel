@@ -26,14 +26,6 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-
-print("🔍 DEBUG:")
-print("API_ID:", repr(API_ID))
-print("API_HASH:", repr(API_HASH))
-print("BOT_TOKEN:", repr(BOT_TOKEN))
-print("ADMIN_IDS:", repr(ADMIN_IDS))
-print("MONGO_URL:", repr(MONGO_URL))
-
 UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
@@ -50,6 +42,7 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
+# Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -85,9 +78,6 @@ pending_otp_requests = {}
 # ---------- Bot Username Cache ----------
 bot_username = None
 
-# ---------- GLOBAL AccountManager ----------
-acc_mgr = None
-
 async def get_bot_username():
     global bot_username
     if bot_username is None:
@@ -121,27 +111,7 @@ async def log_event(text):
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- SESSION VALIDATION (SAFE – uses persistent client) ----------
-async def is_session_valid(phone: str) -> bool:
-    """
-    Check if the account's persistent client is connected and authorized.
-    Uses the existing client – no temporary connections, so OTP forwarding is never broken.
-    """
-    client = acc_mgr.clients.get(phone)
-    if not client:
-        logging.warning(f"No client in memory for {phone}")
-        return False
-    try:
-        if not client.is_connected():
-            await client.connect()
-        # Real server check – will raise if session invalid/revoked
-        await client.get_me()
-        return True
-    except Exception as e:
-        logging.warning(f"Session check failed for {phone}: {e}")
-        return False
-
-# ---------- FORCE JOIN (unchanged) ----------
+# ---------- FORCE JOIN ----------
 def parse_chat_id(raw_id: str):
     raw = raw_id.strip()
     if raw.startswith('@'):
@@ -280,12 +250,13 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
+    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice", "admin_support"):
         user_states.pop(user_id, None)
 
-    # --- Logout ---
+    # --- Logout button callback ---
     if data.startswith("logout_"):
         phone = data[len("logout_"):]
         await acc_mgr.logout_client(phone)
@@ -297,7 +268,7 @@ async def callback_handler(event):
             pass
         return
 
-    # --- Referral ---
+    # --- Referral Info Button ---
     if data == "referral_info":
         username = await get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -314,7 +285,7 @@ async def callback_handler(event):
         await event.edit(text, buttons=[[Button.inline("🔙 Back", b"main")]])
         return
 
-    # --- Purchase flow ---
+    # --- User purchase flow ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -368,7 +339,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- CONFIRM PURCHASE WITH SESSION VALIDATION ----------
+    # ---------- MODIFIED: confirm_purchase with session validation ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -383,58 +354,54 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        # Get all available accounts for this selection
-        available_accounts = await accounts_col.find(
-            {"country": country, "status": "available", "price": price}
-        ).to_list(length=None)
-
-        if not available_accounts:
-            await event.answer("❌ No accounts available for this selection.", alert=True)
+        # 1️⃣ Fetch all available accounts for this country & price
+        cursor = accounts_col.find({"country": country, "status": "available", "price": price})
+        accounts = await cursor.to_list(length=None)
+        if not accounts:
+            await event.answer("❌ No accounts available in this category!", alert=True)
             return
 
-        success = False
-        sold_acc = None
+        selected_acc = None
+        for acc in accounts:
+            # 2️⃣ Try to atomically mark this account as sold
+            updated = await accounts_col.find_one_and_update(
+                {"_id": acc["_id"], "status": "available"},
+                {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
+            )
+            if updated is None:
+                continue  # someone else took it
 
-        # Iterate and validate each account
-        for acc in available_accounts:
             phone = acc["phone"]
-
-            # REAL session check using persistent client (no disconnection)
-            if not await is_session_valid(phone):
-                # Mark invalid and remove from cache if present
-                await accounts_col.update_one(
-                    {"_id": acc["_id"]},
-                    {"$set": {"status": "invalid", "invalid_reason": "session_inactive"}}
-                )
-                # Remove from acc_mgr.clients if it exists (and disconnect)
-                if acc_mgr and phone in acc_mgr.clients:
-                    try:
-                        await acc_mgr.clients[phone].disconnect()
-                    except:
-                        pass
-                    del acc_mgr.clients[phone]
-                await log_event(f"⚠️ Account {phone} marked invalid – session inactive.")
+            # 3️⃣ Check if session is active
+            client = acc_mgr.clients.get(phone)
+            valid = False
+            if client:
+                try:
+                    await client.get_me()  # this will connect and verify authorization
+                    valid = True
+                except Exception as e:
+                    logging.warning(f"Session invalid for {phone}: {e}")
+                    # mark as inactive
+                    await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
+                    continue
+            else:
+                # no client means invalid
+                await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
                 continue
 
-            # Atomically try to sell this account
-            sold_acc = await accounts_col.find_one_and_update(
-                {"_id": acc["_id"], "status": "available"},
-                {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}},
-                return_document=True
-            )
-            if sold_acc:
-                success = True
-                break
+            # ✅ Valid account found
+            selected_acc = updated  # updated contains the sold doc
+            break
 
-        if not success:
-            await event.answer("❌ No active accounts available. Please try later or contact admin.", alert=True)
+        if selected_acc is None:
+            await event.answer("❌ No active accounts available! Please try later.", alert=True)
             return
 
-        # Proceed with purchase
-        acc = sold_acc
+        acc = selected_acc
         phone = acc["phone"]
         twofa_password = acc.get("twofa_password")
 
+        # 4️⃣ Deduct balance
         await users_col.update_one(
             {"user_id": user_id},
             {"$inc": {"balance": -price}},
@@ -466,7 +433,7 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
-        # Notifications
+        # 5️⃣ Admin notification & logs
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -681,7 +648,6 @@ async def callback_handler(event):
             pass
 
         await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-
         await log_event(
             f"✅ **Deposit Approved**\n"
             f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
@@ -704,9 +670,20 @@ async def callback_handler(event):
             pass
         await event.edit("❌ Deposit rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
 
-    elif data == "main":
-        await send_main_menu(event)
+    # ---------- NEW: Admin Set Price ----------
+    elif data == "admin_setprice":
+        if user_id not in ADMIN_IDS:
+            await event.answer("❌ Unauthorized", alert=True)
+            return
+        user_states[user_id] = {"action": "set_price", "step": "await_price"}
+        await event.edit(
+            "💲 **Set Default Price**\n\n"
+            "Send the new default price for accounts (e.g., `50`).\n"
+            "This price will apply when adding new accounts if not specified.",
+            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+        )
 
+    # ---------- Admin Set Support Link ----------
     elif data == "admin_support":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -941,7 +918,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW ----------
+# ---------- DEPOSIT FLOW (screenshot) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -1022,7 +999,7 @@ async def process_deposit_step(event):
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
 
-# ---------- TEXT MESSAGE HANDLER ----------
+# ---------- HANDLE ALL TEXT MESSAGES ----------
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
     user_id = event.sender_id
@@ -1088,6 +1065,30 @@ async def handle_message(event):
                 await event.respond(f"✅ Support link updated to:\n`{link}`",
                                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             user_states.pop(user_id, None)
+    # ---------- NEW: Admin Set Price handler ----------
+    elif action == "set_price":
+        step = state.get("step")
+        if step == "await_price":
+            try:
+                new_price = float(event.message.text.strip())
+                if new_price <= 0:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid price. Send a positive number (e.g., 50):",
+                                    buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                return
+            # Update DEFAULT_PRICE in DB or env? We'll store in settings collection
+            await settings_col.update_one(
+                {"key": "default_price"},
+                {"$set": {"value": new_price, "updated_at": datetime.utcnow()}},
+                upsert=True
+            )
+            # Also update global variable so it reflects immediately
+            global DEFAULT_PRICE
+            DEFAULT_PRICE = new_price
+            await event.respond(f"✅ Default price updated to ₹{new_price}.",
+                                buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            user_states.pop(user_id, None)
     else:
         await send_main_menu(event)
 
@@ -1127,11 +1128,11 @@ async def start_cmd(event):
 
 # ---------- MAIN FUNCTION ----------
 async def main():
-    global acc_mgr
     await bot.start(bot_token=BOT_TOKEN)
+    global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started – session validation uses persistent clients, OTP safe.")
+    logging.info("🚀 Bot started with logout button on OTP...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
