@@ -240,7 +240,7 @@ async def send_main_menu(event):
     else:
         await event.respond(msg, buttons=buttons)
 
-# ---------- IMPROVED BROADCAST COMMAND (with confirmation) ----------
+# ---------- BROADCAST COMMAND (with DM pin via --p) ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
     user_id = event.sender_id
@@ -250,24 +250,39 @@ async def broadcast_cmd(event):
 
     args = event.message.text.split()
     is_forward = "--f" in args
-    is_pin = "--pin" in args
+    pin_dm = "--p" in args          # DM pin
+    pin_logs = ("--pin" in args)    # logs channel pin (old --pin)
+    # Also allow --p as alias for --pin? No, we now separate: --p = DM pin, --pin = logs pin.
+    # If user wants both, they can use both flags.
+    
     msg_parts = [arg for arg in args if not arg.startswith("--")]
     if msg_parts and msg_parts[0] == "/broadcast":
         msg_parts = msg_parts[1:]
     msg_text = " ".join(msg_parts).strip()
 
-    if is_forward:
-        if not event.message.is_reply:
-            await event.respond("❌ Please reply to a message to forward with --f.")
-            return
+    # Auto-detect forward if reply exists and no text provided
+    has_reply = event.message.is_reply
+    replied = None
+    if has_reply:
         replied = await event.message.get_reply_message()
         if not replied:
             await event.respond("❌ Could not get replied message.")
             return
-    else:
-        if not msg_text:
-            await event.respond("❌ Please provide a message to broadcast, or use --f to forward a replied message.")
+
+    # Determine mode
+    if is_forward:
+        if not has_reply:
+            await event.respond("❌ Please reply to a message to forward with --f.")
             return
+        forward_mode = True
+    else:
+        if has_reply and not msg_text:
+            forward_mode = True
+        else:
+            forward_mode = False
+            if not msg_text:
+                await event.respond("❌ Please provide a message to broadcast, or reply to a message to forward it.")
+                return
 
     # Get all users
     cursor = users_col.find({}, {"user_id": 1})
@@ -280,10 +295,11 @@ async def broadcast_cmd(event):
     # Store broadcast data in user state for confirmation
     user_states[user_id] = {
         "action": "broadcast_confirm",
-        "is_forward": is_forward,
-        "is_pin": is_pin,
-        "msg_text": msg_text,
-        "replied_msg": replied if is_forward else None,
+        "is_forward": forward_mode,
+        "pin_dm": pin_dm,
+        "pin_logs": pin_logs,
+        "msg_text": msg_text if not forward_mode else None,
+        "replied_msg": replied if forward_mode else None,
         "user_ids": user_ids,
         "total": len(user_ids)
     }
@@ -291,16 +307,18 @@ async def broadcast_cmd(event):
     # Show preview
     preview = f"📢 **Broadcast Preview**\n\n"
     preview += f"👥 **Recipients:** {len(user_ids)} users\n"
-    if is_forward:
-        preview += "🔄 **Mode:** Forward (reply message will be sent)\n"
+    if forward_mode:
+        preview += "🔄 **Mode:** Forward (replied message will be sent)\n"
         if replied.text:
             preview += f"📝 **Preview of replied message:**\n`{replied.text[:200]}`\n"
         if replied.media:
             preview += "📎 *Media will be forwarded.*\n"
     else:
         preview += f"📝 **Message:**\n`{msg_text[:500]}`\n"
-    if is_pin:
-        preview += "📌 **Pin:** Yes (in logs channel)\n"
+    if pin_dm:
+        preview += "📌 **DM Pin:** Yes (pin in each user's private chat)\n"
+    if pin_logs and LOGS_CHANNEL_ID:
+        preview += "📌 **Logs Pin:** Yes (pin in logs channel)\n"
     preview += "\nDo you want to send this broadcast?"
 
     buttons = [
@@ -336,7 +354,8 @@ async def callback_handler(event):
             return
         
         is_forward = state["is_forward"]
-        is_pin = state["is_pin"]
+        pin_dm = state["pin_dm"]
+        pin_logs = state["pin_logs"]
         msg_text = state["msg_text"]
         replied = state["replied_msg"]
         user_ids = state["user_ids"]
@@ -347,7 +366,7 @@ async def callback_handler(event):
 
         # Pin to logs channel if requested
         pin_msg = None
-        if is_pin and LOGS_CHANNEL_ID:
+        if pin_logs and LOGS_CHANNEL_ID:
             try:
                 if is_forward:
                     pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
@@ -357,11 +376,14 @@ async def callback_handler(event):
                 await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
             except Exception as e:
                 logging.error(f"Failed to pin broadcast: {e}")
-                await event.respond(f"⚠️ Could not pin: {e}")
+                await event.respond(f"⚠️ Could not pin in logs channel: {e}")
 
         # Send to users in batches
         batch_size = 30
         sent_count = 0
+        pin_success = 0
+        pin_failed = 0
+
         for i in range(0, total, batch_size):
             batch = user_ids[i:i+batch_size]
             tasks = []
@@ -374,15 +396,35 @@ async def callback_handler(event):
                 except:
                     pass
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            # Count successful sends (ignore exceptions)
-            for res in results:
-                if not isinstance(res, Exception):
-                    sent_count += 1
+            # results is a list of messages (or exceptions)
+            for idx, res in enumerate(results):
+                if isinstance(res, Exception):
+                    continue
+                # message sent successfully
+                sent_count += 1
+                # pin in DM if requested
+                if pin_dm:
+                    try:
+                        # res is the sent message object
+                        await bot.pin_chat_message(
+                            chat_id=user_ids[i+idx],
+                            message_id=res.id,
+                            disable_notification=True
+                        )
+                        pin_success += 1
+                    except Exception as e:
+                        pin_failed += 1
+                        logging.warning(f"DM pin failed for {user_ids[i+idx]}: {e}")
             await asyncio.sleep(1)
 
-        await event.edit(f"✅ **Broadcast completed!**\n"
-                         f"📤 Sent to {sent_count} out of {total} users.\n"
-                         f"📌 Pin: {'Yes' if is_pin else 'No'}")
+        # Build final message
+        final = f"✅ **Broadcast completed!**\n"
+        final += f"📤 Sent to {sent_count} out of {total} users.\n"
+        if pin_dm:
+            final += f"📌 DM pins: {pin_success} success, {pin_failed} failed.\n"
+        if pin_logs and LOGS_CHANNEL_ID:
+            final += "📌 Logs pin: Done (if successful).\n"
+        await event.edit(final)
         user_states.pop(user_id, None)
 
     elif data == "broadcast_cancel":
