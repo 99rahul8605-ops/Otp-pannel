@@ -12,7 +12,9 @@ from telethon.errors import (
     ChatAdminRequiredError,
     ChannelPrivateError,
     InviteHashInvalidError,
-    FloodWaitError
+    FloodWaitError,
+    UnauthorizedError,          # Explicitly catch
+    AuthKeyError                # Explicitly catch
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -43,7 +45,6 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
-# Broadcast channel for pinning
 BROADCAST_CHANNEL_ID = os.getenv("BROADCAST_CHANNEL_ID", "").strip()
 if BROADCAST_CHANNEL_ID:
     try:
@@ -54,7 +55,6 @@ if BROADCAST_CHANNEL_ID:
 else:
     BROADCAST_CHANNEL_ID = None
 
-# Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -243,31 +243,50 @@ async def send_main_menu(event):
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
 
-# ---------- SESSION VALIDITY CHECK ----------
+# ---------- ENHANCED SESSION VALIDITY CHECK ----------
 async def is_account_session_valid(phone: str) -> bool:
+    """
+    Check if the session for the given phone is still active by calling get_me().
+    Returns True only if get_me() succeeds; otherwise False.
+    """
     client = acc_mgr.clients.get(phone)
     if client:
         try:
             if not client.is_connected():
                 await client.connect()
-            return await client.is_user_authorized()
+            # The ultimate test: fetch the current user
+            await client.get_me()
+            return True
+        except (UnauthorizedError, AuthKeyError) as e:
+            logging.warning(f"Session for {phone} is invalid (get_me failed): {e}")
+            return False
         except Exception as e:
-            logging.error(f"Error checking existing client for {phone}: {e}")
+            logging.error(f"Unexpected error checking session for {phone}: {e}")
             return False
     else:
+        # Not in memory – fetch session string from DB
         account = await accounts_col.find_one({"phone": phone})
         if not account or not account.get("session_string"):
+            logging.warning(f"No session string in DB for {phone}")
             return False
         session_str = account["session_string"]
         temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         try:
             await temp_client.connect()
-            valid = await temp_client.is_user_authorized()
+            await temp_client.get_me()          # This will raise if session is invalid
             await temp_client.disconnect()
-            return valid
+            return True
+        except (UnauthorizedError, AuthKeyError) as e:
+            logging.warning(f"Temp session for {phone} is invalid: {e}")
+            return False
         except Exception as e:
             logging.error(f"Error checking temp client for {phone}: {e}")
             return False
+        finally:
+            try:
+                await temp_client.disconnect()
+            except:
+                pass
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -376,7 +395,7 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- UPDATED PURCHASE LOGIC WITH SESSION VALIDATION ----------
+    # ---------- PURCHASE LOGIC WITH IMPROVED SESSION VALIDATION ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -405,7 +424,9 @@ async def callback_handler(event):
         sold_account = None
         for acc in accounts:
             phone = acc["phone"]
+            # ENHANCED VALIDATION: now uses get_me()
             if not await is_account_session_valid(phone):
+                # Mark as invalid and notify admin
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "invalid", "invalid_reason": "session_expired"}}
@@ -419,6 +440,7 @@ async def callback_handler(event):
                 await log_event(msg)
                 continue
             else:
+                # Atomic sell
                 result = await accounts_col.find_one_and_update(
                     {"_id": acc["_id"], "status": "available"},
                     {"$set": {
@@ -431,6 +453,7 @@ async def callback_handler(event):
                     sold_account = result
                     break
                 else:
+                    # Someone else bought it, move to next
                     continue
 
         if not sold_account:
@@ -1033,7 +1056,6 @@ async def broadcast_command(event):
         await event.respond("❌ You are not authorized to use this command.")
         return
 
-    # Parse flags
     args = event.message.text.split()
     flags = set()
     text_parts = []
@@ -1044,14 +1066,11 @@ async def broadcast_command(event):
             text_parts.append(arg)
     text = ' '.join(text_parts)
 
-    # Determine if we are replying to a message
     reply = await event.get_reply_message()
     if reply:
         if 'f' in flags:
-            # Forward the replied message
             message_to_send = reply
         else:
-            # Send the text of the replied message (or the text of the original message)
             if reply.text:
                 message_to_send = reply.text
             else:
@@ -1063,13 +1082,11 @@ async def broadcast_command(event):
             return
         message_to_send = text
 
-    # Get all users
     all_users = await users_col.find({}, {"user_id": 1}).to_list(length=None)
     if not all_users:
         await event.respond("❌ No users in database.")
         return
 
-    # Confirm
     confirm_msg = await event.respond(
         f"📢 **Broadcast to {len(all_users)} users**\n"
         f"Flags: {', '.join(flags) if flags else 'None'}\n"
@@ -1077,17 +1094,15 @@ async def broadcast_command(event):
         "Reply with **yes** to confirm, or **no** to cancel."
     )
 
-    # Wait for admin's confirmation reply
     @bot.on(events.NewMessage(from_users=user_id, func=lambda e: e.is_private and e.text.lower() in ('yes', 'no')))
     async def confirm_handler(confirm_event):
         if confirm_event.text.lower() == 'no':
             await confirm_event.respond("❌ Broadcast cancelled.")
             return
-        # Proceed with broadcast
         await confirm_event.respond(f"🔄 Broadcasting to {len(all_users)} users...")
         success = 0
         failed = 0
-        semaphore = asyncio.Semaphore(50)  # limit concurrent sends
+        semaphore = asyncio.Semaphore(50)
 
         async def send_one(user_doc):
             nonlocal success, failed
@@ -1097,12 +1112,10 @@ async def broadcast_command(event):
                     if isinstance(message_to_send, str):
                         await bot.send_message(uid, message_to_send)
                     else:
-                        # Forward the message
                         await bot.forward_messages(uid, message_to_send)
                     success += 1
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds)
-                # retry once
                 try:
                     if isinstance(message_to_send, str):
                         await bot.send_message(uid, message_to_send)
@@ -1114,11 +1127,9 @@ async def broadcast_command(event):
             except:
                 failed += 1
 
-        # Send in batches with progress
         tasks = [send_one(u) for u in all_users]
         await asyncio.gather(*tasks)
 
-        # If --p flag, pin the broadcast in the broadcast channel
         if 'p' in flags and BROADCAST_CHANNEL_ID:
             try:
                 pin_msg = f"📢 **Broadcast sent**\nSent to {success} users, {failed} failed."
@@ -1129,13 +1140,10 @@ async def broadcast_command(event):
                 logging.error(f"Failed to pin broadcast: {e}")
 
         await confirm_event.respond(f"✅ Broadcast complete.\n✅ Sent to {success} users.\n❌ Failed: {failed}.")
-        # Remove listener
         confirm_handler.remove()
 
-    # Set a timeout for confirmation
     async def timeout():
         await asyncio.sleep(60)
-        # Remove listener if still active
         confirm_handler.remove()
         try:
             await event.respond("⏰ Broadcast confirmation timed out.")
@@ -1252,7 +1260,7 @@ async def main():
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
     await acc_mgr.load_all()
-    logging.info("🚀 Bot started with session validation, min deposit, and broadcast command.")
+    logging.info("🚀 Bot started with robust session validation (get_me), min deposit, and broadcast.")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
