@@ -2,7 +2,6 @@ import os
 import io
 import asyncio
 import logging
-import re
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
@@ -12,30 +11,26 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    FloodWaitError,
-    UnauthorizedError,
-    AuthKeyError,
-    RPCError
+    InviteHashInvalidError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
+from account_manager import AccountManager
 
 # ---------- .env LOAD ----------
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN missing in .env!")
-
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 UPI_ID = os.getenv("UPI_ID", "example@upi")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop")
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50"))
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5"))
+# NEW: Minimum deposit amount
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10"))
 
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
@@ -44,18 +39,11 @@ if LOGS_CHANNEL_ID:
         LOGS_CHANNEL_ID = int(LOGS_CHANNEL_ID)
     except ValueError:
         LOGS_CHANNEL_ID = None
+        logging.warning("LOGS_CHANNEL_ID is not a valid integer, logs disabled.")
 else:
     LOGS_CHANNEL_ID = None
 
-BROADCAST_CHANNEL_ID = os.getenv("BROADCAST_CHANNEL_ID", "").strip()
-if BROADCAST_CHANNEL_ID:
-    try:
-        BROADCAST_CHANNEL_ID = int(BROADCAST_CHANNEL_ID)
-    except ValueError:
-        BROADCAST_CHANNEL_ID = None
-else:
-    BROADCAST_CHANNEL_ID = None
-
+# Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -66,55 +54,68 @@ else:
     RAW_CHAT_IDS = []
 
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
-    raise ValueError("❌ .env incomplete!")
+    raise ValueError("❌ .env file incomplete!")
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------- MongoDB ----------
+# ---------- MongoDB Setup ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client['otp_bot']
 accounts_col = db['accounts']
 users_col = db['users']
 orders_col = db['orders']
 deposits_col = db['deposits']
-settings_col = db['settings']
+settings_col = db['settings']  # Added for dynamic settings like support link
 
-# ---------- BOT ----------
+# ---------- BOT INSTANCE ----------
+# Use bot token hash as part of session name so changing token creates fresh session
 import hashlib
 session_name = "bot_session_" + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:8]
 bot = TelegramClient(session_name, API_ID, API_HASH)
 
-# ---------- STATE ----------
+# ---------- STATE MACHINE ----------
 user_states = {}
-otp_listeners = {}  # phone -> (client, task, user_id)
+pending_otp_requests = {}
 
-# ---------- HELPERS ----------
+# ---------- Bot Username Cache ----------
+bot_username = None
+
 async def get_bot_username():
-    me = await bot.get_me()
-    return me.username
+    global bot_username
+    if bot_username is None:
+        me = await bot.get_me()
+        bot_username = me.username
+    return bot_username
 
+# ---------- SETTINGS HELPERS ----------
 async def get_support_link():
+    """Fetch the support link from DB, fallback to env or None."""
     setting = await settings_col.find_one({"key": "support_link"})
-    return setting.get("value") if setting else os.getenv("SUPPORT_LINK", "").strip() or None
+    if setting:
+        return setting.get("value")
+    return os.getenv("SUPPORT_LINK", "").strip() or None
 
 async def set_support_link(link: str):
+    """Update or insert the support link in DB."""
     await settings_col.update_one(
         {"key": "support_link"},
         {"$set": {"value": link, "updated_at": datetime.utcnow()}},
         upsert=True
     )
 
+# ---------- LOGS CHANNEL HELPER ----------
 async def log_event(text):
     if LOGS_CHANNEL_ID:
         try:
             await bot.send_message(LOGS_CHANNEL_ID, text)
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"Failed to send log to channel: {e}")
 
+# ---------- HELPER ----------
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
 
-# ---------- FORCE JOIN ----------
+# ---------- FORCE JOIN (improved) ----------
 def parse_chat_id(raw_id: str):
     raw = raw_id.strip()
     if raw.startswith('@'):
@@ -122,6 +123,7 @@ def parse_chat_id(raw_id: str):
     try:
         return int(raw)
     except ValueError:
+        logging.error(f"Invalid chat ID format: {raw}")
         return None
 
 async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
@@ -132,7 +134,13 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
         entity = await bot.get_entity(parsed)
         await bot.get_permissions(entity, user_id)
         return True
-    except:
+    except UserNotParticipantError:
+        return False
+    except (ChatAdminRequiredError, ChannelPrivateError) as e:
+        logging.error(f"Cannot verify membership for '{chat_id_raw}': {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Error checking '{chat_id_raw}': {type(e).__name__}: {e}")
         return False
 
 async def is_user_member(user_id: int) -> bool:
@@ -150,10 +158,11 @@ async def send_join_message(event):
             continue
         title = raw_id
         try:
-            entity = await bot.get_entity(parse_chat_id(raw_id))
+            parsed = parse_chat_id(raw_id)
+            entity = await bot.get_entity(parsed)
             title = getattr(entity, 'title', raw_id)
-        except:
-            pass
+        except Exception as e:
+            logging.warning(f"Could not get title for {raw_id}: {e}")
         if raw_id.startswith('@'):
             link = f"https://t.me/{raw_id[1:]}"
             buttons.append([Button.url(f"📢 Join {title}", link)])
@@ -166,8 +175,10 @@ async def send_join_message(event):
                     usage_limit=0
                 ))
                 invite_link = result.link
-            except:
-                pass
+            except ChatAdminRequiredError:
+                logging.error(f"Bot is not admin in '{raw_id}', cannot generate invite link.")
+            except Exception as e:
+                logging.error(f"Failed to export invite for '{raw_id}': {type(e).__name__}: {e}")
             if invite_link:
                 buttons.append([Button.url(f"📢 Join {title}", invite_link)])
             else:
@@ -177,10 +188,10 @@ async def send_join_message(event):
     buttons.append([Button.inline("✅ Check Again", b"check_join")])
     await event.respond("🔒 **You must join the channels below to use the bot.**", buttons=buttons)
 
-# ---------- MENUS ----------
+# ---------- WELCOME MENU ----------
 async def show_welcome_menu(event, user_id):
     username = await get_bot_username()
-    ref_link = f"https://t.me/{username}?start=ref{user_id}"
+    ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
     welcome_msg = (
         "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
@@ -195,6 +206,7 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("📜 Order History", b"orders")],
         [Button.inline("👥 Referral Program", b"referral_info")],
     ]
+    # Add dynamic Support button
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
@@ -205,6 +217,7 @@ async def show_welcome_menu(event, user_id):
     else:
         await event.respond(welcome_msg, buttons=buttons)
 
+# ---------- MAIN MENU ----------
 async def send_main_menu(event):
     user_id = event.sender_id
     if not await is_user_member(user_id):
@@ -216,107 +229,13 @@ async def send_main_menu(event):
         [Button.inline("💳 Deposit", b"deposit")],
         [Button.inline("📜 Order History", b"orders")],
     ]
+    # Add dynamic Support button
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
     if user_id in ADMIN_IDS:
         buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     await event.respond("🌟 **OTP Bot Main Menu**", buttons=buttons)
-
-# ---------- SESSION VALIDATION ----------
-async def is_session_valid(phone: str) -> bool:
-    account = await accounts_col.find_one({"phone": phone})
-    if not account or not account.get("session_string"):
-        return False
-    session_str = account["session_string"]
-    temp = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    try:
-        await temp.connect()
-        await temp.get_me()
-        await temp.get_dialogs(limit=1)
-        return True
-    except:
-        return False
-    finally:
-        try:
-            await temp.disconnect()
-        except:
-            pass
-
-# ---------- OTP LISTENER (FIXED) ----------
-async def start_otp_listener(phone: str, user_id: int, session_str: str):
-    """Create a client, connect, and listen for OTP codes."""
-    # If already listening for this phone, cancel old listener
-    if phone in otp_listeners:
-        client, task, _ = otp_listeners[phone]
-        try:
-            task.cancel()
-        except:
-            pass
-        try:
-            await client.disconnect()
-        except:
-            pass
-        del otp_listeners[phone]
-
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-
-    # Define the event handler
-    @client.on(events.NewMessage)
-    async def handler(event):
-        text = event.message.text
-        # Look for OTP codes (5-6 digits)
-        codes = re.findall(r'\b\d{5,6}\b', text)
-        if codes:
-            code = codes[0]
-            try:
-                await bot.send_message(user_id, f"🔑 **OTP received:** `{code}`")
-            except Exception as e:
-                logging.error(f"Failed to send OTP to user {user_id}: {e}")
-            # Disconnect after sending the code
-            await client.disconnect()
-            if phone in otp_listeners:
-                del otp_listeners[phone]
-
-    # Connect and start listening in a background task
-    async def listen():
-        try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                logging.warning(f"Client not authorized for {phone}")
-                await client.disconnect()
-                return
-            logging.info(f"OTP listener started for {phone}")
-            await client.run_until_disconnected()
-        except Exception as e:
-            logging.error(f"OTP listener error for {phone}: {e}")
-        finally:
-            if phone in otp_listeners:
-                del otp_listeners[phone]
-
-    task = asyncio.create_task(listen())
-    otp_listeners[phone] = (client, task, user_id)
-
-    # Timeout after 90 seconds
-    async def timeout():
-        await asyncio.sleep(90)
-        if phone in otp_listeners:
-            c, t, uid = otp_listeners[phone]
-            try:
-                await c.disconnect()
-            except:
-                pass
-            try:
-                t.cancel()
-            except:
-                pass
-            del otp_listeners[phone]
-            try:
-                await bot.send_message(uid, "⏰ No OTP received within 90 seconds. Please try again.")
-            except:
-                pass
-    asyncio.create_task(timeout())
-    return True
 
 # ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
@@ -337,36 +256,28 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
+    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
                 "admin_deposits", "admin_setprice", "admin_support"):
         user_states.pop(user_id, None)
 
-    # --- Logout ---
+    # --- Logout button callback ---
     if data.startswith("logout_"):
         phone = data[len("logout_"):]
-        if phone in otp_listeners:
-            client, task, _ = otp_listeners[phone]
-            try:
-                task.cancel()
-            except:
-                pass
-            try:
-                await client.disconnect()
-            except:
-                pass
-            del otp_listeners[phone]
-        await event.answer("🔒 Session terminated.", alert=True)
+        await acc_mgr.logout_client(phone)
+        await event.answer("🔒 Session terminated. You will no longer receive OTPs for this number.", alert=True)
         try:
-            await event.edit(event.message.text + "\n\n🔒 *Session terminated.*", buttons=None)
+            original_text = event.message.text if event.message else ""
+            await event.edit(original_text + "\n\n🔒 *Session terminated.*", buttons=None)
         except:
             pass
         return
 
-    # --- Referral ---
+    # --- Referral Info Button ---
     if data == "referral_info":
         username = await get_bot_username()
-        ref_link = f"https://t.me/{username}?start=ref{user_id}"
+        ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
         invited_count = await users_col.count_documents({"referred_by": user_id})
         paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
         text = (
@@ -380,7 +291,7 @@ async def callback_handler(event):
         await event.edit(text, buttons=[[Button.inline("🔙 Back", b"main")]])
         return
 
-    # --- Buy flow ---
+    # --- User purchase flow ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -434,7 +345,6 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- PURCHASE ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -449,56 +359,14 @@ async def callback_handler(event):
             await event.answer("❌ Insufficient balance!", alert=True)
             return
 
-        await event.edit("⏳ **Processing....**")
-
-        cursor = accounts_col.find({
-            "country": country,
-            "status": "available",
-            "price": price
-        }).sort("_id", 1)
-        accounts = await cursor.to_list(length=None)
-
-        if not accounts:
-            await event.edit("❌ No accounts available for this selection.",
-                             buttons=[[Button.inline("🔙 Back", b"buy")]])
+        acc = await accounts_col.find_one_and_update(
+            {"country": country, "status": "available", "price": price},
+            {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}},
+            sort=[("price", 1)]
+        )
+        if not acc:
+            await event.answer("❌ Just sold out!", alert=True)
             return
-
-        sold_account = None
-        for acc in accounts:
-            phone = acc["phone"]
-            if not await is_session_valid(phone):
-                await accounts_col.update_one(
-                    {"_id": acc["_id"]},
-                    {"$set": {"status": "invalid", "invalid_reason": "session_expired"}}
-                )
-                msg = f"⚠️ **Account expired & removed**\nPhone: `{phone}`\nCountry: {country}\nPrice: ₹{price}"
-                for admin in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin, msg)
-                    except:
-                        pass
-                await log_event(msg)
-                continue
-            else:
-                result = await accounts_col.find_one_and_update(
-                    {"_id": acc["_id"], "status": "available"},
-                    {"$set": {
-                        "status": "sold",
-                        "buyer_id": user_id,
-                        "sold_at": datetime.utcnow()
-                    }}
-                )
-                if result:
-                    sold_account = result
-                    break
-
-        if not sold_account:
-            await event.edit("❌ No **valid** accounts left. Please try another country or price.",
-                             buttons=[[Button.inline("🔙 Back", b"buy")]])
-            return
-
-        phone = sold_account["phone"]
-        twofa_password = sold_account.get("twofa_password")
 
         await users_col.update_one(
             {"user_id": user_id},
@@ -507,13 +375,16 @@ async def callback_handler(event):
         )
         await orders_col.insert_one({
             "user_id": user_id,
-            "account_id": str(sold_account["_id"]),
-            "phone": phone,
+            "account_id": str(acc["_id"]),
+            "phone": acc["phone"],
             "country": country,
             "amount": price,
             "status": "completed",
             "created_at": datetime.utcnow()
         })
+
+        phone = acc["phone"]
+        twofa_password = acc.get("twofa_password")
 
         success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
         if twofa_password:
@@ -531,6 +402,7 @@ async def callback_handler(event):
         )
         user_states.pop(user_id, None)
 
+        # Buyer info for logs and admin notification
         try:
             buyer_entity = await bot.get_entity(user_id)
             buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
@@ -540,6 +412,7 @@ async def callback_handler(event):
         updated_user = await users_col.find_one({"user_id": user_id})
         new_balance = updated_user["balance"] if updated_user else 0
 
+        # Admin notification
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin,
@@ -554,6 +427,7 @@ async def callback_handler(event):
             except:
                 pass
 
+        # Log to channel
         await log_event(
             f"🛒 **Purchase**\n"
             f"Buyer: [{buyer_name}](tg://user?id={user_id}) (`{user_id}`)\n"
@@ -591,28 +465,23 @@ async def callback_handler(event):
         else:
             await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
 
-    # ---------- OTP Resend (FIXED) ----------
     elif data.startswith("resend_"):
         phone = data.split("_", 1)[1]
-        account = await accounts_col.find_one({"phone": phone})
-        if not account or not account.get("session_string"):
-            await event.answer("❌ Account session not found. Contact admin.", alert=True)
+        if phone not in acc_mgr.clients:
+            await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
             return
-
-        # Start OTP listener
-        success = await start_otp_listener(phone, user_id, account["session_string"])
-        if not success:
-            await event.answer("❌ Failed to start OTP listener. Contact admin.", alert=True)
-        else:
-            await event.answer("✅ Listening for OTP. Now try to log in.", alert=True)
-            # Optionally update the message to show "Listening..."
-            try:
-                await event.edit(
-                    event.message.text + "\n\n📡 *Listening for OTP...*",
-                    buttons=event.message.buttons
-                )
-            except:
-                pass
+        pending_otp_requests[(user_id, phone)] = True
+        await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
+        async def clear_pending():
+            await asyncio.sleep(90)
+            key = (user_id, phone)
+            if key in pending_otp_requests:
+                del pending_otp_requests[key]
+                try:
+                    await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
+                except:
+                    pass
+        asyncio.create_task(clear_pending())
 
     elif data == "balance":
         user = await users_col.find_one({"user_id": user_id})
@@ -621,54 +490,25 @@ async def callback_handler(event):
 
     elif data == "deposit":
         user_states[user_id] = {"action": "deposit", "step": "amount"}
+        # Show minimum deposit amount in prompt
         await event.edit(
             f"💵 Enter the amount you want to deposit (₹) – Minimum deposit is ₹{MIN_DEPOSIT}:",
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
 
-    # ---------- ORDER HISTORY (including deposits) ----------
     elif data == "orders":
-        user_id = event.sender_id
-
-        orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1).limit(10)
-        orders = await orders_cursor.to_list(length=10)
-
-        deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1).limit(10)
-        deposits = await deposits_cursor.to_list(length=10)
-
-        items = []
-        for o in orders:
-            items.append({
-                "type": "Purchase",
-                "phone": o["phone"],
-                "country": o["country"],
-                "amount": o["amount"],
-                "date": o["created_at"],
-                "status": "Completed"
-            })
-        for d in deposits:
-            items.append({
-                "type": "Deposit",
-                "phone": "-",
-                "country": "-",
-                "amount": d["amount"],
-                "date": d["created_at"],
-                "status": "Approved"
-            })
-
-        items.sort(key=lambda x: x["date"], reverse=True)
-        items = items[:10]
-
-        if not items:
-            txt = "📜 No activity yet."
+        cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
+        orders = await cursor.to_list(length=10)
+        if not orders:
+            txt = "📜 No orders yet."
         else:
-            txt = "📜 **Recent Activity:**\n" + "\n".join(
-                f"🔹 {item['type']}: ₹{item['amount']} - {item['date'].strftime('%d/%m/%Y %H:%M')}"
-                for item in items
+            txt = "📜 **Your Orders:**\n" + "\n".join(
+                f"🔹 {o['phone']} ({o['country']}) - ₹{o['amount']} - {o['created_at'].strftime('%d/%m/%Y')}"
+                for o in orders
             )
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
 
-    # ---------- ADMIN ----------
+    # ---------- ADMIN CALLBACKS ----------
     elif data == "admin":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -680,7 +520,7 @@ async def callback_handler(event):
             [Button.inline("💰 Add Balance", b"admin_addbal")],
             [Button.inline("💲 Set Price", b"admin_setprice")],
             [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
-            [Button.inline("📞 Set Support Link", b"admin_support")],
+            [Button.inline("📞 Set Support Link", b"admin_support")],  # NEW
             [Button.inline("🔙 Back", b"main")],
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
@@ -739,6 +579,7 @@ async def callback_handler(event):
             upsert=True
         )
 
+        # Referral bonus logic
         bonus_paid = False
         user_doc = await users_col.find_one({"user_id": user_id_dep})
         if user_doc and user_doc.get("referred_by"):
@@ -780,6 +621,8 @@ async def callback_handler(event):
             pass
 
         await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+
+        # Log deposit approval
         await log_event(
             f"✅ **Deposit Approved**\n"
             f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
@@ -805,6 +648,7 @@ async def callback_handler(event):
     elif data == "main":
         await send_main_menu(event)
 
+    # ---------- NEW: Admin Set Support Link ----------
     elif data == "admin_support":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -820,6 +664,7 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
 
+    # ---------- Country selection for admin add flows ----------
     elif data.startswith("addcountry_"):
         if data == "addcountry_new":
             state = user_states.get(user_id)
@@ -944,6 +789,7 @@ async def process_phone_otp_step(event):
         if twofa_password:
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
+        await acc_mgr.add_client(phone, session_str)
         await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
@@ -969,7 +815,8 @@ async def process_session_step(event):
             if not await temp_client.is_user_authorized():
                 await temp_client.disconnect()
                 await event.respond(
-                    "❌ Session not authorized. Use 'Add Account (OTP)' instead.",
+                    "❌ Session authorized nahi hai. Kya aapne incomplete session diya hai?\n"
+                    "Is account ko add karne ke liye 'Add Account (OTP)' use karein.",
                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]]
                 )
                 user_states.pop(user_id, None)
@@ -981,8 +828,8 @@ async def process_session_step(event):
             state["step"] = "ask_2fa"
             await event.respond(
                 f"📱 Number: {phone}\n\n"
-                "🔐 Does this account have a 2FA password?\n"
-                "Send password or 'skip'.",
+                "🔐 Kya is account ka koi 2FA password hai?\n"
+                "Password bhejo, ya 'skip' type karo.",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
         except Exception as e:
@@ -1030,12 +877,13 @@ async def process_session_step(event):
         if twofa_password:
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
+        await acc_mgr.add_client(phone, new_session)
         await client.disconnect()
         await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!",
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW ----------
+# ---------- DEPOSIT FLOW (screenshot) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -1045,11 +893,18 @@ async def process_deposit_step(event):
     if step == "amount":
         try:
             amount = float(event.message.text)
-            if amount <= 0 or amount < MIN_DEPOSIT:
+            if amount <= 0:
                 raise ValueError
+            # NEW: Check minimum deposit
+            if amount < MIN_DEPOSIT:
+                await event.respond(
+                    f"❌ Minimum deposit is ₹{MIN_DEPOSIT}. Please enter a valid amount:",
+                    buttons=[[Button.inline("🔙 Cancel", b"main")]]
+                )
+                return
         except:
             await event.respond(
-                f"❌ Invalid amount. Minimum deposit is ₹{MIN_DEPOSIT}. Enter again:",
+                f"❌ Invalid amount. Minimum is ₹{MIN_DEPOSIT}. Enter again:",
                 buttons=[[Button.inline("🔙 Cancel", b"main")]]
             )
             return
@@ -1070,7 +925,7 @@ async def process_deposit_step(event):
         state["step"] = "screenshot"
     elif step == "screenshot":
         if not event.message.photo:
-            await event.respond("❌ Please send a screenshot, not text.",
+            await event.respond("❌ Kripya payment ka screenshot bhejein, text nahi.",
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
         amount = state["amount"]
@@ -1089,7 +944,7 @@ async def process_deposit_step(event):
             try:
                 await bot.send_file(admin,
                     photo_io,
-                    caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}",
+                    caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nProof: Screenshot",
                     buttons=[
                         [Button.inline("✅ Approve", f"approve_{dep_id}"),
                          Button.inline("❌ Reject", f"reject_{dep_id}")]
@@ -1098,10 +953,12 @@ async def process_deposit_step(event):
             except:
                 pass
         await event.respond(
-            f"✅ Deposit request submitted!\nAmount: ₹{amount}\nAdmin will verify and approve.",
+            f"✅ Deposit request submitted!\nAmount: ₹{amount}\nAdmin will verify your screenshot and approve.",
             buttons=[[Button.inline("🔙 Main Menu", b"main")]]
         )
         user_states.pop(user_id, None)
+
+        # Log deposit request
         await log_event(
             f"💳 **Deposit Request**\n"
             f"User: [{user_id}](tg://user?id={user_id})\n"
@@ -1109,106 +966,7 @@ async def process_deposit_step(event):
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
 
-# ---------- BROADCAST ----------
-@bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s+.*)'))
-async def broadcast_command(event):
-    user_id = event.sender_id
-    if user_id not in ADMIN_IDS:
-        await event.respond("❌ You are not authorized.")
-        return
-
-    args = event.message.text.split()
-    flags = set()
-    text_parts = []
-    for arg in args[1:]:
-        if arg.startswith('--'):
-            flags.add(arg[2:])
-        else:
-            text_parts.append(arg)
-    text = ' '.join(text_parts)
-
-    reply = await event.get_reply_message()
-    if reply:
-        message_to_send = reply if 'f' in flags else (reply.text if reply.text else None)
-        if not message_to_send:
-            await event.respond("❌ The replied message has no text to broadcast.")
-            return
-    else:
-        if not text:
-            await event.respond("❌ Please provide a message or reply to a message.")
-            return
-        message_to_send = text
-
-    all_users = await users_col.find({}, {"user_id": 1}).to_list(length=None)
-    if not all_users:
-        await event.respond("❌ No users found.")
-        return
-
-    await event.respond(
-        f"📢 **Broadcast to {len(all_users)} users**\n"
-        f"Flags: {', '.join(flags) if flags else 'None'}\n"
-        f"Preview: {str(message_to_send)[:100]}...\n\n"
-        "Reply with **yes** to confirm, **no** to cancel."
-    )
-
-    @bot.on(events.NewMessage(from_users=user_id, func=lambda e: e.is_private and e.text.lower() in ('yes', 'no')))
-    async def confirm_handler(confirm_event):
-        if confirm_event.text.lower() == 'no':
-            await confirm_event.respond("❌ Broadcast cancelled.")
-            return
-        await confirm_event.respond(f"🔄 Broadcasting to {len(all_users)} users...")
-        success = 0
-        failed = 0
-        semaphore = asyncio.Semaphore(50)
-
-        async def send_one(user_doc):
-            nonlocal success, failed
-            uid = user_doc['user_id']
-            try:
-                async with semaphore:
-                    if isinstance(message_to_send, str):
-                        await bot.send_message(uid, message_to_send)
-                    else:
-                        await bot.forward_messages(uid, message_to_send)
-                    success += 1
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
-                try:
-                    if isinstance(message_to_send, str):
-                        await bot.send_message(uid, message_to_send)
-                    else:
-                        await bot.forward_messages(uid, message_to_send)
-                    success += 1
-                except:
-                    failed += 1
-            except:
-                failed += 1
-
-        tasks = [send_one(u) for u in all_users]
-        await asyncio.gather(*tasks)
-
-        if 'p' in flags and BROADCAST_CHANNEL_ID:
-            try:
-                pin_msg = f"📢 Broadcast sent to {success} users, {failed} failed."
-                pin_entity = await bot.get_entity(BROADCAST_CHANNEL_ID)
-                await bot.send_message(pin_entity, pin_msg)
-                await bot.pin_message(pin_entity, pin_msg, notify=False)
-            except Exception as e:
-                logging.error(f"Pin failed: {e}")
-
-        await confirm_event.respond(f"✅ Done: {success} sent, {failed} failed.")
-        confirm_handler.remove()
-
-    async def timeout():
-        await asyncio.sleep(60)
-        confirm_handler.remove()
-        try:
-            await event.respond("⏰ Broadcast confirmation timed out.")
-        except:
-            pass
-    asyncio.create_task(timeout())
-
-# ---------- HANDLE TEXT ----------
+# ---------- HANDLE ALL TEXT MESSAGES ----------
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
     user_id = event.sender_id
@@ -1230,7 +988,7 @@ async def handle_message(event):
             try:
                 uid = int(event.message.text)
             except:
-                await event.respond("❌ Invalid user ID.",
+                await event.respond("❌ Invalid user ID. Send a numeric ID:",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
                 return
             state["uid"] = uid
@@ -1241,13 +999,13 @@ async def handle_message(event):
             try:
                 amt = float(event.message.text)
             except:
-                await event.respond("❌ Invalid amount.",
+                await event.respond("❌ Invalid amount. Try again:",
                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
                 return
             uid = state["uid"]
             await users_col.update_one(
                 {"user_id": uid},
-                {"$inc": {"balance": amt}},
+                {"$inc": {"balance": amt}, "$setOnInsert": {"joined_at": datetime.utcnow()}},
                 upsert=True
             )
             await event.respond(f"✅ Added ₹{amt} to user `{uid}`.",
@@ -1264,8 +1022,12 @@ async def handle_message(event):
                 await event.respond("✅ Support link removed.",
                                     buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             else:
+                # Basic validation
                 if not (link.startswith("http://") or link.startswith("https://") or link.startswith("t.me/")):
-                    await event.respond("❌ Invalid link. Try again:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                    await event.respond(
+                        "❌ Invalid link. Please send a valid URL starting with `http://`, `https://`, or `t.me/`.\nTry again:",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                    )
                     return
                 await set_support_link(link)
                 await event.respond(f"✅ Support link updated to:\n`{link}`",
@@ -1274,17 +1036,18 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
-# ---------- START ----------
+# ---------- /start COMMAND ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
     user_id = event.sender_id
     args = event.message.text.split()
     referrer_id = None
+
     if len(args) > 1 and args[1].startswith('ref'):
         try:
             referrer_id = int(args[1][3:])
         except:
-            pass
+            referrer_id = None
 
     user_data = await users_col.find_one({"user_id": user_id})
     if not user_data:
@@ -1307,16 +1070,13 @@ async def start_cmd(event):
 
     await show_welcome_menu(event, user_id)
 
-# ---------- MAIN ----------
+# ---------- MAIN FUNCTION ----------
 async def main():
-    try:
-        await bot.start(bot_token=BOT_TOKEN)
-        logging.info("✅ Bot started with bot token.")
-    except Exception as e:
-        logging.error(f"❌ Failed to start bot: {e}")
-        return
-
-    logging.info("🚀 Bot ready. OTP delivery is now fixed.")
+    await bot.start(bot_token=BOT_TOKEN)
+    global acc_mgr
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
+    await acc_mgr.load_all()
+    logging.info("🚀 Bot started with logout button on OTP...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
