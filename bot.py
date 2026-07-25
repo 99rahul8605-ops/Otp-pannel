@@ -20,6 +20,11 @@ from account_manager import AccountManager
 
 # ---------- .env LOAD ----------
 load_dotenv()
+print("🔍 DEBUG:")
+print("API_ID:", repr(API_ID))
+print("API_HASH:", repr(API_HASH))
+print("BOT_TOKEN:", repr(BOT_TOKEN))
+print("ADMIN_IDS:", repr(ADMIN_IDS))
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
