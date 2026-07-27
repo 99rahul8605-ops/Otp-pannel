@@ -65,6 +65,7 @@ users_col = db['users']
 orders_col = db['orders']
 deposits_col = db['deposits']
 settings_col = db['settings']
+withdrawals_col = db['withdrawals']           # NEW
 
 # ---------- BOT INSTANCE ----------
 import hashlib
@@ -461,7 +462,7 @@ async def callback_handler(event):
     # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
-                "admin_deposits", "admin_setprice", "admin_support"):
+                "admin_deposits", "admin_setprice", "admin_support", "withdraw"):   # added 'withdraw'
         user_states.pop(user_id, None)
 
     # --- Logout button callback ---
@@ -482,15 +483,38 @@ async def callback_handler(event):
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
         invited_count = await users_col.count_documents({"referred_by": user_id})
         paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
+        # Fetch withdrawable balance
+        user_doc = await users_col.find_one({"user_id": user_id})
+        withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
         text = (
             "👥 **Referral Program**\n\n"
             f"🔗 **Your Link:** `{ref_link}`\n"
             f"💰 **Bonus:** ₹{REFERRAL_BONUS} (when your referral deposits ₹50 or more)\n"
             f"📊 **Invited Users:** {invited_count}\n"
-            f"✅ **Bonus Paid:** {paid_count}\n\n"
+            f"✅ **Bonus Paid:** {paid_count}\n"
+            f"💸 **Withdrawable Balance:** ₹{withdrawable}\n\n"
             "Share your link and earn!"
         )
-        await event.edit(text, buttons=[[Button.inline("🔙 Back", b"main")]])
+        buttons = [
+            [Button.inline("💸 Withdraw", b"withdraw")],
+            [Button.inline("🔙 Back", b"main")]
+        ]
+        await event.edit(text, buttons=buttons)
+        return
+
+    # --- Withdraw flow start ---
+    if data == "withdraw":
+        user_doc = await users_col.find_one({"user_id": user_id})
+        withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
+        if withdrawable <= 0:
+            await event.answer("❌ You have no withdrawable balance.", alert=True)
+            return
+        user_states[user_id] = {"action": "withdraw", "step": "amount"}
+        await event.edit(
+            f"💸 **Withdraw**\n\nYour withdrawable balance: ₹{withdrawable}\n"
+            "Enter the amount you wish to withdraw (in ₹):",
+            buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+        )
         return
 
     # --- User purchase flow ---
@@ -648,11 +672,16 @@ async def callback_handler(event):
         phone = acc["phone"]
         twofa_password = acc.get("twofa_password")
 
+        # ---------- NEW: Deduct from balance and withdrawable_balance ----------
+        old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
+        new_withdrawable = max(0, old_withdrawable - price)
         await users_col.update_one(
             {"user_id": user_id},
-            {"$inc": {"balance": -price}},
+            {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}},
             upsert=True
         )
+        # ---------- END NEW ----------
+
         await orders_col.insert_one({
             "user_id": user_id,
             "account_id": str(acc["_id"]),
@@ -899,10 +928,12 @@ async def callback_handler(event):
                 total = total_dep[0]["total"] if total_dep else 0
                 if total >= 50:
                     referrer_id = user_doc["referred_by"]
+                    # ---------- NEW: also add to withdrawable_balance ----------
                     await users_col.update_one(
                         {"user_id": referrer_id},
-                        {"$inc": {"balance": REFERRAL_BONUS}}
+                        {"$inc": {"balance": REFERRAL_BONUS, "withdrawable_balance": REFERRAL_BONUS}}
                     )
+                    # ---------- END NEW ----------
                     await users_col.update_one(
                         {"user_id": user_id_dep},
                         {"$set": {"referral_bonus_paid": True}}
@@ -1000,6 +1031,72 @@ async def callback_handler(event):
             state["step"] = "price"
             await event.edit("💵 Send price for this number (e.g., 50):",
                              buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+
+    # ---------- Withdrawal Admin Approve/Reject ----------
+    elif data.startswith("wapprove_") or data.startswith("wreject_"):
+        if user_id not in ADMIN_IDS:
+            await event.answer("❌ Unauthorized", alert=True)
+            return
+        parts = data.split("_", 1)
+        action = parts[0]
+        w_id = parts[1]
+        withdrawal = await withdrawals_col.find_one({"_id": ObjectId(w_id)})
+        if not withdrawal or withdrawal["status"] != "pending":
+            await event.answer("Already processed.", alert=True)
+            return
+
+        if action == "wapprove":
+            # Check if user still has enough withdrawable balance
+            user_doc = await users_col.find_one({"user_id": withdrawal["user_id"]})
+            if not user_doc:
+                await event.answer("User not found.", alert=True)
+                return
+            if user_doc.get("withdrawable_balance", 0) < withdrawal["amount"]:
+                await event.answer("User doesn't have sufficient withdrawable balance now.", alert=True)
+                return
+            # Deduct from both balances
+            await users_col.update_one(
+                {"user_id": withdrawal["user_id"]},
+                {"$inc": {"balance": -withdrawal["amount"], "withdrawable_balance": -withdrawal["amount"]}}
+            )
+            await withdrawals_col.update_one(
+                {"_id": ObjectId(w_id)},
+                {"$set": {"status": "approved", "processed_at": datetime.utcnow()}}
+            )
+            try:
+                await bot.send_message(
+                    withdrawal["user_id"],
+                    f"✅ Your withdrawal of ₹{withdrawal['amount']} has been approved and processed."
+                )
+            except:
+                pass
+            await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await log_event(
+                f"✅ **Withdrawal Approved**\n"
+                f"User: [{withdrawal['user_id']}](tg://user?id={withdrawal['user_id']})\n"
+                f"Amount: ₹{withdrawal['amount']}\n"
+                f"UPI: {withdrawal.get('upi_id', 'N/A')}\n"
+                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+            )
+        else:  # wreject
+            await withdrawals_col.update_one(
+                {"_id": ObjectId(w_id)},
+                {"$set": {"status": "rejected", "processed_at": datetime.utcnow()}}
+            )
+            try:
+                await bot.send_message(
+                    withdrawal["user_id"],
+                    f"❌ Your withdrawal of ₹{withdrawal['amount']} has been rejected. Contact admin."
+                )
+            except:
+                pass
+            await event.edit("❌ Withdrawal rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await log_event(
+                f"❌ **Withdrawal Rejected**\n"
+                f"User: [{withdrawal['user_id']}](tg://user?id={withdrawal['user_id']})\n"
+                f"Amount: ₹{withdrawal['amount']}\n"
+                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+            )
 
     else:
         await event.answer("Unknown action", alert=True)
@@ -1327,6 +1424,84 @@ async def handle_message(event):
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
+    # ---------- NEW: Withdrawal text flow ----------
+    elif action == "withdraw":
+        step = state.get("step")
+        if step == "amount":
+            try:
+                amount = float(event.message.text.strip())
+                if amount <= 0:
+                    raise ValueError
+            except:
+                await event.respond(
+                    "❌ Invalid amount. Enter a positive number:",
+                    buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+                )
+                return
+            # Check withdrawable balance again
+            user_doc = await users_col.find_one({"user_id": user_id})
+            withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
+            if amount > withdrawable:
+                await event.respond(
+                    f"❌ You have only ₹{withdrawable} withdrawable balance. Enter a lower amount:",
+                    buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+                )
+                return
+            state["amount"] = amount
+            state["step"] = "upi"
+            await event.respond(
+                "💳 Enter your UPI ID (e.g., `example@upi`):",
+                buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+            )
+        elif step == "upi":
+            upi = event.message.text.strip()
+            if not upi or "@" not in upi:   # basic validation
+                await event.respond(
+                    "❌ Invalid UPI ID. Please enter a valid one (e.g., `example@upi`):",
+                    buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+                )
+                return
+            amount = state["amount"]
+            # Create withdrawal request
+            result = await withdrawals_col.insert_one({
+                "user_id": user_id,
+                "amount": amount,
+                "upi_id": upi,
+                "status": "pending",
+                "created_at": datetime.utcnow()
+            })
+            w_id = result.inserted_id
+            # Notify admins
+            for admin in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin,
+                        f"🔔 **New Withdrawal Request**\n"
+                        f"User: `{user_id}`\n"
+                        f"Amount: ₹{amount}\n"
+                        f"UPI: `{upi}`\n"
+                        f"Withdrawable Balance: {user_doc.get('withdrawable_balance', 0)}\n"
+                        f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}",
+                        buttons=[
+                            [Button.inline("✅ Approve", f"wapprove_{w_id}"),
+                             Button.inline("❌ Reject", f"wreject_{w_id}")]
+                        ]
+                    )
+                except:
+                    pass
+            await event.respond(
+                f"✅ Withdrawal request of ₹{amount} submitted to UPI `{upi}`.\n"
+                "Admin will process it shortly.",
+                buttons=[[Button.inline("🔙 Referral Info", b"referral_info")]]
+            )
+            await log_event(
+                f"💸 **Withdrawal Request**\n"
+                f"User: [{user_id}](tg://user?id={user_id})\n"
+                f"Amount: ₹{amount}\n"
+                f"UPI: `{upi}`\n"
+                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+            )
+            user_states.pop(user_id, None)
     elif action == "set_support_link":
         step = state.get("step")
         if step == "await_link":
@@ -1390,13 +1565,16 @@ async def start_cmd(event):
             "balance": 0,
             "joined_at": datetime.utcnow(),
             "referred_by": referrer_id,
-            "referral_bonus_paid": False
+            "referral_bonus_paid": False,
+            "withdrawable_balance": 0      # NEW
         })
     else:
         if user_data.get("referred_by") is None and referrer_id and referrer_id != user_id:
             await users_col.update_one({"user_id": user_id}, {"$set": {"referred_by": referrer_id}})
         if "referral_bonus_paid" not in user_data:
             await users_col.update_one({"user_id": user_id}, {"$set": {"referral_bonus_paid": False}})
+        if "withdrawable_balance" not in user_data:
+            await users_col.update_one({"user_id": user_id}, {"$set": {"withdrawable_balance": 0}})
 
     if not await is_user_member(user_id):
         await send_join_message(event)
