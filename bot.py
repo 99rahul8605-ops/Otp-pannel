@@ -217,10 +217,12 @@ async def show_welcome_menu(event, user_id):
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
-        [Button.inline("👥 Referral Program", b"referral_info"), Button.inline("💸 Withdrawal History", b"my_withdrawals")],
     ]
+    # Third row: Referral Program + Admin (if admin) - removed separate Withdrawal History button
+    row3 = [Button.inline("👥 Referral Program", b"referral_info")]
     if user_id in ADMIN_IDS:
-        buttons[2].append(Button.inline("⚙️ Admin Panel", b"admin"))
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
+    buttons.append(row3)
 
     support_link = await get_support_link()
     if support_link:
@@ -240,11 +242,11 @@ async def send_main_menu(event):
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
-        [Button.inline("👥 Referral Program", b"referral_info"), Button.inline("💸 Withdrawal History", b"my_withdrawals")],
     ]
+    row3 = [Button.inline("👥 Referral Program", b"referral_info")]
     if user_id in ADMIN_IDS:
-        buttons[2].append(Button.inline("⚙️ Admin Panel", b"admin"))
-
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
+    buttons.append(row3)
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
@@ -598,7 +600,7 @@ async def callback_handler(event):
             pass
         return
 
-    # ---------- REFERRAL INFO ----------
+    # ---------- REFERRAL INFO (with Withdrawal History button) ----------
     if data == "referral_info":
         username = await get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -623,6 +625,7 @@ async def callback_handler(event):
         )
         buttons = [
             [Button.inline("💸 Withdraw", b"withdraw")],
+            [Button.inline("📜 Withdrawal History", b"my_withdrawals")],
             [Button.inline("🔙 Back", b"main")]
         ]
         await event.edit(text, buttons=buttons)
@@ -645,7 +648,7 @@ async def callback_handler(event):
         )
         return
 
-    # ---------- USER WITHDRAWALS HISTORY ----------
+    # ---------- USER WITHDRAWALS HISTORY (back to referral_info) ----------
     if data == "my_withdrawals":
         await show_user_withdrawals(event, user_id)
         return
@@ -1434,7 +1437,7 @@ async def show_admin_withdrawals(event, user_id):
     else:
         await event.respond(txt, buttons=btns)
 
-# ---------- USER WITHDRAWALS HISTORY ----------
+# ---------- USER WITHDRAWALS HISTORY (with back to referral) ----------
 async def show_user_withdrawals(event, user_id):
     state = user_states.get(user_id, {})
     page = state.get("user_wd_page", 1)
@@ -1473,7 +1476,8 @@ async def show_user_withdrawals(event, user_id):
     if page_row:
         btns.append(page_row)
 
-    btns.append([Button.inline("🔙 Back", b"main")])
+    # Back button goes to Referral Info instead of main menu
+    btns.append([Button.inline("🔙 Back to Referral", b"referral_info")])
 
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(txt, buttons=btns)
