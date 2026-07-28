@@ -435,10 +435,11 @@ async def broadcast_callback(event):
     user_states.pop(user_id, None)
 
 # ============================================================
-#  1. ADMIN LIST FUNCTIONS – show_all_accounts (filter + pagination)
+#  1. ADMIN LIST FUNCTIONS
 # ============================================================
 
-PAGE_SIZE = 20  # accounts per page
+# ---------- Accounts: status filter + pagination ----------
+PAGE_SIZE = 20
 
 async def show_all_accounts(event, user_id, status_filter="all", page=0):
     """Show accounts, filtered by status (available/sold/invalid/all), paginated."""
@@ -510,46 +511,99 @@ async def show_all_accounts(event, user_id, status_filter="all", page=0):
         await event.edit("❌ Error loading accounts. Please try again.", buttons=[[Button.inline("🔙 Back", b"admin")]])
 
 
-# ============================================================
-#  2. OTHER ADMIN LIST FUNCTIONS (simple, no filters/pagination)
-# ============================================================
+# ---------- Transactions: type filter + pagination ----------
+TXN_PAGE_SIZE = 20
 
-async def show_all_transactions(event, user_id):
-    """Show all purchases and approved deposits (latest 50)."""
+async def show_all_transactions(event, user_id, type_filter="all", page=0):
+    """Show transactions, filtered by type (purchase/deposit/all), paginated."""
     try:
-        orders_cursor = orders_col.find({}).sort("created_at", -1)
-        deposits_cursor = deposits_col.find({"status": "approved"}).sort("created_at", -1)
-        orders = await orders_cursor.to_list(length=None)
-        deposits = await deposits_cursor.to_list(length=None)
-
         combined = []
-        for o in orders:
-            combined.append({
-                "type": "Purchase",
-                "user_id": o["user_id"],
-                "phone": o.get("phone", "N/A"),
-                "country": o.get("country", "N/A"),
-                "amount": o.get("amount", 0),
-                "date": o["created_at"],
-            })
-        for d in deposits:
-            combined.append({
-                "type": "Deposit",
-                "user_id": d["user_id"],
-                "phone": "N/A",
-                "country": "N/A",
-                "amount": d.get("amount", 0),
-                "date": d["created_at"],
-                "txn_id": d.get("txn_id", "N/A"),
-            })
+        total_count = 0
+        total_pages = 1
 
-        combined.sort(key=lambda x: x["date"], reverse=True)
+        if type_filter == "purchase":
+            total_count = await orders_col.count_documents({})
+            total_pages = max(1, (total_count + TXN_PAGE_SIZE - 1) // TXN_PAGE_SIZE)
+            page = max(0, min(page, total_pages - 1))
+            skip = page * TXN_PAGE_SIZE
+
+            cursor = orders_col.find({}).sort("created_at", -1).skip(skip).limit(TXN_PAGE_SIZE)
+            orders = await cursor.to_list(length=TXN_PAGE_SIZE)
+            for o in orders:
+                combined.append({
+                    "type": "Purchase",
+                    "user_id": o["user_id"],
+                    "phone": o.get("phone", "N/A"),
+                    "country": o.get("country", "N/A"),
+                    "amount": o.get("amount", 0),
+                    "date": o["created_at"],
+                })
+
+        elif type_filter == "deposit":
+            query = {"status": "approved"}
+            total_count = await deposits_col.count_documents(query)
+            total_pages = max(1, (total_count + TXN_PAGE_SIZE - 1) // TXN_PAGE_SIZE)
+            page = max(0, min(page, total_pages - 1))
+            skip = page * TXN_PAGE_SIZE
+
+            cursor = deposits_col.find(query).sort("created_at", -1).skip(skip).limit(TXN_PAGE_SIZE)
+            deposits = await cursor.to_list(length=TXN_PAGE_SIZE)
+            for d in deposits:
+                combined.append({
+                    "type": "Deposit",
+                    "user_id": d["user_id"],
+                    "phone": "N/A",
+                    "country": "N/A",
+                    "amount": d.get("amount", 0),
+                    "date": d["created_at"],
+                    "txn_id": d.get("txn_id", "N/A"),
+                })
+
+        else:  # "all" -> merge both collections, in-memory sort + paginate
+            orders_cursor = orders_col.find({}).sort("created_at", -1)
+            deposits_cursor = deposits_col.find({"status": "approved"}).sort("created_at", -1)
+            orders = await orders_cursor.to_list(length=None)
+            deposits = await deposits_cursor.to_list(length=None)
+
+            all_items = []
+            for o in orders:
+                all_items.append({
+                    "type": "Purchase",
+                    "user_id": o["user_id"],
+                    "phone": o.get("phone", "N/A"),
+                    "country": o.get("country", "N/A"),
+                    "amount": o.get("amount", 0),
+                    "date": o["created_at"],
+                })
+            for d in deposits:
+                all_items.append({
+                    "type": "Deposit",
+                    "user_id": d["user_id"],
+                    "phone": "N/A",
+                    "country": "N/A",
+                    "amount": d.get("amount", 0),
+                    "date": d["created_at"],
+                    "txn_id": d.get("txn_id", "N/A"),
+                })
+
+            all_items.sort(key=lambda x: x["date"], reverse=True)
+            total_count = len(all_items)
+            total_pages = max(1, (total_count + TXN_PAGE_SIZE - 1) // TXN_PAGE_SIZE)
+            page = max(0, min(page, total_pages - 1))
+            skip = page * TXN_PAGE_SIZE
+
+            combined = all_items[skip: skip + TXN_PAGE_SIZE]
+
+        # total_pages is already set in each branch
+        logging.info(f"[DEBUG] type_filter={type_filter} page={page} total_count={total_count} total_pages={total_pages}")
+
+        label = type_filter.capitalize() if type_filter != "all" else "All"
 
         if not combined:
-            txt = "📜 **Transaction History**\n\nNo transactions found."
+            txt = f"📜 **Transaction History - {label}**\n\nNo transactions found."
         else:
             lines = []
-            for item in combined[:50]:  # limit to 50 entries
+            for item in combined:
                 date_str = item["date"].strftime('%d/%m/%Y %H:%M')
                 if item["type"] == "Purchase":
                     lines.append(
@@ -559,13 +613,43 @@ async def show_all_transactions(event, user_id):
                     lines.append(
                         f"💰 User {item['user_id']} | Deposit | +₹{item['amount']} | Txn:{item.get('txn_id','N/A')} | {date_str}"
                     )
-            txt = f"📜 **Transaction History** (Latest {len(lines)})\n" + "\n".join(lines)
+            txt = (
+                f"📜 **Transaction History - {label}** (Total: {total_count} | Page {page+1}/{total_pages})\n"
+                + "\n".join(lines)
+            )
 
-        await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"admin")]])
+        # ---- Filter buttons ----
+        def filter_btn(text, t_filter):
+            display = f"• {text} •" if t_filter == type_filter else text
+            return Button.inline(display, f"admin_transactions|{t_filter}|0".encode())
+
+        filter_row = [
+            filter_btn("🛒 Purchase", "purchase"),
+            filter_btn("💰 Deposit", "deposit"),
+            filter_btn("📋 All", "all"),
+        ]
+
+        # ---- Pagination buttons ----
+        nav_row = []
+        if page > 0:
+            nav_row.append(Button.inline("⬅️ Prev", f"admin_transactions|{type_filter}|{page-1}".encode()))
+        if total_pages > 1:
+            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop"))
+        if page < total_pages - 1:
+            nav_row.append(Button.inline("Next ➡️", f"admin_transactions|{type_filter}|{page+1}".encode()))
+
+        buttons = [filter_row]
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([Button.inline("🔙 Back", b"admin")])
+
+        await event.edit(txt, buttons=buttons)
     except Exception as e:
         logging.error(f"Error in show_all_transactions: {e}", exc_info=True)
         await event.edit("❌ Error loading transactions.", buttons=[[Button.inline("🔙 Back", b"admin")]])
 
+
+# ---------- Withdrawals: simple list (latest 50) ----------
 async def show_all_withdrawals(event, user_id):
     """Show all withdrawal requests (latest 50)."""
     try:
@@ -590,7 +674,7 @@ async def show_all_withdrawals(event, user_id):
 
 
 # ============================================================
-#  3. CALLBACK HANDLER (with updated admin_accounts logic)
+#  2. CALLBACK HANDLER
 # ============================================================
 
 @bot.on(events.CallbackQuery)
@@ -647,17 +731,22 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- NOOP (page indicator, does nothing) ----------
-        if data == "noop":
-            await event.answer()
-            return
-
-        # ---------- ADMIN TRANSACTIONS (simple) ----------
-        if data == "admin_transactions":
+        # ---------- ADMIN TRANSACTIONS (type filter + pagination) ----------
+        if data.startswith("admin_transactions"):
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
-            await show_all_transactions(event, user_id)
+
+            if data == "admin_transactions":
+                type_filter, page = "all", 0
+            else:
+                try:
+                    _, type_filter, page_str = data.split("|")
+                    page = int(page_str)
+                except (ValueError, IndexError):
+                    type_filter, page = "all", 0
+
+            await show_all_transactions(event, user_id, type_filter, page)
             await event.answer()
             return
 
@@ -667,6 +756,11 @@ async def callback_handler(event):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             await show_all_withdrawals(event, user_id)
+            await event.answer()
+            return
+
+        # ---------- NOOP (page indicator, does nothing) ----------
+        if data == "noop":
             await event.answer()
             return
 
@@ -1233,7 +1327,7 @@ async def callback_handler(event):
 
 
 # ============================================================
-#  4. USER WITHDRAWALS HISTORY (pagination)
+#  3. USER WITHDRAWALS HISTORY (pagination)
 # ============================================================
 
 async def show_user_withdrawals(event, user_id):
@@ -1283,7 +1377,7 @@ async def show_user_withdrawals(event, user_id):
 
 
 # ============================================================
-#  5. ADD PHONE / SESSION FLOWS (kept as before)
+#  4. ADD PHONE / SESSION FLOWS (kept as before)
 # ============================================================
 
 async def start_add_phone_flow(event):
