@@ -2,6 +2,7 @@ import os
 import io
 import asyncio
 import logging
+import random  # <-- NEW for TxnID
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
@@ -65,7 +66,7 @@ users_col = db['users']
 orders_col = db['orders']
 deposits_col = db['deposits']
 settings_col = db['settings']
-withdrawals_col = db['withdrawals']           # NEW
+withdrawals_col = db['withdrawals']
 
 # ---------- BOT INSTANCE ----------
 import hashlib
@@ -97,6 +98,19 @@ async def set_support_link(link: str):
     await settings_col.update_one(
         {"key": "support_link"},
         {"$set": {"value": link, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+
+async def get_min_withdrawal():
+    setting = await settings_col.find_one({"key": "min_withdrawal"})
+    if setting:
+        return float(setting.get("value", 10.0))
+    return 10.0
+
+async def set_min_withdrawal(value: float):
+    await settings_col.update_one(
+        {"key": "min_withdrawal"},
+        {"$set": {"value": value, "updated_at": datetime.utcnow()}},
         upsert=True
     )
 
@@ -241,7 +255,7 @@ async def send_main_menu(event):
     else:
         await event.respond(msg, buttons=buttons)
 
-# ---------- BROADCAST COMMAND (FIXED: reply without --f sends copy text) ----------
+# ---------- BROADCAST COMMAND ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
     user_id = event.sender_id
@@ -251,16 +265,14 @@ async def broadcast_cmd(event):
 
     args = event.message.text.split()
     is_forward = "--f" in args
-    pin_dm = "--p" in args          # DM pin
-    pin_logs = "--pin" in args      # logs channel pin
+    pin_dm = "--p" in args
+    pin_logs = "--pin" in args
 
-    # Remove flags and command
     msg_parts = [arg for arg in args if not arg.startswith("--")]
     if msg_parts and msg_parts[0] == "/broadcast":
         msg_parts = msg_parts[1:]
     msg_text = " ".join(msg_parts).strip()
 
-    # Check reply
     has_reply = event.message.is_reply
     replied = None
     if has_reply:
@@ -269,29 +281,23 @@ async def broadcast_cmd(event):
             await event.respond("❌ Could not get replied message.")
             return
 
-    # Determine mode
     if is_forward:
-        # Explicit forward: must have reply
         if not has_reply:
             await event.respond("❌ Please reply to a message to forward with --f.")
             return
         forward_mode = True
     else:
-        # No --f flag
         if has_reply and not msg_text:
-            # User replied without text: we want to copy the replied message's text
             if replied.text:
-                msg_text = replied.text  # use replied text
+                msg_text = replied.text
                 forward_mode = False
             else:
-                # Replied message has no text (only media, etc.) -> can't copy
                 await event.respond(
                     "❌ Replied message has no text to copy. Use `--f` to forward media.",
                     parse_mode='markdown'
                 )
                 return
         else:
-            # Either has custom text, or no reply -> text mode
             forward_mode = False
             if not msg_text:
                 await event.respond(
@@ -299,7 +305,6 @@ async def broadcast_cmd(event):
                 )
                 return
 
-    # Get all users from DB
     cursor = users_col.find({}, {"user_id": 1})
     users = await cursor.to_list(length=None)
     user_ids = [u["user_id"] for u in users]
@@ -307,19 +312,17 @@ async def broadcast_cmd(event):
         await event.respond("❌ No users found.")
         return
 
-    # Store broadcast data in user state for confirmation
     user_states[user_id] = {
         "action": "broadcast_confirm",
         "is_forward": forward_mode,
         "pin_dm": pin_dm,
         "pin_logs": pin_logs,
         "msg_text": msg_text if not forward_mode else None,
-        "replied_msg": replied if forward_mode else None,  # only needed for forward
+        "replied_msg": replied if forward_mode else None,
         "user_ids": user_ids,
         "total": len(user_ids),
     }
 
-    # Show preview
     preview = "📢 **Broadcast Preview**\n\n"
     preview += f"👥 **Recipients:** {len(user_ids)} users\n"
     if forward_mode:
@@ -343,8 +346,6 @@ async def broadcast_cmd(event):
     ]
     await event.respond(preview, buttons=buttons)
 
-
-# ---------- Broadcast confirmation callbacks ----------
 @bot.on(events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
 async def broadcast_callback(event):
     user_id = event.sender_id
@@ -363,7 +364,6 @@ async def broadcast_callback(event):
             await event.answer("No broadcast to cancel.", alert=True)
         return
 
-    # data == "broadcast_confirm"
     state = user_states.get(user_id)
     if not state or state.get("action") != "broadcast_confirm":
         await event.answer("No pending broadcast.", alert=True)
@@ -380,7 +380,6 @@ async def broadcast_callback(event):
     await event.edit("⏳ **Sending broadcast...** (this may take a while)")
     await event.answer("Broadcast started!", alert=True)
 
-    # Pin to logs channel if requested
     if pin_logs and LOGS_CHANNEL_ID:
         try:
             if is_forward:
@@ -393,7 +392,6 @@ async def broadcast_callback(event):
             logging.error(f"Failed to pin broadcast in logs channel: {e}")
             await event.respond(f"⚠️ Could not pin in logs channel: {e}")
 
-    # Send to users in batches
     batch_size = 30
     sent_count = 0
     pin_success = 0
@@ -436,13 +434,12 @@ async def broadcast_callback(event):
     await event.edit(final)
     user_states.pop(user_id, None)
 
-# ---------- CALLBACK HANDLER (all other callbacks) ----------
+# ---------- CALLBACK HANDLER ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
     user_id = event.sender_id
 
-    # Skip broadcast callbacks (they are handled by specific pattern)
     if data.startswith("broadcast_"):
         return
 
@@ -459,13 +456,12 @@ async def callback_handler(event):
         await send_join_message(event)
         return
 
-    # Top-level callbacks clear any existing state
     if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                 "admin_add_otp", "admin_add_sess", "admin_list", "admin_addbal",
-                "admin_deposits", "admin_setprice", "admin_support", "withdraw"):   # added 'withdraw'
+                "admin_deposits", "admin_setprice", "admin_support", "withdraw",
+                "admin_minwithdraw"):
         user_states.pop(user_id, None)
 
-    # --- Logout button callback ---
     if data.startswith("logout_"):
         phone = data[len("logout_"):]
         await acc_mgr.logout_client(phone)
@@ -477,13 +473,11 @@ async def callback_handler(event):
             pass
         return
 
-    # --- Referral Info Button ---
     if data == "referral_info":
         username = await get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
         invited_count = await users_col.count_documents({"referred_by": user_id})
         paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
-        # Fetch withdrawable balance
         user_doc = await users_col.find_one({"user_id": user_id})
         withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
         text = (
@@ -502,22 +496,22 @@ async def callback_handler(event):
         await event.edit(text, buttons=buttons)
         return
 
-    # --- Withdraw flow start ---
     if data == "withdraw":
         user_doc = await users_col.find_one({"user_id": user_id})
         withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
         if withdrawable <= 0:
             await event.answer("❌ You have no withdrawable balance.", alert=True)
             return
+        min_wd = await get_min_withdrawal()
         user_states[user_id] = {"action": "withdraw", "step": "amount"}
         await event.edit(
             f"💸 **Withdraw**\n\nYour withdrawable balance: ₹{withdrawable}\n"
+            f"Minimum withdrawal: ₹{min_wd}\n"
             "Enter the amount you wish to withdraw (in ₹):",
             buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
         )
         return
 
-    # --- User purchase flow ---
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -571,7 +565,6 @@ async def callback_handler(event):
         ]
         await event.edit(confirm_text, buttons=buttons)
 
-    # ---------- confirm_purchase with session validation + admin report ----------
     elif data == "confirm_purchase":
         state = user_states.get(user_id)
         if not state or state.get("action") != "awaiting_confirmation":
@@ -672,7 +665,6 @@ async def callback_handler(event):
         phone = acc["phone"]
         twofa_password = acc.get("twofa_password")
 
-        # ---------- NEW: Deduct from balance and withdrawable_balance ----------
         old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
         new_withdrawable = max(0, old_withdrawable - price)
         await users_col.update_one(
@@ -680,7 +672,6 @@ async def callback_handler(event):
             {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}},
             upsert=True
         )
-        # ---------- END NEW ----------
 
         await orders_col.insert_one({
             "user_id": user_id,
@@ -798,7 +789,6 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
 
-    # ---------- Orders + Deposit History combined ----------
     elif data == "orders":
         orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
         orders = await orders_cursor.to_list(length=20)
@@ -842,11 +832,9 @@ async def callback_handler(event):
 
         await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
 
-    # ---------- Main menu back button ----------
     elif data == "main":
         await send_main_menu(event)
 
-    # ---------- ADMIN CALLBACKS ----------
     elif data == "admin":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -859,6 +847,7 @@ async def callback_handler(event):
             [Button.inline("💲 Set Price", b"admin_setprice")],
             [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
             [Button.inline("📞 Set Support Link", b"admin_support")],
+            [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw")],
             [Button.inline("🔙 Back", b"main")],
         ]
         await event.edit("⚙️ **Admin Panel**", buttons=btns)
@@ -893,8 +882,9 @@ async def callback_handler(event):
             return
         btns = []
         for dep in pending:
+            txn_id = dep.get('txn_id', 'N/A')
             btns.append([
-                Button.inline(f"✅ Approve ₹{dep['amount']}", f"approve_{dep['_id']}"),
+                Button.inline(f"✅ Approve ₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}"),
                 Button.inline(f"❌ Reject", f"reject_{dep['_id']}")
             ])
         btns.append([Button.inline("🔙 Back", b"admin")])
@@ -928,12 +918,10 @@ async def callback_handler(event):
                 total = total_dep[0]["total"] if total_dep else 0
                 if total >= 50:
                     referrer_id = user_doc["referred_by"]
-                    # ---------- NEW: also add to withdrawable_balance ----------
                     await users_col.update_one(
                         {"user_id": referrer_id},
                         {"$inc": {"balance": REFERRAL_BONUS, "withdrawable_balance": REFERRAL_BONUS}}
                     )
-                    # ---------- END NEW ----------
                     await users_col.update_one(
                         {"user_id": user_id_dep},
                         {"$set": {"referral_bonus_paid": True}}
@@ -964,6 +952,7 @@ async def callback_handler(event):
             f"✅ **Deposit Approved**\n"
             f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
             f"Amount: ₹{amount}\n"
+            f"Txn ID: {deposit.get('txn_id', 'N/A')}\n"
             f"Referral Bonus: {'Yes' if bonus_paid else 'No'}\n"
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
@@ -982,7 +971,6 @@ async def callback_handler(event):
             pass
         await event.edit("❌ Deposit rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
 
-    # ---------- Admin Set Price ----------
     elif data == "admin_setprice":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -995,7 +983,6 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
 
-    # ---------- Admin Set Support Link ----------
     elif data == "admin_support":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -1011,7 +998,19 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
 
-    # ---------- Country selection for admin add flows ----------
+    elif data == "admin_minwithdraw":
+        if user_id not in ADMIN_IDS:
+            await event.answer("❌ Unauthorized", alert=True)
+            return
+        current = await get_min_withdrawal()
+        user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
+        await event.edit(
+            f"💸 **Set Minimum Withdrawal Amount**\n\n"
+            f"Current minimum: ₹{current}\n\n"
+            "Send the new minimum withdrawal amount (e.g., `20`):",
+            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+        )
+
     elif data.startswith("addcountry_"):
         if data == "addcountry_new":
             state = user_states.get(user_id)
@@ -1032,7 +1031,6 @@ async def callback_handler(event):
             await event.edit("💵 Send price for this number (e.g., 50):",
                              buttons=[[Button.inline("🔙 Cancel", b"admin")]])
 
-    # ---------- Withdrawal Admin Approve/Reject ----------
     elif data.startswith("wapprove_") or data.startswith("wreject_"):
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
@@ -1046,7 +1044,6 @@ async def callback_handler(event):
             return
 
         if action == "wapprove":
-            # Check if user still has enough withdrawable balance
             user_doc = await users_col.find_one({"user_id": withdrawal["user_id"]})
             if not user_doc:
                 await event.answer("User not found.", alert=True)
@@ -1054,7 +1051,6 @@ async def callback_handler(event):
             if user_doc.get("withdrawable_balance", 0) < withdrawal["amount"]:
                 await event.answer("User doesn't have sufficient withdrawable balance now.", alert=True)
                 return
-            # Deduct from both balances
             await users_col.update_one(
                 {"user_id": withdrawal["user_id"]},
                 {"$inc": {"balance": -withdrawal["amount"], "withdrawable_balance": -withdrawal["amount"]}}
@@ -1296,7 +1292,7 @@ async def process_session_step(event):
                             buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW (screenshot) ----------
+# ---------- DEPOSIT FLOW (with TxnID) ----------
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -1321,17 +1317,29 @@ async def process_deposit_step(event):
             )
             return
         state["amount"] = amount
+
+        # ---------- GENERATE UNIQUE TXN ID ----------
+        txn_id = f"DEP{datetime.now().strftime('%y%m%d%H%M')}{random.randint(1000,9999)}"
+        state["txn_id"] = txn_id
+
         upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=OTP_Deposit"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
         buf.name = "qr_code.png"
+
+        caption = (
+            f"💳 **Deposit ₹{amount}**\n"
+            f"🔑 **Txn ID:** `{txn_id}`\n\n"
+            f"📌 **Please mention this Txn ID in your payment note.**\n\n"
+            f"Scan QR or use UPI ID: `{UPI_ID}`\n\n"
+            "Payment karne ke baad uska **screenshot yahan bhejo**."
+        )
         await bot.send_file(
             event.chat_id,
             buf,
-            caption=f"💳 **Deposit ₹{amount}**\nScan QR or use UPI ID: `{UPI_ID}`\n\n"
-                    "Payment karne ke baad uska **screenshot yahan bhejo**.",
+            caption=caption,
             buttons=[[Button.inline("🔙 Cancel", b"main")]]
         )
         state["step"] = "screenshot"
@@ -1341,9 +1349,11 @@ async def process_deposit_step(event):
                                 buttons=[[Button.inline("🔙 Cancel", b"main")]])
             return
         amount = state["amount"]
+        txn_id = state.get("txn_id", "N/A")
         result = await deposits_col.insert_one({
             "user_id": user_id,
             "amount": amount,
+            "txn_id": txn_id,
             "proof_type": "screenshot",
             "status": "pending",
             "created_at": datetime.utcnow()
@@ -1356,7 +1366,7 @@ async def process_deposit_step(event):
             try:
                 await bot.send_file(admin,
                     photo_io,
-                    caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nProof: Screenshot",
+                    caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`\nProof: Screenshot",
                     buttons=[
                         [Button.inline("✅ Approve", f"approve_{dep_id}"),
                          Button.inline("❌ Reject", f"reject_{dep_id}")]
@@ -1365,7 +1375,7 @@ async def process_deposit_step(event):
             except:
                 pass
         await event.respond(
-            f"✅ Deposit request submitted!\nAmount: ₹{amount}\nAdmin will verify your screenshot and approve.",
+            f"✅ Deposit request submitted!\nAmount: ₹{amount}\nTxn ID: `{txn_id}`\nAdmin will verify your screenshot and approve.",
             buttons=[[Button.inline("🔙 Main Menu", b"main")]]
         )
         user_states.pop(user_id, None)
@@ -1374,6 +1384,7 @@ async def process_deposit_step(event):
             f"💳 **Deposit Request**\n"
             f"User: [{user_id}](tg://user?id={user_id})\n"
             f"Amount: ₹{amount}\n"
+            f"Txn ID: `{txn_id}`\n"
             f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
         )
 
@@ -1424,7 +1435,6 @@ async def handle_message(event):
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
-    # ---------- NEW: Withdrawal text flow ----------
     elif action == "withdraw":
         step = state.get("step")
         if step == "amount":
@@ -1438,12 +1448,18 @@ async def handle_message(event):
                     buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
                 )
                 return
-            # Check withdrawable balance again
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
             if amount > withdrawable:
                 await event.respond(
                     f"❌ You have only ₹{withdrawable} withdrawable balance. Enter a lower amount:",
+                    buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+                )
+                return
+            min_wd = await get_min_withdrawal()
+            if amount < min_wd:
+                await event.respond(
+                    f"❌ Minimum withdrawal is ₹{min_wd}. Please enter a higher amount:",
                     buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
                 )
                 return
@@ -1455,14 +1471,13 @@ async def handle_message(event):
             )
         elif step == "upi":
             upi = event.message.text.strip()
-            if not upi or "@" not in upi:   # basic validation
+            if not upi or "@" not in upi:
                 await event.respond(
                     "❌ Invalid UPI ID. Please enter a valid one (e.g., `example@upi`):",
                     buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
                 )
                 return
             amount = state["amount"]
-            # Create withdrawal request
             result = await withdrawals_col.insert_one({
                 "user_id": user_id,
                 "amount": amount,
@@ -1471,7 +1486,6 @@ async def handle_message(event):
                 "created_at": datetime.utcnow()
             })
             w_id = result.inserted_id
-            # Notify admins
             for admin in ADMIN_IDS:
                 try:
                     await bot.send_message(
@@ -1480,7 +1494,6 @@ async def handle_message(event):
                         f"User: `{user_id}`\n"
                         f"Amount: ₹{amount}\n"
                         f"UPI: `{upi}`\n"
-                        f"Withdrawable Balance: {user_doc.get('withdrawable_balance', 0)}\n"
                         f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}",
                         buttons=[
                             [Button.inline("✅ Approve", f"wapprove_{w_id}"),
@@ -1542,6 +1555,21 @@ async def handle_message(event):
             await event.respond(f"✅ Default price updated to ₹{new_price}.",
                                 buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             user_states.pop(user_id, None)
+    elif action == "set_min_withdraw":
+        step = state.get("step")
+        if step == "await_value":
+            try:
+                val = float(event.message.text.strip())
+                if val <= 0:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid value. Enter a positive number (e.g., `20`):",
+                                    buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                return
+            await set_min_withdrawal(val)
+            await event.respond(f"✅ Minimum withdrawal updated to ₹{val}.",
+                                buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            user_states.pop(user_id, None)
     else:
         await send_main_menu(event)
 
@@ -1566,7 +1594,7 @@ async def start_cmd(event):
             "joined_at": datetime.utcnow(),
             "referred_by": referrer_id,
             "referral_bonus_paid": False,
-            "withdrawable_balance": 0      # NEW
+            "withdrawable_balance": 0
         })
     else:
         if user_data.get("referred_by") is None and referrer_id and referrer_id != user_id:
