@@ -55,7 +55,8 @@ else:
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS")
 
-logging.basicConfig(level=logging.INFO)
+# Set logging level to DEBUG to see all details
+logging.basicConfig(level=logging.DEBUG)
 
 # ---------- MongoDB Setup ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
@@ -438,12 +439,10 @@ async def broadcast_callback(event):
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     try:
-        # 1️⃣ DECODE DATA (IMPORTANT!)
         data = event.data.decode("utf-8")
         user_id = event.sender_id
         logging.info(f"Callback received: {data} from user {user_id}")
 
-        # 2️⃣ COMMON CHECKS
         if data.startswith("broadcast_"):
             return
 
@@ -487,6 +486,7 @@ async def callback_handler(event):
                         "admin_accounts_filter": value,
                         "admin_accounts_page": 1
                     }
+                    logging.debug(f"Set filter to {value}")
                 else:
                     await event.answer("Invalid filter", alert=True)
                     return
@@ -499,6 +499,7 @@ async def callback_handler(event):
                     state = user_states.get(user_id, {})
                     state["admin_accounts_page"] = page
                     user_states[user_id] = state
+                    logging.debug(f"Set page to {page}")
                 except:
                     await event.answer("Invalid page", alert=True)
                     return
@@ -525,6 +526,7 @@ async def callback_handler(event):
                         "admin_tx_filter": value,
                         "admin_tx_page": 1
                     }
+                    logging.debug(f"Set tx filter to {value}")
                 else:
                     await event.answer("Invalid filter", alert=True)
                     return
@@ -537,6 +539,7 @@ async def callback_handler(event):
                     state = user_states.get(user_id, {})
                     state["admin_tx_page"] = page
                     user_states[user_id] = state
+                    logging.debug(f"Set tx page to {page}")
                 except:
                     await event.answer("Invalid page", alert=True)
                     return
@@ -563,6 +566,7 @@ async def callback_handler(event):
                         "admin_wd_filter": value,
                         "admin_wd_page": 1
                     }
+                    logging.debug(f"Set wd filter to {value}")
                 else:
                     await event.answer("Invalid filter", alert=True)
                     return
@@ -575,6 +579,7 @@ async def callback_handler(event):
                     state = user_states.get(user_id, {})
                     state["admin_wd_page"] = page
                     user_states[user_id] = state
+                    logging.debug(f"Set wd page to {page}")
                 except:
                     await event.answer("Invalid page", alert=True)
                     return
@@ -589,6 +594,7 @@ async def callback_handler(event):
                 if page < 1:
                     page = 1
                 user_states[user_id] = {"user_wd_page": page}
+                logging.debug(f"Set user wd page to {page}")
             except:
                 await event.answer("Invalid page", alert=True)
                 return
@@ -608,7 +614,7 @@ async def callback_handler(event):
                 pass
             return
 
-        # ---------- REFERRAL INFO (main referral button) ----------
+        # ---------- REFERRAL INFO ----------
         if data == "referral_info":
             username = await get_bot_username()
             ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -640,7 +646,7 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- WITHDRAW (start flow) ----------
+        # ---------- WITHDRAW ----------
         if data == "withdraw":
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
@@ -1210,7 +1216,7 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- ADD COUNTRY (for admin add flows) ----------
+        # ---------- ADD COUNTRY ----------
         if data.startswith("addcountry_"):
             if data == "addcountry_new":
                 state = user_states.get(user_id)
@@ -1309,259 +1315,304 @@ async def callback_handler(event):
         except:
             pass
 
-# ---------- ADMIN ACCOUNTS LIST ----------
+# ---------- ADMIN ACCOUNTS LIST (with detailed logging) ----------
 async def show_accounts_list(event, user_id):
-    state = user_states.get(user_id, {})
-    filter_status = state.get("admin_accounts_filter", "all")
-    page = state.get("admin_accounts_page", 1)
-    per_page = 10
+    try:
+        logging.debug("Entering show_accounts_list")
+        state = user_states.get(user_id, {})
+        filter_status = state.get("admin_accounts_filter", "all")
+        page = state.get("admin_accounts_page", 1)
+        per_page = 10
+        logging.debug(f"Filter: {filter_status}, Page: {page}")
 
-    query = {}
-    if filter_status != "all":
-        query["status"] = filter_status
+        query = {}
+        if filter_status != "all":
+            query["status"] = filter_status
 
-    total = await accounts_col.count_documents(query)
-    total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-    if page > total_pages:
-        page = total_pages
-        state["admin_accounts_page"] = page
-        user_states[user_id] = state
+        total = await accounts_col.count_documents(query)
+        logging.debug(f"Total accounts: {total}")
 
-    skip = (page - 1) * per_page
-    cursor = accounts_col.find(query).sort("_id", -1).skip(skip).limit(per_page)
-    accounts = await cursor.to_list(length=per_page)
+        total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        if page > total_pages:
+            page = total_pages
+            state["admin_accounts_page"] = page
+            user_states[user_id] = state
 
-    if not accounts:
-        txt = f"📋 **Accounts ({filter_status})**\n\nNo accounts found."
-    else:
-        lines = []
-        for acc in accounts:
-            status_emoji = {"available": "🟢", "sold": "🔴", "inactive": "⚪"}.get(acc.get("status"), "❓")
-            buyer = f" (buyer:{acc['buyer_id']})" if acc.get("buyer_id") else ""
-            lines.append(
-                f"{status_emoji} `{acc['phone']}` | {acc['country']} | ₹{acc.get('price', '?')} | {acc.get('status', 'unknown')}{buyer}"
-            )
-        txt = f"📋 **Accounts ({filter_status})** – Page {page}/{total_pages}\n" + "\n".join(lines)
+        skip = (page - 1) * per_page
+        cursor = accounts_col.find(query).sort("_id", -1).skip(skip).limit(per_page)
+        accounts = await cursor.to_list(length=per_page)
+        logging.debug(f"Fetched {len(accounts)} accounts")
 
-    btns = []
-    filter_row = [
-        Button.inline("🟢 All", f"admin_accounts_filter_all"),
-        Button.inline("🟢 Available", f"admin_accounts_filter_available"),
-        Button.inline("🔴 Sold", f"admin_accounts_filter_sold"),
-        Button.inline("⚪ Inactive", f"admin_accounts_filter_inactive")
-    ]
-    btns.append(filter_row)
+        if not accounts:
+            txt = f"📋 **Accounts ({filter_status})**\n\nNo accounts found."
+        else:
+            lines = []
+            for acc in accounts:
+                status_emoji = {"available": "🟢", "sold": "🔴", "inactive": "⚪"}.get(acc.get("status"), "❓")
+                buyer = f" (buyer:{acc['buyer_id']})" if acc.get("buyer_id") else ""
+                lines.append(
+                    f"{status_emoji} `{acc['phone']}` | {acc['country']} | ₹{acc.get('price', '?')} | {acc.get('status', 'unknown')}{buyer}"
+                )
+            txt = f"📋 **Accounts ({filter_status})** – Page {page}/{total_pages}\n" + "\n".join(lines)
 
-    page_row = []
-    if page > 1:
-        page_row.append(Button.inline("⬅️ Prev", f"admin_accounts_page_{page-1}"))
-    if page < total_pages:
-        page_row.append(Button.inline("Next ➡️", f"admin_accounts_page_{page+1}"))
-    if page_row:
-        btns.append(page_row)
+        btns = []
+        filter_row = [
+            Button.inline("🟢 All", f"admin_accounts_filter_all"),
+            Button.inline("🟢 Available", f"admin_accounts_filter_available"),
+            Button.inline("🔴 Sold", f"admin_accounts_filter_sold"),
+            Button.inline("⚪ Inactive", f"admin_accounts_filter_inactive")
+        ]
+        btns.append(filter_row)
 
-    btns.append([Button.inline("🔙 Back", b"admin")])
+        page_row = []
+        if page > 1:
+            page_row.append(Button.inline("⬅️ Prev", f"admin_accounts_page_{page-1}"))
+        if page < total_pages:
+            page_row.append(Button.inline("Next ➡️", f"admin_accounts_page_{page+1}"))
+        if page_row:
+            btns.append(page_row)
 
-    if isinstance(event, events.CallbackQuery.Event):
-        await event.edit(txt, buttons=btns)
-    else:
-        await event.respond(txt, buttons=btns)
+        btns.append([Button.inline("🔙 Back", b"admin")])
+
+        logging.debug("Attempting to edit message with accounts list")
+        if isinstance(event, events.CallbackQuery.Event):
+            await event.edit(txt, buttons=btns)
+            logging.debug("Message edited successfully")
+        else:
+            await event.respond(txt, buttons=btns)
+            logging.debug("Sent new message")
+    except Exception as e:
+        logging.error(f"Error in show_accounts_list: {e}", exc_info=True)
+        raise
 
 # ---------- ADMIN TRANSACTION HISTORY ----------
 async def show_transactions_list(event, user_id):
-    state = user_states.get(user_id, {})
-    filter_type = state.get("admin_tx_filter", "all")
-    page = state.get("admin_tx_page", 1)
-    per_page = 10
+    try:
+        logging.debug("Entering show_transactions_list")
+        state = user_states.get(user_id, {})
+        filter_type = state.get("admin_tx_filter", "all")
+        page = state.get("admin_tx_page", 1)
+        per_page = 10
+        logging.debug(f"Filter: {filter_type}, Page: {page}")
 
-    orders_cursor = orders_col.find({}).sort("created_at", -1)
-    deposits_cursor = deposits_col.find({"status": "approved"}).sort("created_at", -1)
-    orders = await orders_cursor.to_list(length=None)
-    deposits = await deposits_cursor.to_list(length=None)
+        orders_cursor = orders_col.find({}).sort("created_at", -1)
+        deposits_cursor = deposits_col.find({"status": "approved"}).sort("created_at", -1)
+        orders = await orders_cursor.to_list(length=None)
+        deposits = await deposits_cursor.to_list(length=None)
+        logging.debug(f"Found {len(orders)} orders and {len(deposits)} approved deposits")
 
-    combined = []
-    for o in orders:
-        combined.append({
-            "type": "purchase",
-            "user_id": o["user_id"],
-            "phone": o.get("phone", "N/A"),
-            "country": o.get("country", "N/A"),
-            "amount": o.get("amount", 0),
-            "date": o["created_at"],
-            "status": "Completed"
-        })
-    for d in deposits:
-        combined.append({
-            "type": "deposit",
-            "user_id": d["user_id"],
-            "phone": "N/A",
-            "country": "N/A",
-            "amount": d.get("amount", 0),
-            "date": d["created_at"],
-            "txn_id": d.get("txn_id", "N/A"),
-            "status": "Approved"
-        })
+        combined = []
+        for o in orders:
+            combined.append({
+                "type": "purchase",
+                "user_id": o["user_id"],
+                "phone": o.get("phone", "N/A"),
+                "country": o.get("country", "N/A"),
+                "amount": o.get("amount", 0),
+                "date": o["created_at"],
+                "status": "Completed"
+            })
+        for d in deposits:
+            combined.append({
+                "type": "deposit",
+                "user_id": d["user_id"],
+                "phone": "N/A",
+                "country": "N/A",
+                "amount": d.get("amount", 0),
+                "date": d["created_at"],
+                "txn_id": d.get("txn_id", "N/A"),
+                "status": "Approved"
+            })
 
-    if filter_type == "purchase":
-        combined = [x for x in combined if x["type"] == "purchase"]
-    elif filter_type == "deposit":
-        combined = [x for x in combined if x["type"] == "deposit"]
+        if filter_type == "purchase":
+            combined = [x for x in combined if x["type"] == "purchase"]
+        elif filter_type == "deposit":
+            combined = [x for x in combined if x["type"] == "deposit"]
 
-    combined.sort(key=lambda x: x["date"], reverse=True)
+        combined.sort(key=lambda x: x["date"], reverse=True)
+        total = len(combined)
+        logging.debug(f"Total combined transactions after filter: {total}")
 
-    total = len(combined)
-    total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-    if page > total_pages:
-        page = total_pages
-        state["admin_tx_page"] = page
-        user_states[user_id] = state
+        total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        if page > total_pages:
+            page = total_pages
+            state["admin_tx_page"] = page
+            user_states[user_id] = state
 
-    start = (page - 1) * per_page
-    end = min(start + per_page, total)
-    page_items = combined[start:end]
+        start = (page - 1) * per_page
+        end = min(start + per_page, total)
+        page_items = combined[start:end]
+        logging.debug(f"Displaying {len(page_items)} items on page {page}")
 
-    if not page_items:
-        txt = f"📜 **Transaction History ({filter_type})**\n\nNo transactions found."
-    else:
-        lines = []
-        for item in page_items:
-            date_str = item["date"].strftime('%d/%m/%Y %H:%M')
-            if item["type"] == "purchase":
-                lines.append(
-                    f"🛒 User {item['user_id']} | {item['phone']} ({item['country']}) | -₹{item['amount']} | {date_str}"
-                )
-            else:
-                lines.append(
-                    f"💰 User {item['user_id']} | Deposit | +₹{item['amount']} | Txn:{item.get('txn_id','N/A')} | {date_str}"
-                )
-        txt = f"📜 **Transaction History ({filter_type})** – Page {page}/{total_pages}\n" + "\n".join(lines)
+        if not page_items:
+            txt = f"📜 **Transaction History ({filter_type})**\n\nNo transactions found."
+        else:
+            lines = []
+            for item in page_items:
+                date_str = item["date"].strftime('%d/%m/%Y %H:%M')
+                if item["type"] == "purchase":
+                    lines.append(
+                        f"🛒 User {item['user_id']} | {item['phone']} ({item['country']}) | -₹{item['amount']} | {date_str}"
+                    )
+                else:
+                    lines.append(
+                        f"💰 User {item['user_id']} | Deposit | +₹{item['amount']} | Txn:{item.get('txn_id','N/A')} | {date_str}"
+                    )
+            txt = f"📜 **Transaction History ({filter_type})** – Page {page}/{total_pages}\n" + "\n".join(lines)
 
-    btns = []
-    filter_row = [
-        Button.inline("📋 All", f"admin_tx_filter_all"),
-        Button.inline("🛒 Purchases", f"admin_tx_filter_purchase"),
-        Button.inline("💰 Deposits", f"admin_tx_filter_deposit")
-    ]
-    btns.append(filter_row)
+        btns = []
+        filter_row = [
+            Button.inline("📋 All", f"admin_tx_filter_all"),
+            Button.inline("🛒 Purchases", f"admin_tx_filter_purchase"),
+            Button.inline("💰 Deposits", f"admin_tx_filter_deposit")
+        ]
+        btns.append(filter_row)
 
-    page_row = []
-    if page > 1:
-        page_row.append(Button.inline("⬅️ Prev", f"admin_tx_page_{page-1}"))
-    if page < total_pages:
-        page_row.append(Button.inline("Next ➡️", f"admin_tx_page_{page+1}"))
-    if page_row:
-        btns.append(page_row)
+        page_row = []
+        if page > 1:
+            page_row.append(Button.inline("⬅️ Prev", f"admin_tx_page_{page-1}"))
+        if page < total_pages:
+            page_row.append(Button.inline("Next ➡️", f"admin_tx_page_{page+1}"))
+        if page_row:
+            btns.append(page_row)
 
-    btns.append([Button.inline("🔙 Back", b"admin")])
+        btns.append([Button.inline("🔙 Back", b"admin")])
 
-    if isinstance(event, events.CallbackQuery.Event):
-        await event.edit(txt, buttons=btns)
-    else:
-        await event.respond(txt, buttons=btns)
+        logging.debug("Attempting to edit message with transaction list")
+        if isinstance(event, events.CallbackQuery.Event):
+            await event.edit(txt, buttons=btns)
+            logging.debug("Message edited successfully")
+        else:
+            await event.respond(txt, buttons=btns)
+    except Exception as e:
+        logging.error(f"Error in show_transactions_list: {e}", exc_info=True)
+        raise
 
 # ---------- ADMIN WITHDRAWALS HISTORY ----------
 async def show_admin_withdrawals(event, user_id):
-    state = user_states.get(user_id, {})
-    filter_status = state.get("admin_wd_filter", "all")
-    page = state.get("admin_wd_page", 1)
-    per_page = 10
+    try:
+        logging.debug("Entering show_admin_withdrawals")
+        state = user_states.get(user_id, {})
+        filter_status = state.get("admin_wd_filter", "all")
+        page = state.get("admin_wd_page", 1)
+        per_page = 10
+        logging.debug(f"Filter: {filter_status}, Page: {page}")
 
-    query = {}
-    if filter_status != "all":
-        query["status"] = filter_status
+        query = {}
+        if filter_status != "all":
+            query["status"] = filter_status
 
-    total = await withdrawals_col.count_documents(query)
-    total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-    if page > total_pages:
-        page = total_pages
-        state["admin_wd_page"] = page
-        user_states[user_id] = state
+        total = await withdrawals_col.count_documents(query)
+        logging.debug(f"Total withdrawals: {total}")
 
-    skip = (page - 1) * per_page
-    cursor = withdrawals_col.find(query).sort("created_at", -1).skip(skip).limit(per_page)
-    withdrawals = await cursor.to_list(length=per_page)
+        total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        if page > total_pages:
+            page = total_pages
+            state["admin_wd_page"] = page
+            user_states[user_id] = state
 
-    if not withdrawals:
-        txt = f"💸 **Withdrawal History ({filter_status})**\n\nNo withdrawals found."
-    else:
-        lines = []
-        for wd in withdrawals:
-            status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(wd.get("status"), "❓")
-            date_str = wd["created_at"].strftime('%d/%m/%Y %H:%M')
-            lines.append(
-                f"{status_emoji} User {wd['user_id']} | ₹{wd['amount']} | UPI: {wd.get('upi_id','N/A')} | {wd.get('status','unknown')} | {date_str}"
-            )
-        txt = f"💸 **Withdrawal History ({filter_status})** – Page {page}/{total_pages}\n" + "\n".join(lines)
+        skip = (page - 1) * per_page
+        cursor = withdrawals_col.find(query).sort("created_at", -1).skip(skip).limit(per_page)
+        withdrawals = await cursor.to_list(length=per_page)
+        logging.debug(f"Fetched {len(withdrawals)} withdrawals")
 
-    btns = []
-    filter_row = [
-        Button.inline("📋 All", f"admin_wd_filter_all"),
-        Button.inline("🟡 Pending", f"admin_wd_filter_pending"),
-        Button.inline("🟢 Approved", f"admin_wd_filter_approved"),
-        Button.inline("🔴 Rejected", f"admin_wd_filter_rejected")
-    ]
-    btns.append(filter_row)
+        if not withdrawals:
+            txt = f"💸 **Withdrawal History ({filter_status})**\n\nNo withdrawals found."
+        else:
+            lines = []
+            for wd in withdrawals:
+                status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(wd.get("status"), "❓")
+                date_str = wd["created_at"].strftime('%d/%m/%Y %H:%M')
+                lines.append(
+                    f"{status_emoji} User {wd['user_id']} | ₹{wd['amount']} | UPI: {wd.get('upi_id','N/A')} | {wd.get('status','unknown')} | {date_str}"
+                )
+            txt = f"💸 **Withdrawal History ({filter_status})** – Page {page}/{total_pages}\n" + "\n".join(lines)
 
-    page_row = []
-    if page > 1:
-        page_row.append(Button.inline("⬅️ Prev", f"admin_wd_page_{page-1}"))
-    if page < total_pages:
-        page_row.append(Button.inline("Next ➡️", f"admin_wd_page_{page+1}"))
-    if page_row:
-        btns.append(page_row)
+        btns = []
+        filter_row = [
+            Button.inline("📋 All", f"admin_wd_filter_all"),
+            Button.inline("🟡 Pending", f"admin_wd_filter_pending"),
+            Button.inline("🟢 Approved", f"admin_wd_filter_approved"),
+            Button.inline("🔴 Rejected", f"admin_wd_filter_rejected")
+        ]
+        btns.append(filter_row)
 
-    btns.append([Button.inline("🔙 Back", b"admin")])
+        page_row = []
+        if page > 1:
+            page_row.append(Button.inline("⬅️ Prev", f"admin_wd_page_{page-1}"))
+        if page < total_pages:
+            page_row.append(Button.inline("Next ➡️", f"admin_wd_page_{page+1}"))
+        if page_row:
+            btns.append(page_row)
 
-    if isinstance(event, events.CallbackQuery.Event):
-        await event.edit(txt, buttons=btns)
-    else:
-        await event.respond(txt, buttons=btns)
+        btns.append([Button.inline("🔙 Back", b"admin")])
+
+        logging.debug("Attempting to edit message with withdrawal list")
+        if isinstance(event, events.CallbackQuery.Event):
+            await event.edit(txt, buttons=btns)
+            logging.debug("Message edited successfully")
+        else:
+            await event.respond(txt, buttons=btns)
+    except Exception as e:
+        logging.error(f"Error in show_admin_withdrawals: {e}", exc_info=True)
+        raise
 
 # ---------- USER WITHDRAWALS HISTORY ----------
 async def show_user_withdrawals(event, user_id):
-    state = user_states.get(user_id, {})
-    page = state.get("user_wd_page", 1)
-    per_page = 10
+    try:
+        logging.debug("Entering show_user_withdrawals")
+        state = user_states.get(user_id, {})
+        page = state.get("user_wd_page", 1)
+        per_page = 10
+        logging.debug(f"Page: {page}")
 
-    query = {"user_id": user_id}
-    total = await withdrawals_col.count_documents(query)
-    total_pages = (total + per_page - 1) // per_page if total > 0 else 1
-    if page > total_pages:
-        page = total_pages
-        state["user_wd_page"] = page
-        user_states[user_id] = state
+        query = {"user_id": user_id}
+        total = await withdrawals_col.count_documents(query)
+        logging.debug(f"Total user withdrawals: {total}")
 
-    skip = (page - 1) * per_page
-    cursor = withdrawals_col.find(query).sort("created_at", -1).skip(skip).limit(per_page)
-    withdrawals = await cursor.to_list(length=per_page)
+        total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        if page > total_pages:
+            page = total_pages
+            state["user_wd_page"] = page
+            user_states[user_id] = state
 
-    if not withdrawals:
-        txt = "💸 **Your Withdrawal History**\n\nNo withdrawals found."
-    else:
-        lines = []
-        for wd in withdrawals:
-            status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(wd.get("status"), "❓")
-            date_str = wd["created_at"].strftime('%d/%m/%Y %H:%M')
-            lines.append(
-                f"{status_emoji} ₹{wd['amount']} | UPI: {wd.get('upi_id','N/A')} | {wd.get('status','unknown')} | {date_str}"
-            )
-        txt = f"💸 **Your Withdrawal History** – Page {page}/{total_pages}\n" + "\n".join(lines)
+        skip = (page - 1) * per_page
+        cursor = withdrawals_col.find(query).sort("created_at", -1).skip(skip).limit(per_page)
+        withdrawals = await cursor.to_list(length=per_page)
+        logging.debug(f"Fetched {len(withdrawals)} user withdrawals")
 
-    btns = []
-    page_row = []
-    if page > 1:
-        page_row.append(Button.inline("⬅️ Prev", f"user_wd_page_{page-1}"))
-    if page < total_pages:
-        page_row.append(Button.inline("Next ➡️", f"user_wd_page_{page+1}"))
-    if page_row:
-        btns.append(page_row)
+        if not withdrawals:
+            txt = "💸 **Your Withdrawal History**\n\nNo withdrawals found."
+        else:
+            lines = []
+            for wd in withdrawals:
+                status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(wd.get("status"), "❓")
+                date_str = wd["created_at"].strftime('%d/%m/%Y %H:%M')
+                lines.append(
+                    f"{status_emoji} ₹{wd['amount']} | UPI: {wd.get('upi_id','N/A')} | {wd.get('status','unknown')} | {date_str}"
+                )
+            txt = f"💸 **Your Withdrawal History** – Page {page}/{total_pages}\n" + "\n".join(lines)
 
-    btns.append([Button.inline("🔙 Back to Referral", b"referral_info")])
+        btns = []
+        page_row = []
+        if page > 1:
+            page_row.append(Button.inline("⬅️ Prev", f"user_wd_page_{page-1}"))
+        if page < total_pages:
+            page_row.append(Button.inline("Next ➡️", f"user_wd_page_{page+1}"))
+        if page_row:
+            btns.append(page_row)
 
-    if isinstance(event, events.CallbackQuery.Event):
-        await event.edit(txt, buttons=btns)
-    else:
-        await event.respond(txt, buttons=btns)
+        btns.append([Button.inline("🔙 Back to Referral", b"referral_info")])
+
+        logging.debug("Attempting to edit message with user withdrawal list")
+        if isinstance(event, events.CallbackQuery.Event):
+            await event.edit(txt, buttons=btns)
+            logging.debug("Message edited successfully")
+        else:
+            await event.respond(txt, buttons=btns)
+    except Exception as e:
+        logging.error(f"Error in show_user_withdrawals: {e}", exc_info=True)
+        raise
 
 # ---------- ADD PHONE (OTP) FLOW ----------
 async def start_add_phone_flow(event):
