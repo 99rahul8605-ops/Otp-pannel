@@ -434,14 +434,16 @@ async def broadcast_callback(event):
     await event.edit(final)
     user_states.pop(user_id, None)
 
-# ---------- CALLBACK HANDLER (with error handling) ----------
+# ---------- FIXED CALLBACK HANDLER (with proper decoding and error handling) ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     try:
-        data = event.data.decode()
+        # 1️⃣ DECODE DATA (IMPORTANT!)
+        data = event.data.decode("utf-8")
         user_id = event.sender_id
-        logging.info(f"Callback received: data={data}, user={user_id}")  # Debug log
+        logging.info(f"Callback received: {data} from user {user_id}")
 
+        # 2️⃣ COMMON CHECKS
         if data.startswith("broadcast_"):
             return
 
@@ -458,7 +460,7 @@ async def callback_handler(event):
             await send_join_message(event)
             return
 
-        # Clear general states for certain actions
+        # Clear states for menu switches
         if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                     "admin_add_otp", "admin_add_sess", "admin_addbal",
                     "admin_deposits", "admin_setprice", "admin_support", "withdraw",
@@ -501,6 +503,7 @@ async def callback_handler(event):
                     await event.answer("Invalid page", alert=True)
                     return
                 await show_accounts_list(event, user_id)
+            await event.answer()
             return
 
         # ---------- ADMIN TRANSACTIONS FILTER/PAGINATION ----------
@@ -538,6 +541,7 @@ async def callback_handler(event):
                     await event.answer("Invalid page", alert=True)
                     return
                 await show_transactions_list(event, user_id)
+            await event.answer()
             return
 
         # ---------- ADMIN WITHDRAWALS FILTER/PAGINATION ----------
@@ -575,6 +579,7 @@ async def callback_handler(event):
                     await event.answer("Invalid page", alert=True)
                     return
                 await show_admin_withdrawals(event, user_id)
+            await event.answer()
             return
 
         # ---------- USER WITHDRAWALS PAGINATION ----------
@@ -588,12 +593,14 @@ async def callback_handler(event):
                 await event.answer("Invalid page", alert=True)
                 return
             await show_user_withdrawals(event, user_id)
+            await event.answer()
             return
 
+        # ---------- LOGOUT ----------
         if data.startswith("logout_"):
             phone = data[len("logout_"):]
             await acc_mgr.logout_client(phone)
-            await event.answer("🔒 Session terminated. You will no longer receive OTPs for this number.", alert=True)
+            await event.answer("🔒 Session terminated.", alert=True)
             try:
                 original_text = event.message.text if event.message else ""
                 await event.edit(original_text + "\n\n🔒 *Session terminated.*", buttons=None)
@@ -601,7 +608,7 @@ async def callback_handler(event):
                 pass
             return
 
-        # ---------- REFERRAL INFO ----------
+        # ---------- REFERRAL INFO (main referral button) ----------
         if data == "referral_info":
             username = await get_bot_username()
             ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -630,9 +637,10 @@ async def callback_handler(event):
                 [Button.inline("🔙 Back", b"main")]
             ]
             await event.edit(text, buttons=buttons)
+            await event.answer()
             return
 
-        # ---------- Withdraw flow start ----------
+        # ---------- WITHDRAW (start flow) ----------
         if data == "withdraw":
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
@@ -647,14 +655,16 @@ async def callback_handler(event):
                 "Enter the amount you wish to withdraw (in ₹):",
                 buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
             )
+            await event.answer()
             return
 
         # ---------- USER WITHDRAWALS HISTORY ----------
         if data == "my_withdrawals":
             await show_user_withdrawals(event, user_id)
+            await event.answer()
             return
 
-        # ---------- User purchase flow ----------
+        # ---------- BUY / COUNTRY / PRICE ----------
         if data == "buy":
             countries = await accounts_col.distinct("country", {"status": "available"})
             if not countries:
@@ -663,9 +673,10 @@ async def callback_handler(event):
             btns = [[Button.inline(c, f"country_{c}")] for c in countries]
             btns.append([Button.inline("🔙 Back", b"main")])
             await event.edit("🌍 Choose a country:", buttons=btns)
+            await event.answer()
             return
 
-        elif data.startswith("country_"):
+        if data.startswith("country_"):
             country = data.split("_", 1)[1]
             total_count = await accounts_col.count_documents({"country": country, "status": "available"})
             if total_count == 0:
@@ -687,9 +698,10 @@ async def callback_handler(event):
                 f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
                 buttons=btns
             )
+            await event.answer()
             return
 
-        elif data.startswith("price_"):
+        if data.startswith("price_"):
             parts = data.split("_", 2)
             country = parts[1]
             price = float(parts[2])
@@ -709,9 +721,11 @@ async def callback_handler(event):
                 [Button.inline("❌ Cancel", b"cancel_purchase")]
             ]
             await event.edit(confirm_text, buttons=buttons)
+            await event.answer()
             return
 
-        elif data == "confirm_purchase":
+        # ---------- CONFIRM PURCHASE ----------
+        if data == "confirm_purchase":
             state = user_states.get(user_id)
             if not state or state.get("action") != "awaiting_confirmation":
                 await event.answer("Session expired. Please start again.", alert=True)
@@ -877,9 +891,11 @@ async def callback_handler(event):
                 f"Balance After: ₹{new_balance}\n"
                 f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
             )
+            await event.answer("✅ Purchase successful!", alert=True)
             return
 
-        elif data == "cancel_purchase":
+        # ---------- CANCEL PURCHASE ----------
+        if data == "cancel_purchase":
             state = user_states.pop(user_id, None)
             if state and state.get("action") == "awaiting_confirmation":
                 country = state["country"]
@@ -905,9 +921,11 @@ async def callback_handler(event):
                 )
             else:
                 await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
+            await event.answer()
             return
 
-        elif data.startswith("resend_"):
+        # ---------- RESEND OTP ----------
+        if data.startswith("resend_"):
             phone = data.split("_", 1)[1]
             if phone not in acc_mgr.clients:
                 await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
@@ -926,21 +944,26 @@ async def callback_handler(event):
             asyncio.create_task(clear_pending())
             return
 
-        elif data == "balance":
+        # ---------- BALANCE ----------
+        if data == "balance":
             user = await users_col.find_one({"user_id": user_id})
             bal = user["balance"] if user else 0
             await event.edit(f"💰 Your balance: ₹{bal}", buttons=[[Button.inline("🔙 Back", b"main")]])
+            await event.answer()
             return
 
-        elif data == "deposit":
+        # ---------- DEPOSIT ----------
+        if data == "deposit":
             user_states[user_id] = {"action": "deposit", "step": "amount"}
             await event.edit(
                 f"💵 Enter the amount you want to deposit (₹) – Minimum deposit is ₹{MIN_DEPOSIT}:",
                 buttons=[[Button.inline("🔙 Cancel", b"main")]]
             )
+            await event.answer()
             return
 
-        elif data == "orders":
+        # ---------- ORDERS ----------
+        if data == "orders":
             orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
             orders = await orders_cursor.to_list(length=20)
             deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1)
@@ -982,14 +1005,17 @@ async def callback_handler(event):
                 txt = "📜 **Transaction History:**\n" + "\n".join(lines)
 
             await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
+            await event.answer()
             return
 
-        elif data == "main":
+        # ---------- MAIN MENU ----------
+        if data == "main":
             await send_main_menu(event)
+            await event.answer()
             return
 
         # ---------- ADMIN PANEL ----------
-        elif data == "admin":
+        if data == "admin":
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
@@ -1007,21 +1033,30 @@ async def callback_handler(event):
                 [Button.inline("🔙 Back", b"main")],
             ]
             await event.edit("⚙️ **Admin Panel**", buttons=btns)
+            await event.answer()
             return
 
-        elif data == "admin_add_otp":
+        # ---------- ADMIN ADD OTP ----------
+        if data == "admin_add_otp":
             await start_add_phone_flow(event)
-            return
-        elif data == "admin_add_sess":
-            await start_add_session_flow(event)
+            await event.answer()
             return
 
-        elif data == "admin_addbal":
+        # ---------- ADMIN ADD SESSION ----------
+        if data == "admin_add_sess":
+            await start_add_session_flow(event)
+            await event.answer()
+            return
+
+        # ---------- ADMIN ADD BALANCE ----------
+        if data == "admin_addbal":
             user_states[user_id] = {"action": "add_balance", "step": "await_user_id"}
             await event.edit("👤 Send the user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.answer()
             return
 
-        elif data == "admin_deposits":
+        # ---------- ADMIN PENDING DEPOSITS ----------
+        if data == "admin_deposits":
             cursor = deposits_col.find({"status": "pending"}).sort("created_at", 1)
             pending = await cursor.to_list(length=10)
             if not pending:
@@ -1036,9 +1071,11 @@ async def callback_handler(event):
                 ])
             btns.append([Button.inline("🔙 Back", b"admin")])
             await event.edit("🕒 **Pending Deposits**", buttons=btns)
+            await event.answer()
             return
 
-        elif data.startswith("approve_"):
+        # ---------- APPROVE DEPOSIT ----------
+        if data.startswith("approve_"):
             dep_id = data.split("_", 1)[1]
             deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
             if not deposit or deposit["status"] != "pending":
@@ -1104,9 +1141,11 @@ async def callback_handler(event):
                 f"Referral Bonus: {'Yes' if bonus_paid else 'No'}\n"
                 f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
             )
+            await event.answer()
             return
 
-        elif data.startswith("reject_"):
+        # ---------- REJECT DEPOSIT ----------
+        if data.startswith("reject_"):
             dep_id = data.split("_", 1)[1]
             deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
             if not deposit or deposit["status"] != "pending":
@@ -1119,9 +1158,11 @@ async def callback_handler(event):
             except:
                 pass
             await event.edit("❌ Deposit rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await event.answer()
             return
 
-        elif data == "admin_setprice":
+        # ---------- ADMIN SET PRICE ----------
+        if data == "admin_setprice":
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
@@ -1132,9 +1173,11 @@ async def callback_handler(event):
                 "This price will apply when adding new accounts if not specified.",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
+            await event.answer()
             return
 
-        elif data == "admin_support":
+        # ---------- ADMIN SET SUPPORT LINK ----------
+        if data == "admin_support":
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
@@ -1148,9 +1191,11 @@ async def callback_handler(event):
                 f"Send `remove` to delete the support link.",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
+            await event.answer()
             return
 
-        elif data == "admin_minwithdraw":
+        # ---------- ADMIN SET MIN WITHDRAWAL ----------
+        if data == "admin_minwithdraw":
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
@@ -1162,9 +1207,11 @@ async def callback_handler(event):
                 "Send the new minimum withdrawal amount (e.g., `20`):",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
+            await event.answer()
             return
 
-        elif data.startswith("addcountry_"):
+        # ---------- ADD COUNTRY (for admin add flows) ----------
+        if data.startswith("addcountry_"):
             if data == "addcountry_new":
                 state = user_states.get(user_id)
                 if not state or state.get("action") not in ("add_phone_otp", "add_session"):
@@ -1183,9 +1230,11 @@ async def callback_handler(event):
                 state["step"] = "price"
                 await event.edit("💵 Send price for this number (e.g., 50):",
                                  buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.answer()
             return
 
-        elif data.startswith("wapprove_") or data.startswith("wreject_"):
+        # ---------- APPROVE / REJECT WITHDRAWAL ----------
+        if data.startswith("wapprove_") or data.startswith("wreject_"):
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
@@ -1247,14 +1296,14 @@ async def callback_handler(event):
                     f"Amount: ₹{withdrawal['amount']}\n"
                     f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
                 )
+            await event.answer()
             return
 
-        else:
-            # Unknown action
-            await event.answer("❓ Unknown action. Please use the menu buttons.", alert=True)
+        # ---------- UNKNOWN ----------
+        await event.answer("❓ Unknown action. Please use the menu buttons.", alert=True)
 
     except Exception as e:
-        logging.error(f"Error in callback_handler: {e}", exc_info=True)
+        logging.error(f"❌ Callback error: {e}", exc_info=True)
         try:
             await event.answer("❌ Something went wrong. Please try again later.", alert=True)
         except:
