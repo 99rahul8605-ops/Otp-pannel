@@ -218,7 +218,6 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
     ]
-    # Third row: Referral Program + Admin (if admin) - removed separate Withdrawal History button
     row3 = [Button.inline("👥 Referral Program", b"referral_info")]
     if user_id in ADMIN_IDS:
         row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
@@ -435,452 +434,242 @@ async def broadcast_callback(event):
     await event.edit(final)
     user_states.pop(user_id, None)
 
-# ---------- CALLBACK HANDLER ----------
+# ---------- CALLBACK HANDLER (with error handling) ----------
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    data = event.data.decode()
-    user_id = event.sender_id
+    try:
+        data = event.data.decode()
+        user_id = event.sender_id
+        logging.info(f"Callback received: data={data}, user={user_id}")  # Debug log
 
-    if data.startswith("broadcast_"):
-        return
+        if data.startswith("broadcast_"):
+            return
 
-    if data == "check_join":
-        if await is_user_member(user_id):
-            await show_welcome_menu(event, user_id)
-        else:
-            await event.answer("You haven't joined all channels yet!", alert=True)
+        if data == "check_join":
+            if await is_user_member(user_id):
+                await show_welcome_menu(event, user_id)
+            else:
+                await event.answer("You haven't joined all channels yet!", alert=True)
+                await send_join_message(event)
+            return
+
+        if not await is_user_member(user_id):
+            await event.answer("You must join all channels first!", alert=True)
             await send_join_message(event)
-        return
-
-    if not await is_user_member(user_id):
-        await event.answer("You must join all channels first!", alert=True)
-        await send_join_message(event)
-        return
-
-    # Clear general states
-    if data in ("main", "buy", "balance", "deposit", "orders", "admin",
-                "admin_add_otp", "admin_add_sess", "admin_addbal",
-                "admin_deposits", "admin_setprice", "admin_support", "withdraw",
-                "admin_minwithdraw", "admin_transactions", "admin_accounts",
-                "admin_withdrawals", "my_withdrawals"):
-        user_states.pop(user_id, None)
-
-    # ---------- ADMIN ACCOUNTS FILTER/PAGINATION ----------
-    if data.startswith("admin_accounts_"):
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
             return
-        parts = data.split("_", 2)
-        if len(parts) == 3:
-            action = parts[1]
-            value = parts[2]
-        else:
-            action = parts[1] if len(parts) > 1 else None
-            value = None
 
-        if action == "filter":
-            if value in ("all", "available", "sold", "inactive"):
-                user_states[user_id] = {
-                    "admin_accounts_filter": value,
-                    "admin_accounts_page": 1
-                }
+        # Clear general states for certain actions
+        if data in ("main", "buy", "balance", "deposit", "orders", "admin",
+                    "admin_add_otp", "admin_add_sess", "admin_addbal",
+                    "admin_deposits", "admin_setprice", "admin_support", "withdraw",
+                    "admin_minwithdraw", "admin_transactions", "admin_accounts",
+                    "admin_withdrawals", "my_withdrawals"):
+            user_states.pop(user_id, None)
+
+        # ---------- ADMIN ACCOUNTS FILTER/PAGINATION ----------
+        if data.startswith("admin_accounts_"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            parts = data.split("_", 2)
+            if len(parts) == 3:
+                action = parts[1]
+                value = parts[2]
             else:
-                await event.answer("Invalid filter", alert=True)
-                return
-            await show_accounts_list(event, user_id)
-        elif action == "page":
-            try:
-                page = int(value)
-                if page < 1:
-                    page = 1
-                state = user_states.get(user_id, {})
-                state["admin_accounts_page"] = page
-                user_states[user_id] = state
-            except:
-                await event.answer("Invalid page", alert=True)
-                return
-            await show_accounts_list(event, user_id)
-        return
+                action = parts[1] if len(parts) > 1 else None
+                value = None
 
-    # ---------- ADMIN TRANSACTIONS FILTER/PAGINATION ----------
-    if data.startswith("admin_tx_"):
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
-            return
-        parts = data.split("_", 2)
-        if len(parts) == 3:
-            action = parts[1]
-            value = parts[2]
-        else:
-            action = parts[1] if len(parts) > 1 else None
-            value = None
-
-        if action == "filter":
-            if value in ("all", "purchase", "deposit"):
-                user_states[user_id] = {
-                    "admin_tx_filter": value,
-                    "admin_tx_page": 1
-                }
-            else:
-                await event.answer("Invalid filter", alert=True)
-                return
-            await show_transactions_list(event, user_id)
-        elif action == "page":
-            try:
-                page = int(value)
-                if page < 1:
-                    page = 1
-                state = user_states.get(user_id, {})
-                state["admin_tx_page"] = page
-                user_states[user_id] = state
-            except:
-                await event.answer("Invalid page", alert=True)
-                return
-            await show_transactions_list(event, user_id)
-        return
-
-    # ---------- ADMIN WITHDRAWALS FILTER/PAGINATION ----------
-    if data.startswith("admin_wd_"):
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
-            return
-        parts = data.split("_", 2)
-        if len(parts) == 3:
-            action = parts[1]
-            value = parts[2]
-        else:
-            action = parts[1] if len(parts) > 1 else None
-            value = None
-
-        if action == "filter":
-            if value in ("all", "pending", "approved", "rejected"):
-                user_states[user_id] = {
-                    "admin_wd_filter": value,
-                    "admin_wd_page": 1
-                }
-            else:
-                await event.answer("Invalid filter", alert=True)
-                return
-            await show_admin_withdrawals(event, user_id)
-        elif action == "page":
-            try:
-                page = int(value)
-                if page < 1:
-                    page = 1
-                state = user_states.get(user_id, {})
-                state["admin_wd_page"] = page
-                user_states[user_id] = state
-            except:
-                await event.answer("Invalid page", alert=True)
-                return
-            await show_admin_withdrawals(event, user_id)
-        return
-
-    # ---------- USER WITHDRAWALS PAGINATION ----------
-    if data.startswith("user_wd_page_"):
-        try:
-            page = int(data.split("_")[3])
-            if page < 1:
-                page = 1
-            user_states[user_id] = {"user_wd_page": page}
-        except:
-            await event.answer("Invalid page", alert=True)
-            return
-        await show_user_withdrawals(event, user_id)
-        return
-
-    if data.startswith("logout_"):
-        phone = data[len("logout_"):]
-        await acc_mgr.logout_client(phone)
-        await event.answer("🔒 Session terminated. You will no longer receive OTPs for this number.", alert=True)
-        try:
-            original_text = event.message.text if event.message else ""
-            await event.edit(original_text + "\n\n🔒 *Session terminated.*", buttons=None)
-        except:
-            pass
-        return
-
-    # ---------- REFERRAL INFO (with Withdrawal History button) ----------
-    if data == "referral_info":
-        username = await get_bot_username()
-        ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
-        invited_count = await users_col.count_documents({"referred_by": user_id})
-        paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
-        user_doc = await users_col.find_one({"user_id": user_id})
-        withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
-        total_earned = paid_count * REFERRAL_BONUS
-
-        text = (
-            "👥 **Referral Program**\n\n"
-            "🔗 **Your Referral Link:**\n"
-            f"`{ref_link}`\n\n"
-            f"💰 **Bonus:** ₹{REFERRAL_BONUS} per referral\n"
-            f"(When your referred friend deposits ₹50 or more)\n\n"
-            "📊 **Your Stats:**\n"
-            f"• Total Invited: **{invited_count}** users\n"
-            f"• Bonus Paid: **{paid_count}** users\n"
-            f"• Total Earned: **₹{total_earned}**\n\n"
-            f"💸 **Withdrawable Balance:** ₹{withdrawable}\n\n"
-            "Share your link and start earning!"
-        )
-        buttons = [
-            [Button.inline("💸 Withdraw", b"withdraw")],
-            [Button.inline("📜 Withdrawal History", b"my_withdrawals")],
-            [Button.inline("🔙 Back", b"main")]
-        ]
-        await event.edit(text, buttons=buttons)
-        return
-
-    # ---------- Withdraw flow start ----------
-    if data == "withdraw":
-        user_doc = await users_col.find_one({"user_id": user_id})
-        withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
-        if withdrawable <= 0:
-            await event.answer("❌ You have no withdrawable balance.", alert=True)
-            return
-        min_wd = await get_min_withdrawal()
-        user_states[user_id] = {"action": "withdraw", "step": "amount"}
-        await event.edit(
-            f"💸 **Withdraw**\n\nYour withdrawable balance: ₹{withdrawable}\n"
-            f"Minimum withdrawal: ₹{min_wd}\n"
-            "Enter the amount you wish to withdraw (in ₹):",
-            buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
-        )
-        return
-
-    # ---------- USER WITHDRAWALS HISTORY (back to referral_info) ----------
-    if data == "my_withdrawals":
-        await show_user_withdrawals(event, user_id)
-        return
-
-    # ---------- User purchase flow ----------
-    if data == "buy":
-        countries = await accounts_col.distinct("country", {"status": "available"})
-        if not countries:
-            await event.answer("❌ No accounts available!", alert=True)
-            return
-        btns = [[Button.inline(c, f"country_{c}")] for c in countries]
-        btns.append([Button.inline("🔙 Back", b"main")])
-        await event.edit("🌍 Choose a country:", buttons=btns)
-
-    elif data.startswith("country_"):
-        country = data.split("_", 1)[1]
-        total_count = await accounts_col.count_documents({"country": country, "status": "available"})
-        if total_count == 0:
-            await event.answer("No accounts left.", alert=True)
-            return
-        pipeline = [
-            {"$match": {"country": country, "status": "available"}},
-            {"$group": {"_id": "$price", "count": {"$sum": 1}}},
-            {"$sort": {"_id": 1}}
-        ]
-        agg = await accounts_col.aggregate(pipeline).to_list(length=None)
-        btns = []
-        for item in agg:
-            price = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
-            count = item["count"]
-            btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}")])
-        btns.append([Button.inline("🔙 Back", b"buy")])
-        await event.edit(
-            f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
-            buttons=btns
-        )
-
-    elif data.startswith("price_"):
-        parts = data.split("_", 2)
-        country = parts[1]
-        price = float(parts[2])
-        stock = await accounts_col.count_documents({"country": country, "status": "available", "price": price})
-        user_states[user_id] = {"action": "awaiting_confirmation", "country": country, "price": price}
-        confirm_text = (
-            "👋 Dear customer, after you agree to the terms and click the confirm button, "
-            "the number will be reserved for you.\n\n"
-            "💰 The amount will only be deducted from your account when you successfully receive the login codes.\n\n"
-            "⚠️ Please note that cancellation is not available in this server because OTP Delivery is guaranteed!\n\n"
-            f"🌏 Country: {country} 🇮🇳\n"
-            f"💰 Price: ₹{price}\n"
-            f"📦 Stock: {stock}"
-        )
-        buttons = [
-            [Button.inline("✅ Confirm Purchase", b"confirm_purchase")],
-            [Button.inline("❌ Cancel", b"cancel_purchase")]
-        ]
-        await event.edit(confirm_text, buttons=buttons)
-
-    elif data == "confirm_purchase":
-        state = user_states.get(user_id)
-        if not state or state.get("action") != "awaiting_confirmation":
-            await event.answer("Session expired. Please start again.", alert=True)
-            return
-        country = state["country"]
-        price = state["price"]
-
-        user = await users_col.find_one({"user_id": user_id})
-        balance = user["balance"] if user else 0
-        if balance < price:
-            await event.answer("❌ Insufficient balance!", alert=True)
-            return
-
-        cursor = accounts_col.find({"country": country, "status": "available", "price": price})
-        accounts = await cursor.to_list(length=None)
-        if not accounts:
-            await event.answer("❌ No accounts available in this category!", alert=True)
-            return
-
-        selected_acc = None
-        for acc in accounts:
-            updated = await accounts_col.find_one_and_update(
-                {"_id": acc["_id"], "status": "available"},
-                {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
-            )
-            if updated is None:
-                continue
-
-            phone = acc["phone"]
-            client = acc_mgr.clients.get(phone)
-            valid = False
-            error_msg = None
-
-            if client:
+            if action == "filter":
+                if value in ("all", "available", "sold", "inactive"):
+                    user_states[user_id] = {
+                        "admin_accounts_filter": value,
+                        "admin_accounts_page": 1
+                    }
+                else:
+                    await event.answer("Invalid filter", alert=True)
+                    return
+                await show_accounts_list(event, user_id)
+            elif action == "page":
                 try:
-                    await client.get_me()
-                    valid = True
-                except Exception as e:
-                    error_msg = str(e)[:150]
-                    logging.warning(f"Session invalid for {phone}: {e}")
-                    await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
-                    
-                    for admin in ADMIN_IDS:
-                        try:
-                            await bot.send_message(admin,
-                                f"⚠️ **Inactive Session Detected!**\n"
-                                f"📱 Phone: `{phone}`\n"
-                                f"🌍 Country: {country}\n"
-                                f"💰 Price: ₹{price}\n"
-                                f"❌ Error: `{error_msg}`\n"
-                                f"🔄 Status: Marked as `inactive` in DB.\n"
-                                f"🕒 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-                            )
-                        except:
-                            pass
-                    await log_event(
-                        f"⚠️ **Inactive Session**\n"
-                        f"Phone: `{phone}`\n"
-                        f"Country: {country}\n"
-                        f"Price: ₹{price}\n"
-                        f"Error: `{error_msg}`\n"
-                        f"Status: Marked inactive"
-                    )
-                    continue
-            else:
-                await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
-                for admin in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin,
-                            f"⚠️ **Client Missing in Memory!**\n"
-                            f"📱 Phone: `{phone}`\n"
-                            f"🌍 Country: {country}\n"
-                            f"💰 Price: ₹{price}\n"
-                            f"❌ Error: Client not loaded / session string missing.\n"
-                            f"🔄 Status: Marked as `inactive` in DB.\n"
-                            f"🕒 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-                        )
-                    except:
-                        pass
-                await log_event(
-                    f"⚠️ **Client Missing**\n"
-                    f"Phone: `{phone}`\n"
-                    f"Country: {country}\n"
-                    f"Price: ₹{price}\n"
-                    f"Status: Marked inactive (client not found)"
-                )
-                continue
-
-            selected_acc = updated
-            break
-
-        if selected_acc is None:
-            await event.answer("❌ No active accounts available! Please try later.", alert=True)
+                    page = int(value)
+                    if page < 1:
+                        page = 1
+                    state = user_states.get(user_id, {})
+                    state["admin_accounts_page"] = page
+                    user_states[user_id] = state
+                except:
+                    await event.answer("Invalid page", alert=True)
+                    return
+                await show_accounts_list(event, user_id)
             return
 
-        acc = selected_acc
-        phone = acc["phone"]
-        twofa_password = acc.get("twofa_password")
+        # ---------- ADMIN TRANSACTIONS FILTER/PAGINATION ----------
+        if data.startswith("admin_tx_"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            parts = data.split("_", 2)
+            if len(parts) == 3:
+                action = parts[1]
+                value = parts[2]
+            else:
+                action = parts[1] if len(parts) > 1 else None
+                value = None
 
-        old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
-        new_withdrawable = max(0, old_withdrawable - price)
-        await users_col.update_one(
-            {"user_id": user_id},
-            {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}},
-            upsert=True
-        )
+            if action == "filter":
+                if value in ("all", "purchase", "deposit"):
+                    user_states[user_id] = {
+                        "admin_tx_filter": value,
+                        "admin_tx_page": 1
+                    }
+                else:
+                    await event.answer("Invalid filter", alert=True)
+                    return
+                await show_transactions_list(event, user_id)
+            elif action == "page":
+                try:
+                    page = int(value)
+                    if page < 1:
+                        page = 1
+                    state = user_states.get(user_id, {})
+                    state["admin_tx_page"] = page
+                    user_states[user_id] = state
+                except:
+                    await event.answer("Invalid page", alert=True)
+                    return
+                await show_transactions_list(event, user_id)
+            return
 
-        await orders_col.insert_one({
-            "user_id": user_id,
-            "account_id": str(acc["_id"]),
-            "phone": phone,
-            "country": country,
-            "amount": price,
-            "status": "completed",
-            "created_at": datetime.utcnow()
-        })
+        # ---------- ADMIN WITHDRAWALS FILTER/PAGINATION ----------
+        if data.startswith("admin_wd_"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            parts = data.split("_", 2)
+            if len(parts) == 3:
+                action = parts[1]
+                value = parts[2]
+            else:
+                action = parts[1] if len(parts) > 1 else None
+                value = None
 
-        success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
-        if twofa_password:
-            success_text += f"🔒 **2FA Password:** `{twofa_password}`\n\n"
-        success_text += (
-            "Now login to Telegram with this number. OTP will appear here automatically.\n"
-            "If you need a new OTP later, click below."
-        )
-        await event.edit(
-            success_text,
-            buttons=[
-                [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
-                [Button.inline("🔙 Main Menu", b"main")]
-            ]
-        )
-        user_states.pop(user_id, None)
+            if action == "filter":
+                if value in ("all", "pending", "approved", "rejected"):
+                    user_states[user_id] = {
+                        "admin_wd_filter": value,
+                        "admin_wd_page": 1
+                    }
+                else:
+                    await event.answer("Invalid filter", alert=True)
+                    return
+                await show_admin_withdrawals(event, user_id)
+            elif action == "page":
+                try:
+                    page = int(value)
+                    if page < 1:
+                        page = 1
+                    state = user_states.get(user_id, {})
+                    state["admin_wd_page"] = page
+                    user_states[user_id] = state
+                except:
+                    await event.answer("Invalid page", alert=True)
+                    return
+                await show_admin_withdrawals(event, user_id)
+            return
 
-        try:
-            buyer_entity = await bot.get_entity(user_id)
-            buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
-        except:
-            buyer_name = str(user_id)
-
-        updated_user = await users_col.find_one({"user_id": user_id})
-        new_balance = updated_user["balance"] if updated_user else 0
-
-        for admin in ADMIN_IDS:
+        # ---------- USER WITHDRAWALS PAGINATION ----------
+        if data.startswith("user_wd_page_"):
             try:
-                await bot.send_message(admin,
-                    f"🛒 **New Purchase**\n"
-                    f"Buyer: `{user_id}` - {buyer_name}\n"
-                    f"Phone: `{phone}`\n"
-                    f"Country: {country}\n"
-                    f"Price: ₹{price}\n"
-                    f"Balance After Purchase: ₹{new_balance}\n"
-                    f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-                )
+                page = int(data.split("_")[3])
+                if page < 1:
+                    page = 1
+                user_states[user_id] = {"user_wd_page": page}
+            except:
+                await event.answer("Invalid page", alert=True)
+                return
+            await show_user_withdrawals(event, user_id)
+            return
+
+        if data.startswith("logout_"):
+            phone = data[len("logout_"):]
+            await acc_mgr.logout_client(phone)
+            await event.answer("🔒 Session terminated. You will no longer receive OTPs for this number.", alert=True)
+            try:
+                original_text = event.message.text if event.message else ""
+                await event.edit(original_text + "\n\n🔒 *Session terminated.*", buttons=None)
             except:
                 pass
+            return
 
-        await log_event(
-            f"🛒 **Purchase**\n"
-            f"Buyer: [{buyer_name}](tg://user?id={user_id}) (`{user_id}`)\n"
-            f"Phone: `{phone}`\n"
-            f"Country: {country}\n"
-            f"Price: ₹{price}\n"
-            f"Balance After: ₹{new_balance}\n"
-            f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-        )
+        # ---------- REFERRAL INFO ----------
+        if data == "referral_info":
+            username = await get_bot_username()
+            ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
+            invited_count = await users_col.count_documents({"referred_by": user_id})
+            paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
+            user_doc = await users_col.find_one({"user_id": user_id})
+            withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
+            total_earned = paid_count * REFERRAL_BONUS
 
-    elif data == "cancel_purchase":
-        state = user_states.pop(user_id, None)
-        if state and state.get("action") == "awaiting_confirmation":
-            country = state["country"]
+            text = (
+                "👥 **Referral Program**\n\n"
+                "🔗 **Your Referral Link:**\n"
+                f"`{ref_link}`\n\n"
+                f"💰 **Bonus:** ₹{REFERRAL_BONUS} per referral\n"
+                f"(When your referred friend deposits ₹50 or more)\n\n"
+                "📊 **Your Stats:**\n"
+                f"• Total Invited: **{invited_count}** users\n"
+                f"• Bonus Paid: **{paid_count}** users\n"
+                f"• Total Earned: **₹{total_earned}**\n\n"
+                f"💸 **Withdrawable Balance:** ₹{withdrawable}\n\n"
+                "Share your link and start earning!"
+            )
+            buttons = [
+                [Button.inline("💸 Withdraw", b"withdraw")],
+                [Button.inline("📜 Withdrawal History", b"my_withdrawals")],
+                [Button.inline("🔙 Back", b"main")]
+            ]
+            await event.edit(text, buttons=buttons)
+            return
+
+        # ---------- Withdraw flow start ----------
+        if data == "withdraw":
+            user_doc = await users_col.find_one({"user_id": user_id})
+            withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
+            if withdrawable <= 0:
+                await event.answer("❌ You have no withdrawable balance.", alert=True)
+                return
+            min_wd = await get_min_withdrawal()
+            user_states[user_id] = {"action": "withdraw", "step": "amount"}
+            await event.edit(
+                f"💸 **Withdraw**\n\nYour withdrawable balance: ₹{withdrawable}\n"
+                f"Minimum withdrawal: ₹{min_wd}\n"
+                "Enter the amount you wish to withdraw (in ₹):",
+                buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+            )
+            return
+
+        # ---------- USER WITHDRAWALS HISTORY ----------
+        if data == "my_withdrawals":
+            await show_user_withdrawals(event, user_id)
+            return
+
+        # ---------- User purchase flow ----------
+        if data == "buy":
+            countries = await accounts_col.distinct("country", {"status": "available"})
+            if not countries:
+                await event.answer("❌ No accounts available!", alert=True)
+                return
+            btns = [[Button.inline(c, f"country_{c}")] for c in countries]
+            btns.append([Button.inline("🔙 Back", b"main")])
+            await event.edit("🌍 Choose a country:", buttons=btns)
+            return
+
+        elif data.startswith("country_"):
+            country = data.split("_", 1)[1]
             total_count = await accounts_col.count_documents({"country": country, "status": "available"})
             if total_count == 0:
-                await event.edit("❌ No accounts left in this country.", buttons=[[Button.inline("🔙 Back", b"buy")]])
+                await event.answer("No accounts left.", alert=True)
                 return
             pipeline = [
                 {"$match": {"country": country, "status": "available"}},
@@ -890,344 +679,586 @@ async def callback_handler(event):
             agg = await accounts_col.aggregate(pipeline).to_list(length=None)
             btns = []
             for item in agg:
-                price_val = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
+                price = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
                 count = item["count"]
-                btns.append([Button.inline(f"₹{price_val} ({count} available)", f"price_{country}_{price_val}")])
+                btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}")])
             btns.append([Button.inline("🔙 Back", b"buy")])
             await event.edit(
                 f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
                 buttons=btns
             )
-        else:
-            await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
-
-    elif data.startswith("resend_"):
-        phone = data.split("_", 1)[1]
-        if phone not in acc_mgr.clients:
-            await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
             return
-        pending_otp_requests[(user_id, phone)] = True
-        await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
-        async def clear_pending():
-            await asyncio.sleep(90)
-            key = (user_id, phone)
-            if key in pending_otp_requests:
-                del pending_otp_requests[key]
+
+        elif data.startswith("price_"):
+            parts = data.split("_", 2)
+            country = parts[1]
+            price = float(parts[2])
+            stock = await accounts_col.count_documents({"country": country, "status": "available", "price": price})
+            user_states[user_id] = {"action": "awaiting_confirmation", "country": country, "price": price}
+            confirm_text = (
+                "👋 Dear customer, after you agree to the terms and click the confirm button, "
+                "the number will be reserved for you.\n\n"
+                "💰 The amount will only be deducted from your account when you successfully receive the login codes.\n\n"
+                "⚠️ Please note that cancellation is not available in this server because OTP Delivery is guaranteed!\n\n"
+                f"🌏 Country: {country} 🇮🇳\n"
+                f"💰 Price: ₹{price}\n"
+                f"📦 Stock: {stock}"
+            )
+            buttons = [
+                [Button.inline("✅ Confirm Purchase", b"confirm_purchase")],
+                [Button.inline("❌ Cancel", b"cancel_purchase")]
+            ]
+            await event.edit(confirm_text, buttons=buttons)
+            return
+
+        elif data == "confirm_purchase":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "awaiting_confirmation":
+                await event.answer("Session expired. Please start again.", alert=True)
+                return
+            country = state["country"]
+            price = state["price"]
+
+            user = await users_col.find_one({"user_id": user_id})
+            balance = user["balance"] if user else 0
+            if balance < price:
+                await event.answer("❌ Insufficient balance!", alert=True)
+                return
+
+            cursor = accounts_col.find({"country": country, "status": "available", "price": price})
+            accounts = await cursor.to_list(length=None)
+            if not accounts:
+                await event.answer("❌ No accounts available in this category!", alert=True)
+                return
+
+            selected_acc = None
+            for acc in accounts:
+                updated = await accounts_col.find_one_and_update(
+                    {"_id": acc["_id"], "status": "available"},
+                    {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
+                )
+                if updated is None:
+                    continue
+
+                phone = acc["phone"]
+                client = acc_mgr.clients.get(phone)
+                valid = False
+                error_msg = None
+
+                if client:
+                    try:
+                        await client.get_me()
+                        valid = True
+                    except Exception as e:
+                        error_msg = str(e)[:150]
+                        logging.warning(f"Session invalid for {phone}: {e}")
+                        await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
+                        
+                        for admin in ADMIN_IDS:
+                            try:
+                                await bot.send_message(admin,
+                                    f"⚠️ **Inactive Session Detected!**\n"
+                                    f"📱 Phone: `{phone}`\n"
+                                    f"🌍 Country: {country}\n"
+                                    f"💰 Price: ₹{price}\n"
+                                    f"❌ Error: `{error_msg}`\n"
+                                    f"🔄 Status: Marked as `inactive` in DB.\n"
+                                    f"🕒 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                                )
+                            except:
+                                pass
+                        await log_event(
+                            f"⚠️ **Inactive Session**\n"
+                            f"Phone: `{phone}`\n"
+                            f"Country: {country}\n"
+                            f"Price: ₹{price}\n"
+                            f"Error: `{error_msg}`\n"
+                            f"Status: Marked inactive"
+                        )
+                        continue
+                else:
+                    await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
+                    for admin in ADMIN_IDS:
+                        try:
+                            await bot.send_message(admin,
+                                f"⚠️ **Client Missing in Memory!**\n"
+                                f"📱 Phone: `{phone}`\n"
+                                f"🌍 Country: {country}\n"
+                                f"💰 Price: ₹{price}\n"
+                                f"❌ Error: Client not loaded / session string missing.\n"
+                                f"🔄 Status: Marked as `inactive` in DB.\n"
+                                f"🕒 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                            )
+                        except:
+                            pass
+                    await log_event(
+                        f"⚠️ **Client Missing**\n"
+                        f"Phone: `{phone}`\n"
+                        f"Country: {country}\n"
+                        f"Price: ₹{price}\n"
+                        f"Status: Marked inactive (client not found)"
+                    )
+                    continue
+
+                selected_acc = updated
+                break
+
+            if selected_acc is None:
+                await event.answer("❌ No active accounts available! Please try later.", alert=True)
+                return
+
+            acc = selected_acc
+            phone = acc["phone"]
+            twofa_password = acc.get("twofa_password")
+
+            old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
+            new_withdrawable = max(0, old_withdrawable - price)
+            await users_col.update_one(
+                {"user_id": user_id},
+                {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}},
+                upsert=True
+            )
+
+            await orders_col.insert_one({
+                "user_id": user_id,
+                "account_id": str(acc["_id"]),
+                "phone": phone,
+                "country": country,
+                "amount": price,
+                "status": "completed",
+                "created_at": datetime.utcnow()
+            })
+
+            success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
+            if twofa_password:
+                success_text += f"🔒 **2FA Password:** `{twofa_password}`\n\n"
+            success_text += (
+                "Now login to Telegram with this number. OTP will appear here automatically.\n"
+                "If you need a new OTP later, click below."
+            )
+            await event.edit(
+                success_text,
+                buttons=[
+                    [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
+                    [Button.inline("🔙 Main Menu", b"main")]
+                ]
+            )
+            user_states.pop(user_id, None)
+
+            try:
+                buyer_entity = await bot.get_entity(user_id)
+                buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
+            except:
+                buyer_name = str(user_id)
+
+            updated_user = await users_col.find_one({"user_id": user_id})
+            new_balance = updated_user["balance"] if updated_user else 0
+
+            for admin in ADMIN_IDS:
                 try:
-                    await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
+                    await bot.send_message(admin,
+                        f"🛒 **New Purchase**\n"
+                        f"Buyer: `{user_id}` - {buyer_name}\n"
+                        f"Phone: `{phone}`\n"
+                        f"Country: {country}\n"
+                        f"Price: ₹{price}\n"
+                        f"Balance After Purchase: ₹{new_balance}\n"
+                        f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                    )
                 except:
                     pass
-        asyncio.create_task(clear_pending())
 
-    elif data == "balance":
-        user = await users_col.find_one({"user_id": user_id})
-        bal = user["balance"] if user else 0
-        await event.edit(f"💰 Your balance: ₹{bal}", buttons=[[Button.inline("🔙 Back", b"main")]])
-
-    elif data == "deposit":
-        user_states[user_id] = {"action": "deposit", "step": "amount"}
-        await event.edit(
-            f"💵 Enter the amount you want to deposit (₹) – Minimum deposit is ₹{MIN_DEPOSIT}:",
-            buttons=[[Button.inline("🔙 Cancel", b"main")]]
-        )
-
-    elif data == "orders":
-        orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
-        orders = await orders_cursor.to_list(length=20)
-        deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1)
-        deposits = await deposits_cursor.to_list(length=20)
-
-        combined = []
-        for o in orders:
-            combined.append({
-                "type": "Purchase",
-                "phone": o.get("phone", "N/A"),
-                "country": o.get("country", "N/A"),
-                "amount": o.get("amount", 0),
-                "date": o["created_at"],
-                "status": "Completed"
-            })
-        for d in deposits:
-            combined.append({
-                "type": "Deposit",
-                "phone": "N/A",
-                "country": "N/A",
-                "amount": d.get("amount", 0),
-                "date": d["created_at"],
-                "status": "Approved"
-            })
-
-        combined.sort(key=lambda x: x["date"], reverse=True)
-        combined = combined[:20]
-
-        if not combined:
-            txt = "📜 No transactions yet."
-        else:
-            lines = []
-            for item in combined:
-                date_str = item["date"].strftime('%d/%m/%Y')
-                if item["type"] == "Purchase":
-                    lines.append(f"🛒 {item['phone']} ({item['country']}) - ₹{item['amount']} - {date_str}")
-                else:
-                    lines.append(f"💰 Deposit +₹{item['amount']} - {date_str}")
-            txt = "📜 **Transaction History:**\n" + "\n".join(lines)
-
-        await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
-
-    elif data == "main":
-        await send_main_menu(event)
-
-    # ---------- ADMIN PANEL ----------
-    elif data == "admin":
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
-            return
-        btns = [
-            [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
-            [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
-            [Button.inline("📋 Accounts (Filter)", b"admin_accounts_filter_all")],
-            [Button.inline("💰 Add Balance", b"admin_addbal")],
-            [Button.inline("💲 Set Price", b"admin_setprice")],
-            [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
-            [Button.inline("📜 Transaction History", b"admin_tx_filter_all")],
-            [Button.inline("💸 Withdrawal History", b"admin_wd_filter_all")],
-            [Button.inline("📞 Set Support Link", b"admin_support")],
-            [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw")],
-            [Button.inline("🔙 Back", b"main")],
-        ]
-        await event.edit("⚙️ **Admin Panel**", buttons=btns)
-
-    elif data == "admin_add_otp":
-        await start_add_phone_flow(event)
-    elif data == "admin_add_sess":
-        await start_add_session_flow(event)
-
-    elif data == "admin_addbal":
-        user_states[user_id] = {"action": "add_balance", "step": "await_user_id"}
-        await event.edit("👤 Send the user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-
-    elif data == "admin_deposits":
-        cursor = deposits_col.find({"status": "pending"}).sort("created_at", 1)
-        pending = await cursor.to_list(length=10)
-        if not pending:
-            await event.answer("No pending deposits.", alert=True)
-            return
-        btns = []
-        for dep in pending:
-            txn_id = dep.get('txn_id', 'N/A')
-            btns.append([
-                Button.inline(f"✅ Approve ₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}"),
-                Button.inline(f"❌ Reject", f"reject_{dep['_id']}")
-            ])
-        btns.append([Button.inline("🔙 Back", b"admin")])
-        await event.edit("🕒 **Pending Deposits**", buttons=btns)
-
-    elif data.startswith("approve_"):
-        dep_id = data.split("_", 1)[1]
-        deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
-        if not deposit or deposit["status"] != "pending":
-            await event.answer("Already processed.", alert=True)
+            await log_event(
+                f"🛒 **Purchase**\n"
+                f"Buyer: [{buyer_name}](tg://user?id={user_id}) (`{user_id}`)\n"
+                f"Phone: `{phone}`\n"
+                f"Country: {country}\n"
+                f"Price: ₹{price}\n"
+                f"Balance After: ₹{new_balance}\n"
+                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+            )
             return
 
-        user_id_dep = deposit["user_id"]
-        amount = deposit["amount"]
+        elif data == "cancel_purchase":
+            state = user_states.pop(user_id, None)
+            if state and state.get("action") == "awaiting_confirmation":
+                country = state["country"]
+                total_count = await accounts_col.count_documents({"country": country, "status": "available"})
+                if total_count == 0:
+                    await event.edit("❌ No accounts left in this country.", buttons=[[Button.inline("🔙 Back", b"buy")]])
+                    return
+                pipeline = [
+                    {"$match": {"country": country, "status": "available"}},
+                    {"$group": {"_id": "$price", "count": {"$sum": 1}}},
+                    {"$sort": {"_id": 1}}
+                ]
+                agg = await accounts_col.aggregate(pipeline).to_list(length=None)
+                btns = []
+                for item in agg:
+                    price_val = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
+                    count = item["count"]
+                    btns.append([Button.inline(f"₹{price_val} ({count} available)", f"price_{country}_{price_val}")])
+                btns.append([Button.inline("🔙 Back", b"buy")])
+                await event.edit(
+                    f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
+                    buttons=btns
+                )
+            else:
+                await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
+            return
 
-        await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "approved"}})
-        await users_col.update_one(
-            {"user_id": user_id_dep},
-            {"$inc": {"balance": amount}},
-            upsert=True
-        )
-
-        bonus_paid = False
-        user_doc = await users_col.find_one({"user_id": user_id_dep})
-        if user_doc and user_doc.get("referred_by"):
-            if not user_doc.get("referral_bonus_paid"):
-                total_dep = await deposits_col.aggregate([
-                    {"$match": {"user_id": user_id_dep, "status": "approved"}},
-                    {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-                ]).to_list(length=1)
-                total = total_dep[0]["total"] if total_dep else 0
-                if total >= 50:
-                    referrer_id = user_doc["referred_by"]
-                    await users_col.update_one(
-                        {"user_id": referrer_id},
-                        {"$inc": {"balance": REFERRAL_BONUS, "withdrawable_balance": REFERRAL_BONUS}}
-                    )
-                    await users_col.update_one(
-                        {"user_id": user_id_dep},
-                        {"$set": {"referral_bonus_paid": True}}
-                    )
-                    bonus_paid = True
+        elif data.startswith("resend_"):
+            phone = data.split("_", 1)[1]
+            if phone not in acc_mgr.clients:
+                await event.answer("❌ Session expired. Cannot receive OTP. Contact admin.", alert=True)
+                return
+            pending_otp_requests[(user_id, phone)] = True
+            await event.answer("✅ Waiting for new OTP. Now try to log in again.", alert=True)
+            async def clear_pending():
+                await asyncio.sleep(90)
+                key = (user_id, phone)
+                if key in pending_otp_requests:
+                    del pending_otp_requests[key]
                     try:
-                        await bot.send_message(referrer_id,
-                            f"🎉 Your referral {user_id_dep} has deposited ₹{total}.\n"
-                            f"You earned ₹{REFERRAL_BONUS} referral bonus!")
+                        await bot.send_message(user_id, "⏰ No OTP received within 90 seconds. Please try again.")
                     except:
                         pass
-                    await log_event(
-                        f"🎁 **Referral Bonus**\n"
-                        f"Referrer: [{referrer_id}](tg://user?id={referrer_id})\n"
-                        f"Referred User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
-                        f"Total Deposits: ₹{total}\n"
-                        f"Bonus: ₹{REFERRAL_BONUS}"
-                    )
-
-        try:
-            await bot.send_message(user_id_dep,
-                                   f"✅ Deposit of ₹{amount} approved! Balance updated.")
-        except:
-            pass
-
-        await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-        await log_event(
-            f"✅ **Deposit Approved**\n"
-            f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
-            f"Amount: ₹{amount}\n"
-            f"Txn ID: {deposit.get('txn_id', 'N/A')}\n"
-            f"Referral Bonus: {'Yes' if bonus_paid else 'No'}\n"
-            f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-        )
-
-    elif data.startswith("reject_"):
-        dep_id = data.split("_", 1)[1]
-        deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
-        if not deposit or deposit["status"] != "pending":
-            await event.answer("Already processed.", alert=True)
+            asyncio.create_task(clear_pending())
             return
-        await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "rejected"}})
-        try:
-            await bot.send_message(deposit["user_id"],
-                                   f"❌ Deposit of ₹{deposit['amount']} rejected. Contact admin.")
-        except:
-            pass
-        await event.edit("❌ Deposit rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
 
-    elif data == "admin_setprice":
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
+        elif data == "balance":
+            user = await users_col.find_one({"user_id": user_id})
+            bal = user["balance"] if user else 0
+            await event.edit(f"💰 Your balance: ₹{bal}", buttons=[[Button.inline("🔙 Back", b"main")]])
             return
-        user_states[user_id] = {"action": "set_price", "step": "await_price"}
-        await event.edit(
-            "💲 **Set Default Price**\n\n"
-            "Send the new default price for accounts (e.g., `50`).\n"
-            "This price will apply when adding new accounts if not specified.",
-            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-        )
 
-    elif data == "admin_support":
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
+        elif data == "deposit":
+            user_states[user_id] = {"action": "deposit", "step": "amount"}
+            await event.edit(
+                f"💵 Enter the amount you want to deposit (₹) – Minimum deposit is ₹{MIN_DEPOSIT}:",
+                buttons=[[Button.inline("🔙 Cancel", b"main")]]
+            )
             return
-        current = await get_support_link()
-        current_display = f"`{current}`" if current else "*Not set*"
-        user_states[user_id] = {"action": "set_support_link", "step": "await_link"}
-        await event.edit(
-            f"📞 **Set Support Link**\n\n"
-            f"Current: {current_display}\n\n"
-            f"Send the new support link (e.g., `https://t.me/your_support_username` or `t.me/...`).\n"
-            f"Send `remove` to delete the support link.",
-            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-        )
 
-    elif data == "admin_minwithdraw":
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
+        elif data == "orders":
+            orders_cursor = orders_col.find({"user_id": user_id}).sort("created_at", -1)
+            orders = await orders_cursor.to_list(length=20)
+            deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1)
+            deposits = await deposits_cursor.to_list(length=20)
+
+            combined = []
+            for o in orders:
+                combined.append({
+                    "type": "Purchase",
+                    "phone": o.get("phone", "N/A"),
+                    "country": o.get("country", "N/A"),
+                    "amount": o.get("amount", 0),
+                    "date": o["created_at"],
+                    "status": "Completed"
+                })
+            for d in deposits:
+                combined.append({
+                    "type": "Deposit",
+                    "phone": "N/A",
+                    "country": "N/A",
+                    "amount": d.get("amount", 0),
+                    "date": d["created_at"],
+                    "status": "Approved"
+                })
+
+            combined.sort(key=lambda x: x["date"], reverse=True)
+            combined = combined[:20]
+
+            if not combined:
+                txt = "📜 No transactions yet."
+            else:
+                lines = []
+                for item in combined:
+                    date_str = item["date"].strftime('%d/%m/%Y')
+                    if item["type"] == "Purchase":
+                        lines.append(f"🛒 {item['phone']} ({item['country']}) - ₹{item['amount']} - {date_str}")
+                    else:
+                        lines.append(f"💰 Deposit +₹{item['amount']} - {date_str}")
+                txt = "📜 **Transaction History:**\n" + "\n".join(lines)
+
+            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
             return
-        current = await get_min_withdrawal()
-        user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
-        await event.edit(
-            f"💸 **Set Minimum Withdrawal Amount**\n\n"
-            f"Current minimum: ₹{current}\n\n"
-            "Send the new minimum withdrawal amount (e.g., `20`):",
-            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-        )
 
-    elif data.startswith("addcountry_"):
-        if data == "addcountry_new":
-            state = user_states.get(user_id)
-            if not state or state.get("action") not in ("add_phone_otp", "add_session"):
-                await event.answer("❌ Session expired. Please start again from Admin Panel.", alert=True)
+        elif data == "main":
+            await send_main_menu(event)
+            return
+
+        # ---------- ADMIN PANEL ----------
+        elif data == "admin":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
                 return
-            state["step"] = "country_manual"
-            await event.edit("🌍 Send the new country code (e.g., IN):",
-                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-        else:
-            country = data[len("addcountry_"):]
-            state = user_states.get(user_id)
-            if not state or state.get("action") not in ("add_phone_otp", "add_session"):
-                await event.answer("❌ Session expired. Please start again.", alert=True)
-                return
-            state["country"] = country
-            state["step"] = "price"
-            await event.edit("💵 Send price for this number (e.g., 50):",
-                             buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-
-    elif data.startswith("wapprove_") or data.startswith("wreject_"):
-        if user_id not in ADMIN_IDS:
-            await event.answer("❌ Unauthorized", alert=True)
-            return
-        parts = data.split("_", 1)
-        action = parts[0]
-        w_id = parts[1]
-        withdrawal = await withdrawals_col.find_one({"_id": ObjectId(w_id)})
-        if not withdrawal or withdrawal["status"] != "pending":
-            await event.answer("Already processed.", alert=True)
+            btns = [
+                [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
+                [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
+                [Button.inline("📋 Accounts (Filter)", b"admin_accounts_filter_all")],
+                [Button.inline("💰 Add Balance", b"admin_addbal")],
+                [Button.inline("💲 Set Price", b"admin_setprice")],
+                [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
+                [Button.inline("📜 Transaction History", b"admin_tx_filter_all")],
+                [Button.inline("💸 Withdrawal History", b"admin_wd_filter_all")],
+                [Button.inline("📞 Set Support Link", b"admin_support")],
+                [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw")],
+                [Button.inline("🔙 Back", b"main")],
+            ]
+            await event.edit("⚙️ **Admin Panel**", buttons=btns)
             return
 
-        if action == "wapprove":
-            user_doc = await users_col.find_one({"user_id": withdrawal["user_id"]})
-            if not user_doc:
-                await event.answer("User not found.", alert=True)
+        elif data == "admin_add_otp":
+            await start_add_phone_flow(event)
+            return
+        elif data == "admin_add_sess":
+            await start_add_session_flow(event)
+            return
+
+        elif data == "admin_addbal":
+            user_states[user_id] = {"action": "add_balance", "step": "await_user_id"}
+            await event.edit("👤 Send the user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
+
+        elif data == "admin_deposits":
+            cursor = deposits_col.find({"status": "pending"}).sort("created_at", 1)
+            pending = await cursor.to_list(length=10)
+            if not pending:
+                await event.answer("No pending deposits.", alert=True)
                 return
-            if user_doc.get("withdrawable_balance", 0) < withdrawal["amount"]:
-                await event.answer("User doesn't have sufficient withdrawable balance now.", alert=True)
+            btns = []
+            for dep in pending:
+                txn_id = dep.get('txn_id', 'N/A')
+                btns.append([
+                    Button.inline(f"✅ Approve ₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}"),
+                    Button.inline(f"❌ Reject", f"reject_{dep['_id']}")
+                ])
+            btns.append([Button.inline("🔙 Back", b"admin")])
+            await event.edit("🕒 **Pending Deposits**", buttons=btns)
+            return
+
+        elif data.startswith("approve_"):
+            dep_id = data.split("_", 1)[1]
+            deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
+            if not deposit or deposit["status"] != "pending":
+                await event.answer("Already processed.", alert=True)
                 return
+
+            user_id_dep = deposit["user_id"]
+            amount = deposit["amount"]
+
+            await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "approved"}})
             await users_col.update_one(
-                {"user_id": withdrawal["user_id"]},
-                {"$inc": {"balance": -withdrawal["amount"], "withdrawable_balance": -withdrawal["amount"]}}
-            )
-            await withdrawals_col.update_one(
-                {"_id": ObjectId(w_id)},
-                {"$set": {"status": "approved", "processed_at": datetime.utcnow()}}
-            )
-            try:
-                await bot.send_message(
-                    withdrawal["user_id"],
-                    f"✅ Your withdrawal of ₹{withdrawal['amount']} has been approved and processed."
-                )
-            except:
-                pass
-            await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-            await log_event(
-                f"✅ **Withdrawal Approved**\n"
-                f"User: [{withdrawal['user_id']}](tg://user?id={withdrawal['user_id']})\n"
-                f"Amount: ₹{withdrawal['amount']}\n"
-                f"UPI: {withdrawal.get('upi_id', 'N/A')}\n"
-                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-            )
-        else:  # wreject
-            await withdrawals_col.update_one(
-                {"_id": ObjectId(w_id)},
-                {"$set": {"status": "rejected", "processed_at": datetime.utcnow()}}
-            )
-            try:
-                await bot.send_message(
-                    withdrawal["user_id"],
-                    f"❌ Your withdrawal of ₹{withdrawal['amount']} has been rejected. Contact admin."
-                )
-            except:
-                pass
-            await event.edit("❌ Withdrawal rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-            await log_event(
-                f"❌ **Withdrawal Rejected**\n"
-                f"User: [{withdrawal['user_id']}](tg://user?id={withdrawal['user_id']})\n"
-                f"Amount: ₹{withdrawal['amount']}\n"
-                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                {"user_id": user_id_dep},
+                {"$inc": {"balance": amount}},
+                upsert=True
             )
 
-    else:
-        await event.answer("Unknown action", alert=True)
+            bonus_paid = False
+            user_doc = await users_col.find_one({"user_id": user_id_dep})
+            if user_doc and user_doc.get("referred_by"):
+                if not user_doc.get("referral_bonus_paid"):
+                    total_dep = await deposits_col.aggregate([
+                        {"$match": {"user_id": user_id_dep, "status": "approved"}},
+                        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+                    ]).to_list(length=1)
+                    total = total_dep[0]["total"] if total_dep else 0
+                    if total >= 50:
+                        referrer_id = user_doc["referred_by"]
+                        await users_col.update_one(
+                            {"user_id": referrer_id},
+                            {"$inc": {"balance": REFERRAL_BONUS, "withdrawable_balance": REFERRAL_BONUS}}
+                        )
+                        await users_col.update_one(
+                            {"user_id": user_id_dep},
+                            {"$set": {"referral_bonus_paid": True}}
+                        )
+                        bonus_paid = True
+                        try:
+                            await bot.send_message(referrer_id,
+                                f"🎉 Your referral {user_id_dep} has deposited ₹{total}.\n"
+                                f"You earned ₹{REFERRAL_BONUS} referral bonus!")
+                        except:
+                            pass
+                        await log_event(
+                            f"🎁 **Referral Bonus**\n"
+                            f"Referrer: [{referrer_id}](tg://user?id={referrer_id})\n"
+                            f"Referred User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
+                            f"Total Deposits: ₹{total}\n"
+                            f"Bonus: ₹{REFERRAL_BONUS}"
+                        )
+
+            try:
+                await bot.send_message(user_id_dep,
+                                       f"✅ Deposit of ₹{amount} approved! Balance updated.")
+            except:
+                pass
+
+            await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await log_event(
+                f"✅ **Deposit Approved**\n"
+                f"User: [{user_id_dep}](tg://user?id={user_id_dep})\n"
+                f"Amount: ₹{amount}\n"
+                f"Txn ID: {deposit.get('txn_id', 'N/A')}\n"
+                f"Referral Bonus: {'Yes' if bonus_paid else 'No'}\n"
+                f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+            )
+            return
+
+        elif data.startswith("reject_"):
+            dep_id = data.split("_", 1)[1]
+            deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
+            if not deposit or deposit["status"] != "pending":
+                await event.answer("Already processed.", alert=True)
+                return
+            await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "rejected"}})
+            try:
+                await bot.send_message(deposit["user_id"],
+                                       f"❌ Deposit of ₹{deposit['amount']} rejected. Contact admin.")
+            except:
+                pass
+            await event.edit("❌ Deposit rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            return
+
+        elif data == "admin_setprice":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "set_price", "step": "await_price"}
+            await event.edit(
+                "💲 **Set Default Price**\n\n"
+                "Send the new default price for accounts (e.g., `50`).\n"
+                "This price will apply when adding new accounts if not specified.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
+            return
+
+        elif data == "admin_support":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            current = await get_support_link()
+            current_display = f"`{current}`" if current else "*Not set*"
+            user_states[user_id] = {"action": "set_support_link", "step": "await_link"}
+            await event.edit(
+                f"📞 **Set Support Link**\n\n"
+                f"Current: {current_display}\n\n"
+                f"Send the new support link (e.g., `https://t.me/your_support_username` or `t.me/...`).\n"
+                f"Send `remove` to delete the support link.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
+            return
+
+        elif data == "admin_minwithdraw":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            current = await get_min_withdrawal()
+            user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
+            await event.edit(
+                f"💸 **Set Minimum Withdrawal Amount**\n\n"
+                f"Current minimum: ₹{current}\n\n"
+                "Send the new minimum withdrawal amount (e.g., `20`):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
+            return
+
+        elif data.startswith("addcountry_"):
+            if data == "addcountry_new":
+                state = user_states.get(user_id)
+                if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+                    await event.answer("❌ Session expired. Please start again from Admin Panel.", alert=True)
+                    return
+                state["step"] = "country_manual"
+                await event.edit("🌍 Send the new country code (e.g., IN):",
+                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            else:
+                country = data[len("addcountry_"):]
+                state = user_states.get(user_id)
+                if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+                    await event.answer("❌ Session expired. Please start again.", alert=True)
+                    return
+                state["country"] = country
+                state["step"] = "price"
+                await event.edit("💵 Send price for this number (e.g., 50):",
+                                 buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
+
+        elif data.startswith("wapprove_") or data.startswith("wreject_"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            parts = data.split("_", 1)
+            action = parts[0]
+            w_id = parts[1]
+            withdrawal = await withdrawals_col.find_one({"_id": ObjectId(w_id)})
+            if not withdrawal or withdrawal["status"] != "pending":
+                await event.answer("Already processed.", alert=True)
+                return
+
+            if action == "wapprove":
+                user_doc = await users_col.find_one({"user_id": withdrawal["user_id"]})
+                if not user_doc:
+                    await event.answer("User not found.", alert=True)
+                    return
+                if user_doc.get("withdrawable_balance", 0) < withdrawal["amount"]:
+                    await event.answer("User doesn't have sufficient withdrawable balance now.", alert=True)
+                    return
+                await users_col.update_one(
+                    {"user_id": withdrawal["user_id"]},
+                    {"$inc": {"balance": -withdrawal["amount"], "withdrawable_balance": -withdrawal["amount"]}}
+                )
+                await withdrawals_col.update_one(
+                    {"_id": ObjectId(w_id)},
+                    {"$set": {"status": "approved", "processed_at": datetime.utcnow()}}
+                )
+                try:
+                    await bot.send_message(
+                        withdrawal["user_id"],
+                        f"✅ Your withdrawal of ₹{withdrawal['amount']} has been approved and processed."
+                    )
+                except:
+                    pass
+                await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await log_event(
+                    f"✅ **Withdrawal Approved**\n"
+                    f"User: [{withdrawal['user_id']}](tg://user?id={withdrawal['user_id']})\n"
+                    f"Amount: ₹{withdrawal['amount']}\n"
+                    f"UPI: {withdrawal.get('upi_id', 'N/A')}\n"
+                    f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                )
+            else:  # wreject
+                await withdrawals_col.update_one(
+                    {"_id": ObjectId(w_id)},
+                    {"$set": {"status": "rejected", "processed_at": datetime.utcnow()}}
+                )
+                try:
+                    await bot.send_message(
+                        withdrawal["user_id"],
+                        f"❌ Your withdrawal of ₹{withdrawal['amount']} has been rejected. Contact admin."
+                    )
+                except:
+                    pass
+                await event.edit("❌ Withdrawal rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await log_event(
+                    f"❌ **Withdrawal Rejected**\n"
+                    f"User: [{withdrawal['user_id']}](tg://user?id={withdrawal['user_id']})\n"
+                    f"Amount: ₹{withdrawal['amount']}\n"
+                    f"Date: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                )
+            return
+
+        else:
+            # Unknown action
+            await event.answer("❓ Unknown action. Please use the menu buttons.", alert=True)
+
+    except Exception as e:
+        logging.error(f"Error in callback_handler: {e}", exc_info=True)
+        try:
+            await event.answer("❌ Something went wrong. Please try again later.", alert=True)
+        except:
+            pass
 
 # ---------- ADMIN ACCOUNTS LIST ----------
 async def show_accounts_list(event, user_id):
@@ -1437,7 +1468,7 @@ async def show_admin_withdrawals(event, user_id):
     else:
         await event.respond(txt, buttons=btns)
 
-# ---------- USER WITHDRAWALS HISTORY (with back to referral) ----------
+# ---------- USER WITHDRAWALS HISTORY ----------
 async def show_user_withdrawals(event, user_id):
     state = user_states.get(user_id, {})
     page = state.get("user_wd_page", 1)
@@ -1476,7 +1507,6 @@ async def show_user_withdrawals(event, user_id):
     if page_row:
         btns.append(page_row)
 
-    # Back button goes to Referral Info instead of main menu
     btns.append([Button.inline("🔙 Back to Referral", b"referral_info")])
 
     if isinstance(event, events.CallbackQuery.Event):
