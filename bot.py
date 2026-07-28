@@ -2,7 +2,7 @@ import os
 import io
 import asyncio
 import logging
-import random  # <-- NEW for TxnID
+import random
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
@@ -43,7 +43,6 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
-# Force join
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -204,7 +203,7 @@ async def send_join_message(event):
     else:
         await event.respond(msg, buttons=buttons)
 
-# ---------- WELCOME MENU ----------
+# ---------- WELCOME / MAIN MENU (with 2‑column layout) ----------
 async def show_welcome_menu(event, user_id):
     username = await get_bot_username()
     ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -215,40 +214,43 @@ async def show_welcome_menu(event, user_id):
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
         "Use the buttons below to get started."
     )
+    # Build buttons with 2 columns
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy")],
-        [Button.inline("💰 My Balance", b"balance")],
-        [Button.inline("💳 Deposit", b"deposit")],
-        [Button.inline("📜 Order History", b"orders")],
-        [Button.inline("👥 Referral Program", b"referral_info")],
+        [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
+        [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
     ]
+    # Third row: Referral Program + Admin (if admin)
+    row3 = [Button.inline("👥 Referral Program", b"referral_info")]
+    if user_id in ADMIN_IDS:
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
+    buttons.append(row3)
+
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
-    if user_id in ADMIN_IDS:
-        buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
+
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(welcome_msg, buttons=buttons)
     else:
         await event.respond(welcome_msg, buttons=buttons)
 
-# ---------- MAIN MENU ----------
+# ---------- MAIN MENU (same layout) ----------
 async def send_main_menu(event):
     user_id = event.sender_id
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy")],
-        [Button.inline("💰 My Balance", b"balance")],
-        [Button.inline("💳 Deposit", b"deposit")],
-        [Button.inline("📜 Order History", b"orders")],
+        [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
+        [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
     ]
+    row3 = [Button.inline("👥 Referral Program", b"referral_info")]
+    if user_id in ADMIN_IDS:
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
+    buttons.append(row3)
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link)])
-    if user_id in ADMIN_IDS:
-        buttons.append([Button.inline("⚙️ Admin Panel", b"admin")])
     msg = "🌟 **OTP Bot Main Menu**"
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(msg, buttons=buttons)
@@ -473,6 +475,7 @@ async def callback_handler(event):
             pass
         return
 
+    # ---------- REFERRAL INFO (improved formatting) ----------
     if data == "referral_info":
         username = await get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -480,14 +483,20 @@ async def callback_handler(event):
         paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
         user_doc = await users_col.find_one({"user_id": user_id})
         withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
+        total_earned = paid_count * REFERRAL_BONUS  # approximate
+
         text = (
             "👥 **Referral Program**\n\n"
-            f"🔗 **Your Link:** `{ref_link}`\n"
-            f"💰 **Bonus:** ₹{REFERRAL_BONUS} (when your referral deposits ₹50 or more)\n"
-            f"📊 **Invited Users:** {invited_count}\n"
-            f"✅ **Bonus Paid:** {paid_count}\n"
+            "🔗 **Your Referral Link:**\n"
+            f"`{ref_link}`\n\n"
+            f"💰 **Bonus:** ₹{REFERRAL_BONUS} per referral\n"
+            f"(When your referred friend deposits ₹50 or more)\n\n"
+            "📊 **Your Stats:**\n"
+            f"• Total Invited: **{invited_count}** users\n"
+            f"• Bonus Paid: **{paid_count}** users\n"
+            f"• Total Earned: **₹{total_earned}**\n\n"
             f"💸 **Withdrawable Balance:** ₹{withdrawable}\n\n"
-            "Share your link and earn!"
+            "Share your link and start earning!"
         )
         buttons = [
             [Button.inline("💸 Withdraw", b"withdraw")],
@@ -496,6 +505,7 @@ async def callback_handler(event):
         await event.edit(text, buttons=buttons)
         return
 
+    # ---------- Withdraw flow start ----------
     if data == "withdraw":
         user_doc = await users_col.find_one({"user_id": user_id})
         withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
@@ -512,6 +522,7 @@ async def callback_handler(event):
         )
         return
 
+    # ---------- User purchase flow ----------
     if data == "buy":
         countries = await accounts_col.distinct("country", {"status": "available"})
         if not countries:
@@ -835,6 +846,7 @@ async def callback_handler(event):
     elif data == "main":
         await send_main_menu(event)
 
+    # ---------- ADMIN PANEL ----------
     elif data == "admin":
         if user_id not in ADMIN_IDS:
             await event.answer("❌ Unauthorized", alert=True)
