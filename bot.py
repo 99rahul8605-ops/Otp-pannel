@@ -1174,7 +1174,7 @@ async def callback_handler(event):
             await event.edit(
                 "➕ **Add Accounts to Stock**\n\n"
                 "Send in this format:\n\n"
-                "`CountryName|price|2AF`\n"
+                "`CountryName|price|2FA`\n"
                 "`account_data_line_1`\n"
                 "`account_data_line_2`\n"
                 "`....`\n\n"
@@ -1183,7 +1183,7 @@ async def callback_handler(event):
                 "`session_string_1`\n"
                 "`session_string_2`\n"
                 "`....`\n\n"
-                "First line = country|price|2AF (2FA password, send `none` if accounts have no 2FA), "
+                "First line = country|price|2FA (2FA password, send `none` if accounts have no 2FA), "
                 "every line after that = one session string (one account per line).",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
@@ -1628,7 +1628,7 @@ async def process_add_stock_step(event):
     parts = [p.strip() for p in header.split("|")]
     if len(parts) < 2:
         await event.respond(
-            "❌ Invalid header. Use format: `CountryName|price|2AF`",
+            "❌ Invalid header. Use format: `CountryName|price|2FA`",
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
         return
@@ -1640,7 +1640,7 @@ async def process_add_stock_step(event):
             raise ValueError
     except ValueError:
         await event.respond(
-            "❌ Invalid price in header. Use format: `CountryName|price|2AF`",
+            "❌ Invalid price in header. Use format: `CountryName|price|2FA`",
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
         return
@@ -1670,7 +1670,7 @@ async def process_add_stock_step(event):
             await temp_client.disconnect()
 
             existing = await accounts_col.find_one({"phone": phone})
-            if existing:
+            if existing and existing.get("status") == "available":
                 duplicates += 1
                 continue
 
@@ -1683,7 +1683,12 @@ async def process_add_stock_step(event):
             }
             if twofa:
                 insert_data["twofa_password"] = twofa
-            await accounts_col.insert_one(insert_data)
+
+            if existing:
+                # Existing account but not currently available (e.g. sold/used) -> restock it
+                await accounts_col.update_one({"_id": existing["_id"]}, {"$set": insert_data})
+            else:
+                await accounts_col.insert_one(insert_data)
             await acc_mgr.add_client(phone, new_session)
             added += 1
         except Exception as e:
@@ -1701,7 +1706,7 @@ async def process_add_stock_step(event):
                 pass
 
     summary = (
-        f"✅ **Stock Add Complete** ({country} @ ₹{price}{' | 2AF set' if twofa else ' | no 2AF'})\n\n"
+        f"✅ **Stock Add Complete** ({country} @ ₹{price}{' | 2FA set' if twofa else ' | no 2FA'})\n\n"
         f"➕ Added: {added}\n"
         f"♻️ Duplicates skipped: {duplicates}\n"
         f"❌ Failed: {failed}"
