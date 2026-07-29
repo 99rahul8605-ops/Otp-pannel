@@ -1174,7 +1174,7 @@ async def callback_handler(event):
             await event.edit(
                 "➕ **Add Accounts to Stock**\n\n"
                 "Send in this format:\n\n"
-                "`CountryName|price|tag`\n"
+                "`CountryName|price|2AF`\n"
                 "`account_data_line_1`\n"
                 "`account_data_line_2`\n"
                 "`....`\n\n"
@@ -1183,7 +1183,8 @@ async def callback_handler(event):
                 "`session_string_1`\n"
                 "`session_string_2`\n"
                 "`....`\n\n"
-                "First line = country|price|tag, every line after that = one session string (one account per line).",
+                "First line = country|price|2AF (2FA password, send `none` if accounts have no 2FA), "
+                "every line after that = one session string (one account per line).",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
             await event.answer()
@@ -1627,7 +1628,7 @@ async def process_add_stock_step(event):
     parts = [p.strip() for p in header.split("|")]
     if len(parts) < 2:
         await event.respond(
-            "❌ Invalid header. Use format: `CountryName|price|tag`",
+            "❌ Invalid header. Use format: `CountryName|price|2AF`",
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
         return
@@ -1639,11 +1640,11 @@ async def process_add_stock_step(event):
             raise ValueError
     except ValueError:
         await event.respond(
-            "❌ Invalid price in header. Use format: `CountryName|price|tag`",
+            "❌ Invalid price in header. Use format: `CountryName|price|2AF`",
             buttons=[[Button.inline("🔙 Cancel", b"admin")]]
         )
         return
-    tag = parts[2] if len(parts) > 2 else None
+    twofa = parts[2] if len(parts) > 2 and parts[2].lower() not in ("", "none", "skip") else None
 
     session_lines = lines[1:]
     total = len(session_lines)
@@ -1680,8 +1681,8 @@ async def process_add_stock_step(event):
                 "status": "available",
                 "price": price
             }
-            if tag:
-                insert_data["tag"] = tag
+            if twofa:
+                insert_data["twofa_password"] = twofa
             await accounts_col.insert_one(insert_data)
             await acc_mgr.add_client(phone, new_session)
             added += 1
@@ -1700,7 +1701,7 @@ async def process_add_stock_step(event):
                 pass
 
     summary = (
-        f"✅ **Stock Add Complete** ({country} @ ₹{price}{f' | {tag}' if tag else ''})\n\n"
+        f"✅ **Stock Add Complete** ({country} @ ₹{price}{' | 2AF set' if twofa else ' | no 2AF'})\n\n"
         f"➕ Added: {added}\n"
         f"♻️ Duplicates skipped: {duplicates}\n"
         f"❌ Failed: {failed}"
