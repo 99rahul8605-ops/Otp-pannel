@@ -1,5 +1,6 @@
 import os
 import io
+import tempfile
 import asyncio
 import logging
 import random
@@ -435,7 +436,7 @@ async def broadcast_callback(event):
     user_states.pop(user_id, None)
 
 # ============================================================
-#  1. ADMIN LIST FUNCTIONS
+#  1. ADMIN LIST FUNCTIONS (Accounts, Transactions, Withdrawals)
 # ============================================================
 
 # ---------- Accounts: status filter + pagination ----------
@@ -594,7 +595,6 @@ async def show_all_transactions(event, user_id, type_filter="all", page=0):
 
             combined = all_items[skip: skip + TXN_PAGE_SIZE]
 
-        # total_pages is already set in each branch
         logging.info(f"[DEBUG] type_filter={type_filter} page={page} total_count={total_count} total_pages={total_pages}")
 
         label = type_filter.capitalize() if type_filter != "all" else "All"
@@ -704,10 +704,10 @@ async def callback_handler(event):
 
         # Clear states for menu switches
         if data in ("main", "buy", "balance", "deposit", "orders", "admin",
-                    "admin_add_otp", "admin_add_sess", "admin_addbal",
-                    "admin_deposits", "admin_setprice", "admin_support", "withdraw",
-                    "admin_minwithdraw", "admin_transactions", "admin_withdrawals",
-                    "my_withdrawals"):
+                    "admin_add_otp", "admin_add_sess", "admin_add_session_file",
+                    "admin_addbal", "admin_deposits", "admin_setprice",
+                    "admin_support", "withdraw", "admin_minwithdraw",
+                    "admin_transactions", "admin_withdrawals", "my_withdrawals"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -717,10 +717,8 @@ async def callback_handler(event):
                 return
 
             if data == "admin_accounts":
-                # default: no filter, first page (from main admin panel button)
                 status_filter, page = "all", 0
             else:
-                # format: admin_accounts|<status>|<page>
                 try:
                     _, status_filter, page_str = data.split("|")
                     page = int(page_str)
@@ -1153,6 +1151,7 @@ async def callback_handler(event):
             btns = [
                 [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
                 [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
+                [Button.inline("📁 Add Account (Session File)", b"admin_add_session_file")],  # NEW
                 [Button.inline("📋 Accounts (List)", b"admin_accounts")],
                 [Button.inline("💰 Add Balance", b"admin_addbal")],
                 [Button.inline("💲 Set Price", b"admin_setprice")],
@@ -1167,7 +1166,14 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- OTHER ADMIN HANDLERS (simplified) ----------
+        # ---------- ADMIN ADD SESSION FILE ----------
+        if data == "admin_add_session_file":
+            user_states[user_id] = {"action": "add_session_file", "step": "await_file"}
+            await event.edit("📁 Please upload the `.session` file.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.answer()
+            return
+
+        # ---------- OTHER ADMIN HANDLERS ----------
         if data == "admin_add_otp":
             await start_add_phone_flow(event)
             await event.answer()
@@ -1212,7 +1218,7 @@ async def callback_handler(event):
                 {"$inc": {"balance": amount}},
                 upsert=True
             )
-            # referral bonus logic (kept as before)
+            # referral bonus logic (simplified)
             await event.edit("✅ Deposit approved!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             await event.answer()
             return
@@ -1255,7 +1261,7 @@ async def callback_handler(event):
         if data.startswith("addcountry_"):
             if data == "addcountry_new":
                 state = user_states.get(user_id)
-                if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+                if not state or state.get("action") not in ("add_phone_otp", "add_session", "add_session_file"):
                     await event.answer("❌ Session expired. Start again.", alert=True)
                     return
                 state["step"] = "country_manual"
@@ -1263,7 +1269,7 @@ async def callback_handler(event):
             else:
                 country = data[len("addcountry_"):]
                 state = user_states.get(user_id)
-                if not state or state.get("action") not in ("add_phone_otp", "add_session"):
+                if not state or state.get("action") not in ("add_phone_otp", "add_session", "add_session_file"):
                     await event.answer("❌ Session expired. Start again.", alert=True)
                     return
                 state["country"] = country
@@ -1377,7 +1383,7 @@ async def show_user_withdrawals(event, user_id):
 
 
 # ============================================================
-#  4. ADD PHONE / SESSION FLOWS (kept as before)
+#  4. ADD PHONE (OTP) AND SESSION FLOWS (existing)
 # ============================================================
 
 async def start_add_phone_flow(event):
@@ -1554,7 +1560,87 @@ async def process_session_step(event):
         await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
-# ---------- DEPOSIT FLOW ----------
+
+# ============================================================
+#  5. HANDLE SESSION FILE UPLOAD (NEW)
+# ============================================================
+
+async def process_session_file_step(event):
+    user_id = event.sender_id
+    state = user_states.get(user_id)
+    if not state or state["action"] != "add_session_file":
+        return
+    step = state.get("step")
+
+    if step == "await_file":
+        # Check if it's a document (file)
+        if not event.message.document:
+            await event.respond("❌ Please send a `.session` file (as a document).", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
+
+        # Download the file
+        try:
+            file_bytes = await event.message.download_media(file=bytes)
+        except Exception as e:
+            await event.respond(f"❌ Failed to download file: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
+
+        if not file_bytes:
+            await event.respond("❌ Empty file received.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            return
+
+        # Write to a temporary file
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".session") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+
+            # Create client from the temp session file
+            temp_client = TelegramClient(tmp_path, API_ID, API_HASH)
+            await temp_client.connect()
+
+            if not await temp_client.is_user_authorized():
+                await temp_client.disconnect()
+                os.unlink(tmp_path)
+                await event.respond("❌ Session is not authorized (logged out). Please provide a valid session.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                return
+
+            me = await temp_client.get_me()
+            phone = me.phone
+            session_str = temp_client.session.save()   # get string representation
+            await temp_client.disconnect()
+            os.unlink(tmp_path)
+
+            # Now we have phone and session string – reuse the add_session flow from "choose_country" step
+            state["phone"] = phone
+            state["session_str"] = session_str
+            # Change action to "add_session" and set step to "choose_country" so that the existing flow handles it
+            state["action"] = "add_session"
+            state["step"] = "choose_country"
+
+            existing = await get_existing_countries()
+            btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
+            btns.append([Button.inline("➕ New Country", b"addcountry_new")])
+            btns.append([Button.inline("🔙 Cancel", b"admin")])
+            await event.respond("🌍 Select country or add new:", buttons=btns)
+            return
+
+        except Exception as e:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            logging.error(f"Session file error: {e}", exc_info=True)
+            await event.respond(f"❌ Error processing session file: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            user_states.pop(user_id, None)
+            return
+
+    # If step is not "await_file", we can ignore (should not happen)
+
+
+# ============================================================
+#  6. DEPOSIT FLOW
+# ============================================================
+
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -1621,7 +1707,11 @@ async def process_deposit_step(event):
         user_states.pop(user_id, None)
         await log_event(f"💳 Deposit request: {user_id} ₹{amount} Txn:{txn_id}")
 
-# ---------- HANDLE TEXT MESSAGES ----------
+
+# ============================================================
+#  7. HANDLE ALL TEXT MESSAGES (including session file upload)
+# ============================================================
+
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
     user_id = event.sender_id
@@ -1633,6 +1723,13 @@ async def handle_message(event):
         await send_main_menu(event)
         return
     action = state.get("action")
+
+    # ---- SESSION FILE UPLOAD ----
+    if action == "add_session_file":
+        await process_session_file_step(event)
+        return
+
+    # ---- OTHER FLOWS ----
     if action == "add_phone_otp":
         await process_phone_otp_step(event)
     elif action == "add_session":
@@ -1760,6 +1857,7 @@ async def handle_message(event):
     else:
         await send_main_menu(event)
 
+
 # ---------- /start ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
@@ -1794,6 +1892,7 @@ async def start_cmd(event):
         return
 
     await show_welcome_menu(event, user_id)
+
 
 # ---------- MAIN ----------
 async def main():
