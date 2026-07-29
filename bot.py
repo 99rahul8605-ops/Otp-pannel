@@ -7,7 +7,7 @@ import random
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
-from telethon.sessions import StringSession, MemorySession
+from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     UserNotParticipantError,
@@ -19,15 +19,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
 from bson import ObjectId
 from account_manager import AccountManager
-
-# ---------- PYROGRAM (optional) ----------
-try:
-    from pyrogram import Client as PyroClient
-    from pyrogram.errors import SessionPasswordNeeded as PyroSessionPasswordNeeded
-    PYROGRAM_AVAILABLE = True
-except ImportError:
-    PYROGRAM_AVAILABLE = False
-    logging.warning("Pyrogram not installed. Some features will be disabled.")
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -713,8 +704,8 @@ async def callback_handler(event):
 
         # Clear states for menu switches
         if data in ("main", "buy", "balance", "deposit", "orders", "admin",
-                    "admin_add_otp", "admin_add_sess", "admin_add_session_file",
-                    "admin_add_pyrogram_otp", "admin_addbal", "admin_deposits",
+                    "admin_add_otp", "admin_add_sess", "admin_add_stock",
+                    "admin_addbal", "admin_deposits",
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
                     "admin_transactions", "admin_withdrawals", "my_withdrawals"):
             user_states.pop(user_id, None)
@@ -1160,8 +1151,7 @@ async def callback_handler(event):
             btns = [
                 [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
                 [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
-                [Button.inline("📁 Add Account (Session File)", b"admin_add_session_file")],
-                [Button.inline("🔥 Add Account (Pyrogram OTP)", b"admin_add_pyrogram_otp")] if PYROGRAM_AVAILABLE else None,
+                [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock")],
                 [Button.inline("📋 Accounts (List)", b"admin_accounts")],
                 [Button.inline("💰 Add Balance", b"admin_addbal")],
                 [Button.inline("💲 Set Price", b"admin_setprice")],
@@ -1178,26 +1168,24 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- ADMIN ADD SESSION FILE ----------
-        if data == "admin_add_session_file":
-            user_states[user_id] = {"action": "add_session_file", "step": "await_file"}
+        # ---------- ADMIN ADD ACCOUNTS TO STOCK (BULK) ----------
+        if data == "admin_add_stock":
+            user_states[user_id] = {"action": "add_stock", "step": "await_bulk"}
             await event.edit(
-                "📁 Please upload a `.session` file.\n\n"
-                "✅ Supports both **Telethon** and **Pyrogram** session files.\n"
-                "• Telethon sessions are used directly.\n"
-                "• Pyrogram sessions are automatically converted to Telethon format.",
+                "➕ **Add Accounts to Stock**\n\n"
+                "Send in this format:\n\n"
+                "`CountryName|price|tag`\n"
+                "`account_data_line_1`\n"
+                "`account_data_line_2`\n"
+                "`....`\n\n"
+                "**Example:**\n"
+                "`India|55|real1`\n"
+                "`session_string_1`\n"
+                "`session_string_2`\n"
+                "`....`\n\n"
+                "First line = country|price|tag, every line after that = one session string (one account per line).",
                 buttons=[[Button.inline("🔙 Cancel", b"admin")]]
             )
-            await event.answer()
-            return
-
-        # ---------- ADMIN ADD PYROGRAM OTP ----------
-        if data == "admin_add_pyrogram_otp":
-            if not PYROGRAM_AVAILABLE:
-                await event.answer("❌ Pyrogram not installed! Install with: pip install pyrogram", alert=True)
-                return
-            user_states[user_id] = {"action": "add_pyrogram_otp", "step": "phone"}
-            await event.edit("📱 Send phone number (e.g., +919876543210):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             await event.answer()
             return
 
@@ -1289,7 +1277,7 @@ async def callback_handler(event):
         if data.startswith("addcountry_"):
             if data == "addcountry_new":
                 state = user_states.get(user_id)
-                if not state or state.get("action") not in ("add_phone_otp", "add_session", "add_session_file", "add_pyrogram_otp"):
+                if not state or state.get("action") not in ("add_phone_otp", "add_session"):
                     await event.answer("❌ Session expired. Start again.", alert=True)
                     return
                 state["step"] = "country_manual"
@@ -1297,7 +1285,7 @@ async def callback_handler(event):
             else:
                 country = data[len("addcountry_"):]
                 state = user_states.get(user_id)
-                if not state or state.get("action") not in ("add_phone_otp", "add_session", "add_session_file", "add_pyrogram_otp"):
+                if not state or state.get("action") not in ("add_phone_otp", "add_session"):
                     await event.answer("❌ Session expired. Start again.", alert=True)
                     return
                 state["country"] = country
@@ -1615,278 +1603,117 @@ async def process_session_step(event):
 
 
 # ============================================================
-#  5. HANDLE SESSION FILE UPLOAD (SUPPORTS BOTH TELEGRAM AND PYROGRAM)
+#  5. BULK ADD ACCOUNTS TO STOCK
 # ============================================================
 
-async def process_session_file_step(event):
+async def process_add_stock_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
-    if not state or state["action"] != "add_session_file":
+    if not state or state["action"] != "add_stock":
         return
-    step = state.get("step")
 
-    if step == "await_file":
-        # Check if it's a document (file)
-        if not event.message.document:
-            await event.respond("❌ Please send a `.session` file (as a document).", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            return
+    raw_text = event.message.text or ""
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
 
-        # Download the file
+    if len(lines) < 2:
+        await event.respond(
+            "❌ Invalid format. Send the header line and at least one session string.\n\n"
+            "Example:\n`India|55|real1`\n`session_string_1`",
+            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+        )
+        return
+
+    header = lines[0]
+    parts = [p.strip() for p in header.split("|")]
+    if len(parts) < 2:
+        await event.respond(
+            "❌ Invalid header. Use format: `CountryName|price|tag`",
+            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+        )
+        return
+
+    country = parts[0].upper()
+    try:
+        price = float(parts[1])
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await event.respond(
+            "❌ Invalid price in header. Use format: `CountryName|price|tag`",
+            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+        )
+        return
+    tag = parts[2] if len(parts) > 2 else None
+
+    session_lines = lines[1:]
+    total = len(session_lines)
+
+    status_msg = await event.respond(f"⏳ Processing 0/{total} accounts...")
+
+    added, failed, duplicates = 0, 0, 0
+    fail_reasons = []
+
+    for idx, session_str in enumerate(session_lines, start=1):
+        temp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         try:
-            file_bytes = await event.message.download_media(file=bytes)
+            await temp_client.connect()
+            if not await temp_client.is_user_authorized():
+                await temp_client.disconnect()
+                failed += 1
+                fail_reasons.append(f"Line {idx}: invalid/unauthorized session")
+                continue
+
+            me = await temp_client.get_me()
+            phone = me.phone
+            new_session = temp_client.session.save()
+            await temp_client.disconnect()
+
+            existing = await accounts_col.find_one({"phone": phone})
+            if existing:
+                duplicates += 1
+                continue
+
+            insert_data = {
+                "phone": phone,
+                "country": country,
+                "session_string": new_session,
+                "status": "available",
+                "price": price
+            }
+            if tag:
+                insert_data["tag"] = tag
+            await accounts_col.insert_one(insert_data)
+            await acc_mgr.add_client(phone, new_session)
+            added += 1
         except Exception as e:
-            await event.respond(f"❌ Failed to download file: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            return
-
-        if not file_bytes:
-            await event.respond("❌ Empty file received.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            return
-
-        # Write to a temporary file
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".session") as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-
-            # ========== ATTEMPT 1: Try to load as Telethon session ==========
             try:
-                temp_client = TelegramClient(tmp_path, API_ID, API_HASH)
-                await temp_client.connect()
-                if await temp_client.is_user_authorized():
-                    me = await temp_client.get_me()
-                    phone = me.phone
-                    session_str = temp_client.session.save()
-                    await temp_client.disconnect()
-                    os.unlink(tmp_path)
+                await temp_client.disconnect()
+            except Exception:
+                pass
+            failed += 1
+            fail_reasons.append(f"Line {idx}: {str(e)}")
 
-                    state["phone"] = phone
-                    state["session_str"] = session_str    # ✅ explicitly set
-                    state["action"] = "add_session"
-                    state["step"] = "choose_country"
-                    state.pop("client", None)
-                    logging.info(f"[DEBUG] Telethon session loaded. session_str set: {session_str[:20]}...")
-
-                    existing = await get_existing_countries()
-                    btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-                    btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-                    btns.append([Button.inline("🔙 Cancel", b"admin")])
-                    await event.respond("✅ Telethon session file loaded successfully. Select country:", buttons=btns)
-                    return
-                else:
-                    await temp_client.disconnect()
-                    # Not a valid Telethon session, fall through to try pyrogram
-                    logging.info("Not a valid Telethon session, trying Pyrogram...")
-
-            except Exception as e:
-                # Telethon failed, continue to try Pyrogram
-                logging.info(f"Telethon load failed: {e}, trying Pyrogram...")
-                if tmp_path and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)  # remove the file to avoid leftovers
-
-            # ========== ATTEMPT 2: Try to load as Pyrogram session ==========
-            if not PYROGRAM_AVAILABLE:
-                await event.respond(
-                    "❌ Pyrogram is not installed. Please install it to use Pyrogram session files.\n"
-                    "Command: `pip install pyrogram`",
-                    buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-                )
-                user_states.pop(user_id, None)
-                return
-
+        if idx % 5 == 0 or idx == total:
             try:
-                # We need to re-save the file because the previous attempt may have deleted it.
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".session") as tmp2:
-                    tmp2.write(file_bytes)
-                    tmp2_path = tmp2.name
+                await status_msg.edit(f"⏳ Processing {idx}/{total} accounts...")
+            except Exception:
+                pass
 
-                pyro_client = PyroClient(
-                    name="pyro_load",
-                    api_id=API_ID,
-                    api_hash=API_HASH,
-                    session_file=tmp2_path,
-                    in_memory=False,
-                )
-                await pyro_client.connect()
-                if await pyro_client.is_user_authorized():
-                    me = await pyro_client.get_me()
-                    phone = me.phone
-                    # Extract auth_key and dc_id
-                    auth_key = pyro_client.auth_key
-                    dc_id = pyro_client.dc_id
-                    await pyro_client.disconnect()
-                    os.unlink(tmp2_path)
+    summary = (
+        f"✅ **Stock Add Complete** ({country} @ ₹{price}{f' | {tag}' if tag else ''})\n\n"
+        f"➕ Added: {added}\n"
+        f"♻️ Duplicates skipped: {duplicates}\n"
+        f"❌ Failed: {failed}"
+    )
+    if fail_reasons:
+        shown = "\n".join(fail_reasons[:10])
+        summary += f"\n\n**Failure details:**\n{shown}"
+        if len(fail_reasons) > 10:
+            summary += f"\n...and {len(fail_reasons) - 10} more."
 
-                    # Convert to Telethon MemorySession
-                    mem_session = MemorySession()
-                    mem_session.set_dc(dc_id, auth_key, None)
-                    telethon_session_str = mem_session.save()
-
-                    state["phone"] = phone
-                    state["session_str"] = telethon_session_str   # ✅ explicitly set
-                    state["action"] = "add_session"
-                    state["step"] = "choose_country"
-                    state.pop("client", None)
-                    logging.info(f"[DEBUG] Pyrogram session converted. session_str set: {telethon_session_str[:20]}...")
-
-                    existing = await get_existing_countries()
-                    btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-                    btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-                    btns.append([Button.inline("🔙 Cancel", b"admin")])
-                    await event.respond("✅ Pyrogram session file converted to Telethon. Select country:", buttons=btns)
-                    return
-                else:
-                    await pyro_client.disconnect()
-                    os.unlink(tmp2_path)
-                    await event.respond(
-                        "❌ The file is not a valid authorized session (either Telethon or Pyrogram).",
-                        buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-                    )
-                    user_states.pop(user_id, None)
-                    return
-
-            except Exception as e:
-                if tmp2_path and os.path.exists(tmp2_path):
-                    os.unlink(tmp2_path)
-                await event.respond(
-                    f"❌ Failed to load session file: {str(e)}\n"
-                    "Please ensure the file is a valid Telethon or Pyrogram `.session` file.",
-                    buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-                )
-                user_states.pop(user_id, None)
-                return
-
-        except Exception as e:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            logging.error(f"Session file error: {e}", exc_info=True)
-            await event.respond(
-                f"❌ Unexpected error: {str(e)}",
-                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-            )
-            user_states.pop(user_id, None)
-            return
-
-
-# ============================================================
-#  6. PYROGRAM OTP FLOW (automatically converts to Telethon session)
-# ============================================================
-
-async def process_pyrogram_otp_step(event):
-    user_id = event.sender_id
-    state = user_states.get(user_id)
-    if not state or state["action"] != "add_pyrogram_otp":
-        return
-    step = state.get("step")
-
-    if step == "phone":
-        phone = event.message.text.strip()
-        if not phone.startswith("+") or not phone[1:].isdigit():
-            await event.respond("❌ Invalid phone number. Send in international format (e.g., +919876543210).", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            return
-        state["phone"] = phone
-        state["pyro_client"] = None
-
-        try:
-            pyro_client = PyroClient(
-                name="pyro_otp",
-                api_id=API_ID,
-                api_hash=API_HASH,
-                phone_number=phone,
-                in_memory=True,
-            )
-            await pyro_client.connect()
-            sent = await pyro_client.send_code(phone)
-            state["pyro_client"] = pyro_client
-            state["phone_code_hash"] = sent.phone_code_hash
-            state["step"] = "otp"
-            await event.respond("✉️ OTP sent! Send the code:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-        except Exception as e:
-            await event.respond(f"❌ Pyrogram error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            user_states.pop(user_id, None)
-        return
-
-    elif step == "otp":
-        code = event.message.text.strip()
-        pyro_client = state.get("pyro_client")
-        if not pyro_client:
-            await event.respond("❌ Session expired. Please start again.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            user_states.pop(user_id, None)
-            return
-
-        try:
-            await pyro_client.sign_in(state["phone"], code)
-        except PyroSessionPasswordNeeded:
-            state["step"] = "2fa"
-            await event.respond("🔒 2FA password required. Send password:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            return
-        except Exception as e:
-            await pyro_client.disconnect()
-            await event.respond(f"❌ Login failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            user_states.pop(user_id, None)
-            return
-
-        # Success – extract auth_key and dc_id
-        auth_key = pyro_client.auth_key
-        dc_id = pyro_client.dc_id
-        phone = state["phone"]
-        await pyro_client.disconnect()
-
-        # Convert to Telethon MemorySession
-        mem_session = MemorySession()
-        mem_session.set_dc(dc_id, auth_key, None)
-        telethon_session_str = mem_session.save()
-
-        state["session_str"] = telethon_session_str
-        state["phone"] = phone
-        state["action"] = "add_session"
-        state["step"] = "choose_country"
-        state.pop("pyro_client", None)
-
-        existing = await get_existing_countries()
-        btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-        btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-        btns.append([Button.inline("🔙 Cancel", b"admin")])
-        await event.respond("✅ Pyrogram login successful! Session converted. Select country:", buttons=btns)
-        return
-
-    elif step == "2fa":
-        password = event.message.text.strip()
-        pyro_client = state.get("pyro_client")
-        if not pyro_client:
-            await event.respond("❌ Session expired. Please start again.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            user_states.pop(user_id, None)
-            return
-
-        try:
-            await pyro_client.sign_in(password=password)
-        except Exception as e:
-            await pyro_client.disconnect()
-            await event.respond(f"❌ 2FA login failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            user_states.pop(user_id, None)
-            return
-
-        auth_key = pyro_client.auth_key
-        dc_id = pyro_client.dc_id
-        phone = state["phone"]
-        await pyro_client.disconnect()
-
-        mem_session = MemorySession()
-        mem_session.set_dc(dc_id, auth_key, None)
-        telethon_session_str = mem_session.save()
-
-        state["session_str"] = telethon_session_str
-        state["phone"] = phone
-        state["action"] = "add_session"
-        state["step"] = "choose_country"
-        state.pop("pyro_client", None)
-
-        existing = await get_existing_countries()
-        btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-        btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-        btns.append([Button.inline("🔙 Cancel", b"admin")])
-        await event.respond("✅ Pyrogram 2FA successful! Session converted. Select country:", buttons=btns)
-        return
+    await event.respond(summary, buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+    await log_event(f"📦 Stock added by {user_id}: {added} accounts ({country} @ ₹{price})")
+    user_states.pop(user_id, None)
 
 
 # ============================================================
@@ -1976,14 +1803,9 @@ async def handle_message(event):
         return
     action = state.get("action")
 
-    # ---- SESSION FILE UPLOAD ----
-    if action == "add_session_file":
-        await process_session_file_step(event)
-        return
-
-    # ---- PYROGRAM OTP FLOW ----
-    if action == "add_pyrogram_otp":
-        await process_pyrogram_otp_step(event)
+    # ---- BULK ADD ACCOUNTS TO STOCK ----
+    if action == "add_stock":
+        await process_add_stock_step(event)
         return
 
     # ---- OTHER FLOWS ----
