@@ -7,7 +7,7 @@ import random
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, MemorySession
 from telethon.errors import (
     SessionPasswordNeededError,
     UserNotParticipantError,
@@ -27,7 +27,7 @@ try:
     PYROGRAM_AVAILABLE = True
 except ImportError:
     PYROGRAM_AVAILABLE = False
-    logging.warning("Pyrogram not installed. 'Add Account (Pyrogram OTP)' will be disabled.")
+    logging.warning("Pyrogram not installed. Some features will be disabled.")
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -1181,7 +1181,13 @@ async def callback_handler(event):
         # ---------- ADMIN ADD SESSION FILE ----------
         if data == "admin_add_session_file":
             user_states[user_id] = {"action": "add_session_file", "step": "await_file"}
-            await event.edit("📁 Please upload the `.session` file.\n\n⚠️ **Note:** Only Telethon `.session` files are supported. If you have a Pyrogram session file, please use the **Pyrogram OTP** method instead.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.edit(
+                "📁 Please upload a `.session` file.\n\n"
+                "✅ Supports both **Telethon** and **Pyrogram** session files.\n"
+                "• Telethon sessions are used directly.\n"
+                "• Pyrogram sessions are automatically converted to Telethon format.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
             await event.answer()
             return
 
@@ -1405,7 +1411,7 @@ async def show_user_withdrawals(event, user_id):
 
 
 # ============================================================
-#  4. ADD PHONE (OTP) AND SESSION FLOWS (existing + fixed)
+#  4. ADD PHONE (OTP) AND SESSION FLOWS (existing)
 # ============================================================
 
 async def start_add_phone_flow(event):
@@ -1594,7 +1600,7 @@ async def process_session_step(event):
 
 
 # ============================================================
-#  5. HANDLE SESSION FILE UPLOAD (FIXED)
+#  5. HANDLE SESSION FILE UPLOAD (SUPPORTS BOTH TELEGRAM AND PYROGRAM)
 # ============================================================
 
 async def process_session_file_step(event):
@@ -1628,55 +1634,119 @@ async def process_session_file_step(event):
                 tmp.write(file_bytes)
                 tmp_path = tmp.name
 
-            # Create client from the temp session file
-            temp_client = TelegramClient(tmp_path, API_ID, API_HASH)
-            await temp_client.connect()
+            # ========== ATTEMPT 1: Try to load as Telethon session ==========
+            try:
+                temp_client = TelegramClient(tmp_path, API_ID, API_HASH)
+                await temp_client.connect()
+                if await temp_client.is_user_authorized():
+                    me = await temp_client.get_me()
+                    phone = me.phone
+                    session_str = temp_client.session.save()
+                    await temp_client.disconnect()
+                    os.unlink(tmp_path)
 
-            if not await temp_client.is_user_authorized():
-                await temp_client.disconnect()
-                os.unlink(tmp_path)
-                await event.respond("❌ Session is not authorized (logged out). Please provide a valid session.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                    state["phone"] = phone
+                    state["session_str"] = session_str
+                    state["action"] = "add_session"
+                    state["step"] = "choose_country"
+                    state.pop("client", None)
+
+                    existing = await get_existing_countries()
+                    btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
+                    btns.append([Button.inline("➕ New Country", b"addcountry_new")])
+                    btns.append([Button.inline("🔙 Cancel", b"admin")])
+                    await event.respond("✅ Telethon session file loaded successfully. Select country:", buttons=btns)
+                    return
+                else:
+                    await temp_client.disconnect()
+                    # Not a valid Telethon session, fall through to try pyrogram
+                    logging.info("Not a valid Telethon session, trying Pyrogram...")
+
+            except Exception as e:
+                # Telethon failed, continue to try Pyrogram
+                logging.info(f"Telethon load failed: {e}, trying Pyrogram...")
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)  # remove the file to avoid leftovers
+
+            # ========== ATTEMPT 2: Try to load as Pyrogram session ==========
+            if not PYROGRAM_AVAILABLE:
+                await event.respond(
+                    "❌ Pyrogram is not installed. Please install it to use Pyrogram session files.\n"
+                    "Command: `pip install pyrogram`",
+                    buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                )
+                user_states.pop(user_id, None)
                 return
 
-            me = await temp_client.get_me()
-            phone = me.phone
-            session_str = temp_client.session.save()   # get string representation
-            await temp_client.disconnect()
-            os.unlink(tmp_path)
+            try:
+                # We need to re-save the file because the previous attempt may have deleted it.
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".session") as tmp2:
+                    tmp2.write(file_bytes)
+                    tmp2_path = tmp2.name
 
-            # Now we have phone and session string – reuse the add_session flow
-            state["phone"] = phone
-            state["session_str"] = session_str
-            state["action"] = "add_session"        # switch to session flow
-            state["step"] = "choose_country"       # go to country selection
-            state.pop("client", None)
+                pyro_client = PyroClient(
+                    name="pyro_load",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    session_file=tmp2_path,
+                    in_memory=False,
+                )
+                await pyro_client.connect()
+                if await pyro_client.is_user_authorized():
+                    me = await pyro_client.get_me()
+                    phone = me.phone
+                    # Extract auth_key and dc_id
+                    auth_key = pyro_client.auth_key
+                    dc_id = pyro_client.dc_id
+                    await pyro_client.disconnect()
+                    os.unlink(tmp2_path)
 
-            existing = await get_existing_countries()
-            btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-            btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-            btns.append([Button.inline("🔙 Cancel", b"admin")])
-            await event.respond("🌍 Select country or add new:", buttons=btns)
-            return
+                    # Convert to Telethon MemorySession
+                    mem_session = MemorySession()
+                    mem_session.set_dc(dc_id, auth_key, None)
+                    telethon_session_str = mem_session.save()
+
+                    state["phone"] = phone
+                    state["session_str"] = telethon_session_str
+                    state["action"] = "add_session"
+                    state["step"] = "choose_country"
+                    state.pop("client", None)
+
+                    existing = await get_existing_countries()
+                    btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
+                    btns.append([Button.inline("➕ New Country", b"addcountry_new")])
+                    btns.append([Button.inline("🔙 Cancel", b"admin")])
+                    await event.respond("✅ Pyrogram session file converted to Telethon. Select country:", buttons=btns)
+                    return
+                else:
+                    await pyro_client.disconnect()
+                    os.unlink(tmp2_path)
+                    await event.respond(
+                        "❌ The file is not a valid authorized session (either Telethon or Pyrogram).",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                    )
+                    user_states.pop(user_id, None)
+                    return
+
+            except Exception as e:
+                if tmp2_path and os.path.exists(tmp2_path):
+                    os.unlink(tmp2_path)
+                await event.respond(
+                    f"❌ Failed to load session file: {str(e)}\n"
+                    "Please ensure the file is a valid Telethon or Pyrogram `.session` file.",
+                    buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                )
+                user_states.pop(user_id, None)
+                return
 
         except Exception as e:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             logging.error(f"Session file error: {e}", exc_info=True)
-            # Provide a more helpful message
-            if "Can't load" in str(e) or "invalid" in str(e).lower():
-                await event.respond(
-                    "❌ **Invalid Session File**\n\n"
-                    "The file you uploaded is not a valid Telethon `.session` file.\n"
-                    "Possible reasons:\n"
-                    "• The file is corrupted.\n"
-                    "• It's a session file from another library (e.g., Pyrogram).\n"
-                    "• The file is empty or not a proper session.\n\n"
-                    "Please use the **'Add Account (Session)'** option to paste the session string directly,\n"
-                    "or use **'Add Account (Pyrogram OTP)'** to log in and automatically convert the session.",
-                    buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-                )
-            else:
-                await event.respond(f"❌ Error processing session file: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond(
+                f"❌ Unexpected error: {str(e)}",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
             user_states.pop(user_id, None)
             return
 
@@ -1701,9 +1771,8 @@ async def process_pyrogram_otp_step(event):
         state["pyro_client"] = None
 
         try:
-            # Create Pyrogram client
             pyro_client = PyroClient(
-                name="pyro_session",
+                name="pyro_otp",
                 api_id=API_ID,
                 api_hash=API_HASH,
                 phone_number=phone,
@@ -1740,78 +1809,17 @@ async def process_pyrogram_otp_step(event):
             user_states.pop(user_id, None)
             return
 
-        # Success: get Pyrogram session string and convert to Telethon
-        try:
-            pyro_session_str = await pyro_client.export_session_string()
-            await pyro_client.disconnect()
-        except Exception as e:
-            await event.respond(f"❌ Failed to export session: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            user_states.pop(user_id, None)
-            return
-
-        # Convert Pyrogram session to Telethon session by logging in with a Telethon client
-        # using the exported session? Actually, we can't directly use pyrogram session string in Telethon.
-        # We will create a new Telethon client with a StringSession and log in using the phone and password?
-        # We already have the phone, but we need a way to get the auth key. Instead, we can use the pyrogram client
-        # to get the session data and then construct a Telethon session manually, but that's complex.
-
-        # For simplicity, we'll create a new Telethon client with a StringSession and then use the sign_in
-        # with the same phone and the OTP code we already have. But we need to resend OTP? That would be a bad UX.
-
-        # Instead, we can use a trick: Telethon can accept a session string from Pyrogram? No.
-
-        # However, we already have a working Telethon OTP flow. The Pyrogram method is an extra alternative.
-        # For now, we will store the Pyrogram session string as-is, but the AccountManager expects Telethon sessions.
-        # So we need to convert. We'll use the pyrogram client to get the auth_key and dc_id, then create a Telethon session.
-
-        # Since this is complex, we'll provide a workaround: we will use the Pyrogram session to create a Telethon client
-        # by using the pyrogram client's `auth_key` and `dc_id` to construct a Telethon session.
-        # But that's not straightforward.
-
-        # Given time constraints, I'll mark this as a known limitation: Pyrogram session export is not directly compatible.
-        # We will instead store the session as a Telethon StringSession by creating a Telethon client and logging in with the same phone and OTP.
-        # But we already have the phone and the code; we can use them to login via Telethon as well, but we need to send code again.
-        # Not ideal.
-
-        # As a fallback, we'll just tell the user to use the regular Telethon OTP method.
-
-        # Actually, we can use the pyrogram client to get the `auth_key` and then create a Telethon session with it.
-        # Let's try a simpler approach: after successful login, we can create a Telethon client with a memory session
-        # and then use the pyrogram client's `auth_key` to set the session. But that's complicated.
-
-        # For now, I'll store the pyrogram session as a string and mark it as "pyrogram" in the DB, but the bot won't be able to use it.
-        # So I'll instead use the Telethon OTP flow as the primary and keep Pyrogram as a separate method that uses Telethon under the hood? Not good.
-
-        # I'll just use the Telethon client to login using the same phone and the OTP? We already have the OTP code, but we need to send a code request again? That would require another SMS.
-
-        # Given the complexity, I'll simply tell the user to use the "Add Account (OTP)" method for Telethon-compatible sessions, and use Pyrogram only if they need a Pyrogram-specific feature. But the bot requires Telethon.
-
-        # To make this work, I'll implement a conversion using pyrogram's `export_session` and then use that to create a Telethon session.
-        # There is a known method: pyrogram session string can be converted to Telethon by base64 decoding and using telethon's Session.
-        # But it's not straightforward and may break.
-
-        # Since the user explicitly asked for Pyrogram v2 function, I'll keep the code but add a note that the session will be converted.
-        # I'll implement a conversion using the pyrogram client's `export_session` method to get the session in a format that can be used by Telethon? No.
-
-        # I'll take a simpler route: after successful login with Pyrogram, we create a new Telethon client with a StringSession,
-        # and then use the phone number and the same OTP code to sign in via Telethon? But we don't have the code anymore; we used it for Pyrogram.
-        # We could store the code and use it for Telethon, but that would be messy.
-
-        # The safest approach is to just keep the Pyrogram method as a convenience for login, but after login, we can get the `auth_key` and `dc_id` from pyrogram client and then create a Telethon session using those.
-        # I'll implement that.
-
-        # Let's extract auth_key and dc_id from pyrogram client:
-        auth_key = pyro_client.auth_key  # bytes
+        # Success – extract auth_key and dc_id
+        auth_key = pyro_client.auth_key
         dc_id = pyro_client.dc_id
+        phone = state["phone"]
+        await pyro_client.disconnect()
 
-        # Create a Telethon session using the auth_key and dc_id
-        from telethon.sessions import MemorySession
+        # Convert to Telethon MemorySession
         mem_session = MemorySession()
         mem_session.set_dc(dc_id, auth_key, None)
-        # Then we need to save it to a StringSession
-        telethon_session_str = mem_session.save()  # this is a string
+        telethon_session_str = mem_session.save()
 
-        # Now we have a Telethon session string that we can store.
         state["session_str"] = telethon_session_str
         state["phone"] = phone
         state["action"] = "add_session"
@@ -1822,7 +1830,7 @@ async def process_pyrogram_otp_step(event):
         btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
         btns.append([Button.inline("➕ New Country", b"addcountry_new")])
         btns.append([Button.inline("🔙 Cancel", b"admin")])
-        await event.respond("✅ Login successful! Session converted. Select country or add new:", buttons=btns)
+        await event.respond("✅ Pyrogram login successful! Session converted. Select country:", buttons=btns)
         return
 
     elif step == "2fa":
@@ -1841,18 +1849,17 @@ async def process_pyrogram_otp_step(event):
             user_states.pop(user_id, None)
             return
 
-        # Success with 2FA – extract auth_key and dc_id
         auth_key = pyro_client.auth_key
         dc_id = pyro_client.dc_id
+        phone = state["phone"]
         await pyro_client.disconnect()
 
-        from telethon.sessions import MemorySession
         mem_session = MemorySession()
         mem_session.set_dc(dc_id, auth_key, None)
         telethon_session_str = mem_session.save()
 
         state["session_str"] = telethon_session_str
-        state["phone"] = state["phone"]
+        state["phone"] = phone
         state["action"] = "add_session"
         state["step"] = "choose_country"
         state.pop("pyro_client", None)
@@ -1861,7 +1868,7 @@ async def process_pyrogram_otp_step(event):
         btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
         btns.append([Button.inline("➕ New Country", b"addcountry_new")])
         btns.append([Button.inline("🔙 Cancel", b"admin")])
-        await event.respond("✅ 2FA successful! Session converted. Select country or add new:", buttons=btns)
+        await event.respond("✅ Pyrogram 2FA successful! Session converted. Select country:", buttons=btns)
         return
 
 
