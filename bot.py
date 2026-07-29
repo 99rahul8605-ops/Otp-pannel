@@ -1565,13 +1565,24 @@ async def process_session_step(event):
             if price <= 0:
                 raise ValueError
         except:
-            await event.respond("❌ Invalid price.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond("❌ Invalid price. Send a positive number:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             return
-        phone = state["phone"]
-        country = state["country"]
         
+        phone = state.get("phone")
+        country = state.get("country")
+        
+        # 🔍 DEBUG: print the state to see what's inside
+        logging.info(f"[DEBUG] price step - state keys: {list(state.keys())}")
+        logging.info(f"[DEBUG] phone: {phone}, country: {country}, session_str: {state.get('session_str')}")
+        
+        # Try to get session from multiple possible keys
         client = state.get("client")
         session_str = state.get("session_str")
+        
+        # Fallback: try to get from 'session' key (if any)
+        if not session_str and state.get("session"):
+            session_str = state["session"]
+            logging.info("[DEBUG] Using 'session' key as session_str")
         
         if client:
             new_session = client.session.save()
@@ -1579,7 +1590,11 @@ async def process_session_step(event):
         elif session_str:
             new_session = session_str
         else:
-            await event.respond("❌ No session found. Please try again.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            logging.error(f"[ERROR] No session found in state: {state}")
+            await event.respond(
+                "❌ No session found. Please start again using the 'Add Account (Session File)' option.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            )
             user_states.pop(user_id, None)
             return
         
@@ -1646,10 +1661,11 @@ async def process_session_file_step(event):
                     os.unlink(tmp_path)
 
                     state["phone"] = phone
-                    state["session_str"] = session_str
+                    state["session_str"] = session_str    # ✅ explicitly set
                     state["action"] = "add_session"
                     state["step"] = "choose_country"
                     state.pop("client", None)
+                    logging.info(f"[DEBUG] Telethon session loaded. session_str set: {session_str[:20]}...")
 
                     existing = await get_existing_countries()
                     btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
@@ -1707,10 +1723,11 @@ async def process_session_file_step(event):
                     telethon_session_str = mem_session.save()
 
                     state["phone"] = phone
-                    state["session_str"] = telethon_session_str
+                    state["session_str"] = telethon_session_str   # ✅ explicitly set
                     state["action"] = "add_session"
                     state["step"] = "choose_country"
                     state.pop("client", None)
+                    logging.info(f"[DEBUG] Pyrogram session converted. session_str set: {telethon_session_str[:20]}...")
 
                     existing = await get_existing_countries()
                     btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
