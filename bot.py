@@ -1383,7 +1383,7 @@ async def show_user_withdrawals(event, user_id):
 
 
 # ============================================================
-#  4. ADD PHONE (OTP) AND SESSION FLOWS (existing)
+#  4. ADD PHONE (OTP) AND SESSION FLOWS (existing + fixed)
 # ============================================================
 
 async def start_add_phone_flow(event):
@@ -1541,9 +1541,21 @@ async def process_session_step(event):
             return
         phone = state["phone"]
         country = state["country"]
-        session_str = state["session_str"]
-        client = state["client"]
-        new_session = client.session.save()
+        
+        # ✅ FIXED: Check for client (normal flow) or session_str (file flow)
+        client = state.get("client")
+        session_str = state.get("session_str")
+        
+        if client:
+            new_session = client.session.save()
+            await client.disconnect()
+        elif session_str:
+            new_session = session_str
+        else:
+            await event.respond("❌ No session found. Please try again.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            user_states.pop(user_id, None)
+            return
+        
         twofa_password = state.get("twofa_password")
         insert_data = {
             "phone": phone,
@@ -1556,7 +1568,6 @@ async def process_session_step(event):
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, new_session)
-        await client.disconnect()
         await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
         user_states.pop(user_id, None)
 
@@ -1612,12 +1623,13 @@ async def process_session_file_step(event):
             await temp_client.disconnect()
             os.unlink(tmp_path)
 
-            # Now we have phone and session string – reuse the add_session flow from "choose_country" step
+            # Now we have phone and session string – reuse the add_session flow
             state["phone"] = phone
             state["session_str"] = session_str
-            # Change action to "add_session" and set step to "choose_country" so that the existing flow handles it
-            state["action"] = "add_session"
-            state["step"] = "choose_country"
+            state["action"] = "add_session"        # switch to session flow
+            state["step"] = "choose_country"       # go to country selection
+            # Remove client key if exists (it doesn't in this flow)
+            state.pop("client", None)
 
             existing = await get_existing_countries()
             btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
@@ -1633,8 +1645,6 @@ async def process_session_file_step(event):
             await event.respond(f"❌ Error processing session file: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
             user_states.pop(user_id, None)
             return
-
-    # If step is not "await_file", we can ignore (should not happen)
 
 
 # ============================================================
