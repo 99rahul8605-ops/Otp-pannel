@@ -173,6 +173,26 @@ _usd_fetched: float = 0
 SMM_CATS_PER_PAGE = 10
 SMM_SVCS_PER_PAGE = 8
 
+SMM_PLATFORMS = ["Telegram", "Instagram", "Facebook", "Other"]
+_SMM_PLATFORM_EMOJI = {
+    "Telegram": "✈️", "Instagram": "📸", "Facebook": "📘", "Other": "🌐",
+}
+
+def classify_smm_platform(cat: str) -> str:
+    c = (cat or "").lower()
+    if "telegram" in c or c.startswith("tg"):
+        return "Telegram"
+    if "instagram" in c or " ig " in f" {c} " or c.startswith("insta"):
+        return "Instagram"
+    if "facebook" in c or c.startswith("fb"):
+        return "Facebook"
+    return "Other"
+
+def get_smm_platform_categories(platform: str) -> list:
+    return sorted(
+        [cat for cat in _smm_categorized.keys() if classify_smm_platform(cat) == platform]
+    )
+
 async def fetch_smm_services():
     """Fetch and cache all services from the SMM panel, grouped by category."""
     global _smm_all_services, _smm_categorized, _smm_cache_time
@@ -216,8 +236,22 @@ async def get_usd_inr() -> float:
         logging.warning(f"USD/INR fetch failed, using {_usd_inr}: {e}")
     return _usd_inr
 
-async def build_smm_category_page(page: int):
-    cat_keys = list(_smm_categorized.keys())
+async def build_smm_platform_menu():
+    buttons = []
+    for p in SMM_PLATFORMS:
+        cats = get_smm_platform_categories(p)
+        count = sum(len(_smm_categorized[c]) for c in cats)
+        emoji = _SMM_PLATFORM_EMOJI.get(p, "🌐")
+        label = f"{emoji} {p} ({count} services)"
+        buttons.append([Button.inline(label, f"smm_cat_{p}_0".encode())])
+    buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
+    buttons.append([Button.inline("📦 My SMM Orders", b"smm_myorders")])
+    buttons.append([Button.inline("🔙 Back", b"main")])
+    text = "🚀 **SMM Services** — choose a platform:"
+    return text, buttons
+
+async def build_smm_category_page(platform: str, page: int):
+    cat_keys = get_smm_platform_categories(platform)
     total = len(cat_keys)
     tp = max(1, (total + SMM_CATS_PER_PAGE - 1) // SMM_CATS_PER_PAGE)
     page = max(0, min(page, tp - 1))
@@ -225,27 +259,31 @@ async def build_smm_category_page(page: int):
 
     buttons = []
     for cat in chunk:
-        i = cat_keys.index(cat)
+        idx = cat_keys.index(cat)
         count = len(_smm_categorized[cat])
         label = f"{cat[:30]} ({count})"
-        buttons.append([Button.inline(label, f"smm_svc_{i}_0".encode())])
+        buttons.append([Button.inline(label, f"smm_svc_{platform}_{idx}_0".encode())])
 
     nav = []
     if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"smm_cat_{page-1}".encode()))
+        nav.append(Button.inline("⬅️ Prev", f"smm_cat_{platform}_{page-1}".encode()))
     if page < tp - 1:
-        nav.append(Button.inline("Next ➡️", f"smm_cat_{page+1}".encode()))
+        nav.append(Button.inline("Next ➡️", f"smm_cat_{platform}_{page+1}".encode()))
     if nav:
         buttons.append(nav)
 
     buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
-    buttons.append([Button.inline("📦 My SMM Orders", b"smm_myorders")])
-    buttons.append([Button.inline("🔙 Back", b"main")])
+    buttons.append([Button.inline("🔙 Back to Platforms", b"smm_services")])
 
-    text = f"🚀 **SMM Services** — Select a category  ({page+1}/{tp})\nTotal categories: {total}"
+    emoji = _SMM_PLATFORM_EMOJI.get(platform, "🌐")
+    text = f"{emoji} **{platform} Services** — Select a category  ({page+1}/{tp})\nTotal categories: {total}"
     return text, buttons
 
-async def build_smm_service_page(cat_name: str, page: int, usd: float):
+async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float):
+    cat_keys = get_smm_platform_categories(platform)
+    if cidx >= len(cat_keys):
+        return None, None
+    cat_name = cat_keys[cidx]
     svcs = _smm_categorized[cat_name]
     total = len(svcs)
     tp = max(1, (total + SMM_SVCS_PER_PAGE - 1) // SMM_SVCS_PER_PAGE)
@@ -263,19 +301,17 @@ async def build_smm_service_page(cat_name: str, page: int, usd: float):
         )
     text = "\n".join(lines)
 
-    cat_keys = list(_smm_categorized.keys())
-    cidx = cat_keys.index(cat_name)
     buttons = []
     nav = []
     if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"smm_svc_{cidx}_{page-1}".encode()))
+        nav.append(Button.inline("⬅️ Prev", f"smm_svc_{platform}_{cidx}_{page-1}".encode()))
     if page < tp - 1:
-        nav.append(Button.inline("Next ➡️", f"smm_svc_{cidx}_{page+1}".encode()))
+        nav.append(Button.inline("Next ➡️", f"smm_svc_{platform}_{cidx}_{page+1}".encode()))
     if nav:
         buttons.append(nav)
 
     buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
-    buttons.append([Button.inline("🔙 Back to Categories", b"smm_cat_0")])
+    buttons.append([Button.inline("🔙 Back to Categories", f"smm_cat_{platform}_0".encode())])
     return text, buttons
 
 # ---------- FORCE JOIN ----------
@@ -1312,29 +1348,28 @@ async def callback_handler(event):
                                   buttons=[[Button.inline("🔙 Back", b"main")]])
                 await event.answer()
                 return
-            text, btns = await build_smm_category_page(0)
+            text, btns = await build_smm_platform_menu()
             await event.edit(text, buttons=btns)
             await event.answer()
             return
 
         if data.startswith("smm_cat_"):
-            page = int(data.split("_")[2])
+            parts = data.split("_")
+            platform, page = parts[2], int(parts[3])
             if not _smm_categorized:
                 await fetch_smm_services()
-            text, btns = await build_smm_category_page(page)
+            text, btns = await build_smm_category_page(platform, page)
             await event.edit(text, buttons=btns)
             await event.answer()
             return
 
         if data.startswith("smm_svc_"):
-            _, _, cidx, page = data.split("_")
-            cidx, page = int(cidx), int(page)
-            cat_keys = list(_smm_categorized.keys())
-            if cidx >= len(cat_keys):
+            parts = data.split("_")
+            platform, cidx, page = parts[2], int(parts[3]), int(parts[4])
+            text, btns = await build_smm_service_page(platform, cidx, page, await get_usd_inr())
+            if text is None:
                 await event.answer("Not found.", alert=True)
                 return
-            usd = await get_usd_inr()
-            text, btns = await build_smm_service_page(cat_keys[cidx], page, usd)
             await event.edit(text, buttons=btns)
             await event.answer()
             return
@@ -1343,7 +1378,7 @@ async def callback_handler(event):
             user_states[user_id] = {"action": "smm_order", "step": "service_id"}
             await event.edit(
                 "🆔 Enter the **Service ID** you want to order (shown above each service):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]]
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services")]]
             )
             await event.answer()
             return
@@ -2294,7 +2329,7 @@ async def handle_message(event):
             sid_text = event.message.text.strip()
             if not sid_text.isdigit():
                 await event.respond("❌ Invalid Service ID. Send numeric ID only.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services")]])
                 return
             sid = int(sid_text)
             if not _smm_all_services:
@@ -2302,7 +2337,7 @@ async def handle_message(event):
             service = next((s for s in _smm_all_services if str(s.get("service")) == str(sid)), None)
             if not service:
                 await event.respond("❌ Service ID not found.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services")]])
                 return
             state["service"] = service
             state["step"] = "link"
@@ -2310,7 +2345,7 @@ async def handle_message(event):
                 f"📦 **{service['name']}**\n"
                 f"Min: {service['min']} | Max: {service['max']}\n\n"
                 "🔗 Now send the **link** (post/profile/video URL) for this order:",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]]
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services")]]
             )
             return
 
@@ -2318,14 +2353,14 @@ async def handle_message(event):
             link = event.message.text.strip()
             if not link.startswith("http"):
                 await event.respond("❌ Please send a valid link starting with http/https.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services")]])
                 return
             state["link"] = link
             state["step"] = "quantity"
             service = state["service"]
             await event.respond(
                 f"📊 Send the **quantity** you want (Min: {service['min']}, Max: {service['max']}):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]]
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services")]]
             )
             return
 
@@ -2335,12 +2370,12 @@ async def handle_message(event):
                 qty = int(event.message.text.strip())
             except:
                 await event.respond("❌ Invalid quantity. Send a number.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services")]])
                 return
             min_q, max_q = int(float(service["min"])), int(float(service["max"]))
             if qty < min_q or qty > max_q:
                 await event.respond(f"❌ Quantity must be between {min_q} and {max_q}.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services")]])
                 return
 
             usd = await get_usd_inr()
