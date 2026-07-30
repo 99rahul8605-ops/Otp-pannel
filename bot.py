@@ -189,9 +189,13 @@ def classify_smm_platform(cat: str) -> str:
     return "Other"
 
 def get_smm_platform_categories(platform: str) -> list:
-    return sorted(
-        [cat for cat in _smm_categorized.keys() if classify_smm_platform(cat) == platform]
-    )
+    cats = [cat for cat in _smm_categorized.keys() if classify_smm_platform(cat) == platform]
+    if platform == "Telegram":
+        # Reaction services first, then alphabetical within each group
+        cats.sort(key=lambda c: (0 if "reaction" in c.lower() else 1, c.lower()))
+    else:
+        cats.sort(key=lambda c: c.lower())
+    return cats
 
 async def fetch_smm_services():
     """Fetch and cache all services from the SMM panel, grouped by category."""
@@ -244,6 +248,7 @@ async def build_smm_platform_menu():
         emoji = _SMM_PLATFORM_EMOJI.get(p, "🌐")
         label = f"{emoji} {p} ({count} services)"
         buttons.append([Button.inline(label, f"smm_cat_{p}_0".encode())])
+    buttons.append([Button.inline("🔍 Search Service", b"smm_search")])
     buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
     buttons.append([Button.inline("📦 My SMM Orders", b"smm_myorders")])
     buttons.append([Button.inline("🔙 Back", b"main")])
@@ -261,7 +266,7 @@ async def build_smm_category_page(platform: str, page: int):
     for cat in chunk:
         idx = cat_keys.index(cat)
         count = len(_smm_categorized[cat])
-        label = f"{cat[:30]} ({count})"
+        label = f"{cat[:55]} ({count})"
         buttons.append([Button.inline(label, f"smm_svc_{platform}_{idx}_0".encode())])
 
     nav = []
@@ -312,6 +317,38 @@ async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float
 
     buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
     buttons.append([Button.inline("🔙 Back to Categories", f"smm_cat_{platform}_0".encode())])
+    return text, buttons
+
+SMM_SEARCH_LIMIT = 15
+
+async def build_smm_search_results(query: str, usd: float):
+    q = query.lower().strip()
+    matches = [
+        svc for svc in _smm_all_services
+        if q in svc.get("name", "").lower() or q in svc.get("category", "").lower()
+    ][:SMM_SEARCH_LIMIT]
+
+    if not matches:
+        text = f"🔍 No services found matching `{query}`."
+        buttons = [[Button.inline("🔙 Back", b"smm_services")]]
+        return text, buttons
+
+    lines = [f"🔍 **Search results for:** `{query}` ({len(matches)} shown)\n"]
+    for svc in matches:
+        markup = await get_smm_markup(svc.get("category", ""))
+        rate = round(float(svc["rate"]) * usd * markup, 4)
+        lines.append(
+            f"🆔 `{svc['service']}`\n"
+            f"📦 {svc['name']}\n"
+            f"🏷 {svc.get('category', 'N/A')}\n"
+            f"💰 ₹{rate}/1k | Min: {svc['min']} Max: {svc['max']}\n"
+        )
+    text = "\n".join(lines)
+    buttons = [
+        [Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")],
+        [Button.inline("🔍 Search Again", b"smm_search")],
+        [Button.inline("🔙 Back", b"smm_services")],
+    ]
     return text, buttons
 
 # ---------- FORCE JOIN ----------
@@ -898,7 +935,7 @@ async def callback_handler(event):
                     "admin_addbal", "admin_deposits",
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
                     "admin_transactions", "admin_withdrawals", "my_withdrawals",
-                    "smm_services", "smm_myorders", "admin_smm_markup",
+                    "smm_services", "smm_myorders", "admin_smm_markup", "smm_search",
                     "admin_smm_markup_default", "admin_smm_markup_member"):
             user_states.pop(user_id, None)
 
@@ -1371,6 +1408,17 @@ async def callback_handler(event):
                 await event.answer("Not found.", alert=True)
                 return
             await event.edit(text, buttons=btns)
+            await event.answer()
+            return
+
+        if data == "smm_search":
+            if not _smm_all_services:
+                await fetch_smm_services()
+            user_states[user_id] = {"action": "smm_search", "step": "query"}
+            await event.edit(
+                "🔍 Send a keyword to search services (e.g. `views`, `members`, `reaction`, `Instagram`):",
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services")]]
+            )
             await event.answer()
             return
 
@@ -2321,6 +2369,20 @@ async def handle_message(event):
             await event.respond(f"✅ {label} SMM markup set to {val}x.",
                                  buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             user_states.pop(user_id, None)
+
+    elif action == "smm_search":
+        step = state.get("step")
+        if step == "query":
+            query = event.message.text.strip()
+            if len(query) < 2:
+                await event.respond("❌ Please send at least 2 characters to search.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services")]])
+                return
+            usd = await get_usd_inr()
+            text, btns = await build_smm_search_results(query, usd)
+            user_states.pop(user_id, None)
+            await event.respond(text, buttons=btns)
+            return
 
     elif action == "smm_order":
         step = state.get("step")
