@@ -1,9 +1,11 @@
 import os
 import io
+import time
 import tempfile
 import asyncio
 import logging
 import random
+import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
@@ -33,6 +35,10 @@ PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop").strip()
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50").strip())
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
+
+SMM_API_URL = os.getenv("SMM_API_URL", "").strip()
+SMM_API_KEY = os.getenv("SMM_API_KEY", "").strip()
+SMM_DEFAULT_MARKUP = float(os.getenv("SMM_DEFAULT_MARKUP", "1.3").strip())
 
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
 if LOGS_CHANNEL_ID:
@@ -67,6 +73,7 @@ orders_col = db['orders']
 deposits_col = db['deposits']
 settings_col = db['settings']
 withdrawals_col = db['withdrawals']
+smm_orders_col = db['smm_orders']
 
 # ---------- BOT INSTANCE ----------
 import hashlib
@@ -76,6 +83,105 @@ bot = TelegramClient(session_name, API_ID, API_HASH)
 # ---------- STATE MACHINE ----------
 user_states = {}
 pending_otp_requests = {}
+
+# ---------- SMM SERVICE (Reactions / Members panel) ----------
+_smm_services: list = []
+_smm_categorized: dict = {}
+_smm_cache_time: float = 0
+_smm_usd_inr: float = 95.0
+_smm_usd_fetched: float = 0
+
+SMM_TARGET_CATEGORIES = [
+    "Telegram: Post Reactions [Fast]",
+    "Telegram: Post Reactions [Cheap]",
+    "Telegram: Members &amp; Subscribers [ New ]",
+    "Telegram: Members &amp; Subscribers [ Cheap ]",
+]
+
+SMM_SHORT_NAMES = {
+    "Telegram: Post Reactions [Fast]":  "⚡ Fast Reaction",
+    "Telegram: Post Reactions [Cheap]": "💰 Cheap Reaction",
+    "Telegram: Members &amp; Subscribers [ New ]": "👥 Add Members",
+    "Telegram: Members &amp; Subscribers [ Cheap ]": "💸 Cheap Members",
+}
+
+SMM_PER_PAGE = 8
+
+async def fetch_smm_services():
+    global _smm_services, _smm_categorized, _smm_cache_time
+    if time.time() - _smm_cache_time < 3600 and _smm_categorized:
+        return True
+    if not SMM_API_URL or not SMM_API_KEY:
+        logging.warning("SMM_API_URL/SMM_API_KEY not set, SMM service disabled.")
+        return False
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(SMM_API_URL, data={"key": SMM_API_KEY, "action": "services"}) as r:
+                data = await r.json(content_type=None)
+        if not isinstance(data, list):
+            return False
+        _smm_services = data
+        _smm_categorized = {}
+        for cat in SMM_TARGET_CATEGORIES:
+            filtered = [s for s in data if s.get("category", "") == cat]
+            if filtered:
+                _smm_categorized[cat] = filtered
+        _smm_cache_time = time.time()
+        return True
+    except Exception as e:
+        logging.error(f"fetch_smm_services error: {e}")
+        return False
+
+async def get_smm_usd_inr() -> float:
+    global _smm_usd_inr, _smm_usd_fetched
+    if time.time() - _smm_usd_fetched < 3600:
+        return _smm_usd_inr
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://open.er-api.com/v6/latest/USD",
+                              timeout=aiohttp.ClientTimeout(total=5)) as r:
+                d = await r.json()
+                if d.get("result") == "success":
+                    _smm_usd_inr = float(d["rates"]["INR"])
+                    _smm_usd_fetched = time.time()
+    except Exception as e:
+        logging.warning(f"SMM USD/INR fetch failed, using {_smm_usd_inr}: {e}")
+    return _smm_usd_inr
+
+def get_smm_rate(svc: dict, usd: float) -> float:
+    return round(float(svc["rate"]) * usd * SMM_DEFAULT_MARKUP, 4)
+
+async def build_smm_page(cat_name: str, page: int, usd: float):
+    svcs = _smm_categorized[cat_name]
+    total = len(svcs)
+    tp = max(1, (total + SMM_PER_PAGE - 1) // SMM_PER_PAGE)
+    page = max(0, min(page, tp - 1))
+    chunk = svcs[page * SMM_PER_PAGE:(page + 1) * SMM_PER_PAGE]
+
+    text = f"🎯 **{cat_name}** ({page+1}/{tp})\n\n"
+    rows = []
+    for svc in chunk:
+        rate = get_smm_rate(svc, usd)
+        text += (
+            f"🆔 `{svc['service']}`\n"
+            f"📦 {svc['name']}\n"
+            f"💰 ₹{rate}/1k | Min: {svc['min']} Max: {svc['max']}\n\n"
+        )
+        rows.append([Button.inline(f"🛒 {svc['service']} — ₹{rate}/1k", f"smmpick_{svc['service']}".encode())])
+
+    cat_keys = list(_smm_categorized.keys())
+    cidx = cat_keys.index(cat_name)
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"smmsvc_{cidx}_{page-1}".encode()))
+    if page < tp - 1:
+        nav.append(Button.inline("Next ➡️", f"smmsvc_{cidx}_{page+1}".encode()))
+    if nav:
+        rows.append(nav)
+
+    rows.append([Button.inline("🔙 Categories", b"smm")])
+    return text, rows
 
 # ---------- Bot Username Cache ----------
 bot_username = None
@@ -217,6 +323,7 @@ async def show_welcome_menu(event, user_id):
     )
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
+        [Button.inline("🎯 SMM Service", b"smm")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info")]
@@ -241,6 +348,7 @@ async def send_main_menu(event):
         return
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
+        [Button.inline("🎯 SMM Service", b"smm")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info")]
@@ -703,7 +811,7 @@ async def callback_handler(event):
             return
 
         # Clear states for menu switches
-        if data in ("main", "buy", "balance", "deposit", "orders", "admin",
+        if data in ("main", "buy", "balance", "deposit", "orders", "admin", "smm",
                     "admin_add_otp", "admin_add_sess", "admin_add_stock",
                     "admin_addbal", "admin_deposits",
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
@@ -1077,6 +1185,126 @@ async def callback_handler(event):
                     except:
                         pass
             asyncio.create_task(clear_pending())
+            return
+
+        # ---------- SMM SERVICE ----------
+        if data == "smm":
+            wait_msg = await event.edit("⏳ Loading SMM services...")
+            ok = await fetch_smm_services()
+            if not ok or not _smm_categorized:
+                await event.edit(
+                    "❌ SMM service unavailable right now. Try again later or contact admin.",
+                    buttons=[[Button.inline("🔙 Back", b"main")]]
+                )
+                await event.answer()
+                return
+            cat_keys = list(_smm_categorized.keys())
+            rows = []
+            for i, cat in enumerate(cat_keys):
+                short = SMM_SHORT_NAMES.get(cat, cat[:20])
+                rows.append([Button.inline(short, f"smmsvc_{i}_0".encode())])
+            rows.append([Button.inline("🔙 Back", b"main")])
+            await event.edit("🎯 **SMM Service**\n\nSelect a category:", buttons=rows)
+            await event.answer()
+            return
+
+        # ---------- SMM CATEGORY PAGINATION ----------
+        if data.startswith("smmsvc_"):
+            _, cidx, page = data.split("_")
+            cidx, page = int(cidx), int(page)
+            cat_keys = list(_smm_categorized.keys())
+            if not cat_keys or cidx >= len(cat_keys):
+                await event.answer("❌ Session expired, reopen SMM Service.", alert=True)
+                return
+            usd = await get_smm_usd_inr()
+            text, rows = await build_smm_page(cat_keys[cidx], page, usd)
+            await event.edit(text, buttons=rows)
+            await event.answer()
+            return
+
+        # ---------- SMM PICK SERVICE ----------
+        if data.startswith("smmpick_"):
+            service_id = data.replace("smmpick_", "")
+            svc = next((s for s in _smm_services if str(s.get("service")) == service_id), None)
+            if not svc:
+                await event.answer("❌ Service not found, refresh and try again.", alert=True)
+                return
+            usd = await get_smm_usd_inr()
+            rate = get_smm_rate(svc, usd)
+            user_states[user_id] = {"action": "smm_link", "service": svc, "rate": rate}
+            await event.edit(
+                f"✅ **{svc['name']}**\n\n"
+                f"💰 ₹{rate}/1k | Min: {svc['min']} | Max: {svc['max']}\n\n"
+                f"Send the **link/username** to send this service to:",
+                buttons=[[Button.inline("🔙 Cancel", b"smm")]]
+            )
+            await event.answer()
+            return
+
+        # ---------- SMM ORDER CONFIRM/CANCEL ----------
+        if data == "smm_confirm":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "smm_confirm":
+                await event.answer("❌ Session expired, start again.", alert=True)
+                return
+            svc = state["service"]
+            link = state["link"]
+            qty = state["quantity"]
+            cost = state["cost"]
+            user = await users_col.find_one({"user_id": user_id})
+            balance = user["balance"] if user else 0
+            if balance < cost:
+                await event.answer("❌ Insufficient balance!", alert=True)
+                return
+            await event.answer("Placing order...")
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(SMM_API_URL, data={
+                        "key": SMM_API_KEY, "action": "add",
+                        "service": svc["service"], "link": link, "quantity": qty
+                    }) as r:
+                        res = await r.json(content_type=None)
+            except Exception as e:
+                logging.error(f"SMM add order error: {e}")
+                res = {}
+            if res.get("order"):
+                await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": -cost}})
+                await smm_orders_col.insert_one({
+                    "user_id": user_id,
+                    "smm_order_id": res["order"],
+                    "service_id": svc["service"],
+                    "service_name": svc["name"],
+                    "link": link,
+                    "quantity": qty,
+                    "cost": cost,
+                    "status": "pending",
+                    "created_at": datetime.utcnow()
+                })
+                updated_user = await users_col.find_one({"user_id": user_id})
+                new_bal = updated_user["balance"] if updated_user else 0
+                await event.edit(
+                    f"✅ **Order Placed!**\n\n"
+                    f"🆔 Order ID: `{res['order']}`\n"
+                    f"💰 Cost: ₹{cost}\n"
+                    f"👛 Balance: ₹{new_bal}",
+                    buttons=[[Button.inline("🔙 Main Menu", b"main")]]
+                )
+            else:
+                error = str(res.get("error", "")).lower()
+                if any(k in error for k in ["funds", "balance", "credit", "money"]):
+                    msg_text = "⚠️ Service temporarily unavailable. Please try again later or contact support."
+                elif "invalid" in error or "not found" in error:
+                    msg_text = "❌ Invalid order details. Please check the link and try again."
+                else:
+                    msg_text = "⚠️ Could not place order. Please try again later."
+                await event.edit(msg_text, buttons=[[Button.inline("🔙 Main Menu", b"main")]])
+            user_states.pop(user_id, None)
+            return
+
+        if data == "smm_cancel":
+            user_states.pop(user_id, None)
+            await event.edit("❌ Order cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
+            await event.answer()
             return
 
         # ---------- BALANCE ----------
@@ -1812,6 +2040,51 @@ async def handle_message(event):
     # ---- BULK ADD ACCOUNTS TO STOCK ----
     if action == "add_stock":
         await process_add_stock_step(event)
+        return
+
+    # ---- SMM SERVICE ORDER FLOW ----
+    if action == "smm_link":
+        link = (event.message.text or "").strip()
+        if not link:
+            await event.respond("❌ Send a valid link/username.")
+            return
+        svc = state["service"]
+        state["link"] = link
+        state["action"] = "smm_quantity"
+        await event.respond(
+            f"📊 Enter **quantity** (Min: {svc['min']} | Max: {svc['max']}):",
+            buttons=[[Button.inline("🔙 Cancel", b"smm")]]
+        )
+        return
+
+    if action == "smm_quantity":
+        svc = state["service"]
+        rate = state["rate"]
+        try:
+            qty = int((event.message.text or "").strip())
+        except ValueError:
+            await event.respond("❌ Enter a valid number.")
+            return
+        if qty < int(svc["min"]) or qty > int(svc["max"]):
+            await event.respond(f"❌ Quantity must be between {svc['min']} and {svc['max']}.")
+            return
+        cost = round(rate * qty / 1000, 2)
+        user = await users_col.find_one({"user_id": user_id})
+        balance = user["balance"] if user else 0
+        state.update({"action": "smm_confirm", "quantity": qty, "cost": cost})
+        bal_ok = balance >= cost
+        await event.respond(
+            f"📋 **Order Summary**\n\n"
+            f"📦 {svc['name']}\n"
+            f"🔗 {state['link']}\n"
+            f"📊 Qty: {qty}\n"
+            f"💰 Cost: ₹{cost}\n"
+            f"👛 Balance: ₹{balance}\n\n"
+            f"{'✅ Sufficient balance' if bal_ok else '❌ Insufficient balance — add funds first'}",
+            buttons=[
+                [Button.inline("✅ Confirm", b"smm_confirm"), Button.inline("❌ Cancel", b"smm_cancel")]
+            ]
+        )
         return
 
     # ---- OTHER FLOWS ----
