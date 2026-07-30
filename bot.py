@@ -4,8 +4,6 @@ import tempfile
 import asyncio
 import logging
 import random
-import time
-import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
@@ -35,10 +33,6 @@ PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop").strip()
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50").strip())
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
-
-SMM_API_URL = os.getenv("SMM_API_URL", "").strip()
-SMM_API_KEY = os.getenv("SMM_API_KEY", "").strip()
-SMM_DEFAULT_MARKUP = float(os.getenv("SMM_DEFAULT_MARKUP", "1.2").strip())
 
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
 if LOGS_CHANNEL_ID:
@@ -73,7 +67,6 @@ orders_col = db['orders']
 deposits_col = db['deposits']
 settings_col = db['settings']
 withdrawals_col = db['withdrawals']
-smm_orders_col = db['smm_orders']
 
 # ---------- BOT INSTANCE ----------
 import hashlib
@@ -121,19 +114,6 @@ async def set_min_withdrawal(value: float):
         upsert=True
     )
 
-async def get_smm_markup():
-    setting = await settings_col.find_one({"key": "smm_markup"})
-    if setting:
-        return float(setting.get("value", SMM_DEFAULT_MARKUP))
-    return SMM_DEFAULT_MARKUP
-
-async def set_smm_markup(value: float):
-    await settings_col.update_one(
-        {"key": "smm_markup"},
-        {"$set": {"value": value, "updated_at": datetime.utcnow()}},
-        upsert=True
-    )
-
 # ---------- LOGS CHANNEL HELPER ----------
 async def log_event(text):
     if LOGS_CHANNEL_ID:
@@ -145,124 +125,6 @@ async def log_event(text):
 # ---------- HELPER ----------
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
-
-# ============================================================
-#  SMM PANEL INTEGRATION
-# ============================================================
-
-_smm_all_services: list = []
-_smm_categorized: dict = {}
-_smm_cache_time: float = 0
-
-_usd_inr: float = 95.0
-_usd_fetched: float = 0
-
-SMM_CATS_PER_PAGE = 10
-SMM_SVCS_PER_PAGE = 8
-
-async def fetch_smm_services():
-    """Fetch and cache all services from the SMM panel, grouped by category."""
-    global _smm_all_services, _smm_categorized, _smm_cache_time
-    if not SMM_API_URL or not SMM_API_KEY:
-        return False
-    if time.time() - _smm_cache_time < 3600 and _smm_categorized:
-        return True
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(SMM_API_URL, data={
-                "key": SMM_API_KEY, "action": "services"
-            }) as r:
-                data = await r.json(content_type=None)
-        if not isinstance(data, list):
-            return False
-        _smm_all_services = data
-        _smm_categorized = {}
-        for svc in data:
-            cat = svc.get("category", "Other") or "Other"
-            _smm_categorized.setdefault(cat, []).append(svc)
-        _smm_cache_time = time.time()
-        logging.info(f"SMM: loaded {len(data)} services across {len(_smm_categorized)} categories")
-        return True
-    except Exception as e:
-        logging.error(f"fetch_smm_services error: {e}")
-        return False
-
-async def get_usd_inr() -> float:
-    global _usd_inr, _usd_fetched
-    if time.time() - _usd_fetched < 3600:
-        return _usd_inr
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://open.er-api.com/v6/latest/USD",
-                              timeout=aiohttp.ClientTimeout(total=5)) as r:
-                d = await r.json()
-                if d.get("result") == "success":
-                    _usd_inr = float(d["rates"]["INR"])
-                    _usd_fetched = time.time()
-    except Exception as e:
-        logging.warning(f"USD/INR fetch failed, using {_usd_inr}: {e}")
-    return _usd_inr
-
-async def build_smm_category_page(page: int):
-    cat_keys = list(_smm_categorized.keys())
-    total = len(cat_keys)
-    tp = max(1, (total + SMM_CATS_PER_PAGE - 1) // SMM_CATS_PER_PAGE)
-    page = max(0, min(page, tp - 1))
-    chunk = cat_keys[page * SMM_CATS_PER_PAGE:(page + 1) * SMM_CATS_PER_PAGE]
-
-    buttons = []
-    for cat in chunk:
-        i = cat_keys.index(cat)
-        count = len(_smm_categorized[cat])
-        label = f"{cat[:30]} ({count})"
-        buttons.append([Button.inline(label, f"smm_svc_{i}_0".encode())])
-
-    nav = []
-    if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"smm_cat_{page-1}".encode()))
-    if page < tp - 1:
-        nav.append(Button.inline("Next ➡️", f"smm_cat_{page+1}".encode()))
-    if nav:
-        buttons.append(nav)
-
-    buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
-    buttons.append([Button.inline("📦 My SMM Orders", b"smm_myorders")])
-    buttons.append([Button.inline("🔙 Back", b"main")])
-
-    text = f"🚀 **SMM Services** — Select a category  ({page+1}/{tp})\nTotal categories: {total}"
-    return text, buttons
-
-async def build_smm_service_page(cat_name: str, page: int, usd: float, markup: float):
-    svcs = _smm_categorized[cat_name]
-    total = len(svcs)
-    tp = max(1, (total + SMM_SVCS_PER_PAGE - 1) // SMM_SVCS_PER_PAGE)
-    page = max(0, min(page, tp - 1))
-    chunk = svcs[page * SMM_SVCS_PER_PAGE:(page + 1) * SMM_SVCS_PER_PAGE]
-
-    lines = [f"📋 **{cat_name}**  ({page+1}/{tp})\n"]
-    for svc in chunk:
-        rate = round(float(svc["rate"]) * usd * markup, 4)
-        lines.append(
-            f"🆔 `{svc['service']}`\n"
-            f"📦 {svc['name']}\n"
-            f"💰 ₹{rate}/1k | Min: {svc['min']} Max: {svc['max']}\n"
-        )
-    text = "\n".join(lines)
-
-    cat_keys = list(_smm_categorized.keys())
-    cidx = cat_keys.index(cat_name)
-    buttons = []
-    nav = []
-    if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"smm_svc_{cidx}_{page-1}".encode()))
-    if page < tp - 1:
-        nav.append(Button.inline("Next ➡️", f"smm_svc_{cidx}_{page+1}".encode()))
-    if nav:
-        buttons.append(nav)
-
-    buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order")])
-    buttons.append([Button.inline("🔙 Back to Categories", b"smm_cat_0")])
-    return text, buttons
 
 # ---------- FORCE JOIN ----------
 def parse_chat_id(raw_id: str):
@@ -356,7 +218,6 @@ async def show_welcome_menu(event, user_id):
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
-        [Button.inline("🚀 SMM Services", b"smm_services")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info")]
     if user_id in ADMIN_IDS:
@@ -381,7 +242,6 @@ async def send_main_menu(event):
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
         [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
-        [Button.inline("🚀 SMM Services", b"smm_services")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info")]
     if user_id in ADMIN_IDS:
@@ -847,8 +707,7 @@ async def callback_handler(event):
                     "admin_add_otp", "admin_add_sess", "admin_add_stock",
                     "admin_addbal", "admin_deposits",
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
-                    "admin_transactions", "admin_withdrawals", "my_withdrawals",
-                    "smm_services", "smm_myorders", "admin_smm_markup"):
+                    "admin_transactions", "admin_withdrawals", "my_withdrawals"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -1284,147 +1143,6 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ============================================================
-        #  SMM SERVICES CALLBACKS
-        # ============================================================
-        if data == "smm_services":
-            if not SMM_API_URL or not SMM_API_KEY:
-                await event.answer("❌ SMM panel not configured yet.", alert=True)
-                return
-            ok = await fetch_smm_services()
-            if not ok or not _smm_categorized:
-                await event.edit("❌ Could not load SMM services. Try again later.",
-                                  buttons=[[Button.inline("🔙 Back", b"main")]])
-                await event.answer()
-                return
-            text, btns = await build_smm_category_page(0)
-            await event.edit(text, buttons=btns)
-            await event.answer()
-            return
-
-        if data.startswith("smm_cat_"):
-            page = int(data.split("_")[2])
-            if not _smm_categorized:
-                await fetch_smm_services()
-            text, btns = await build_smm_category_page(page)
-            await event.edit(text, buttons=btns)
-            await event.answer()
-            return
-
-        if data.startswith("smm_svc_"):
-            _, _, cidx, page = data.split("_")
-            cidx, page = int(cidx), int(page)
-            cat_keys = list(_smm_categorized.keys())
-            if cidx >= len(cat_keys):
-                await event.answer("Not found.", alert=True)
-                return
-            usd = await get_usd_inr()
-            markup = await get_smm_markup()
-            text, btns = await build_smm_service_page(cat_keys[cidx], page, usd, markup)
-            await event.edit(text, buttons=btns)
-            await event.answer()
-            return
-
-        if data == "smm_place_order":
-            user_states[user_id] = {"action": "smm_order", "step": "service_id"}
-            await event.edit(
-                "🆔 Enter the **Service ID** you want to order (shown above each service):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]]
-            )
-            await event.answer()
-            return
-
-        if data == "smm_myorders":
-            cursor = smm_orders_col.find({"user_id": user_id}).sort("created_at", -1)
-            orders = await cursor.to_list(length=20)
-            if not orders:
-                txt = "📦 No SMM orders yet."
-            else:
-                lines = []
-                for o in orders:
-                    date_str = o["created_at"].strftime('%d/%m/%Y')
-                    lines.append(
-                        f"🆔 Order `{o.get('smm_order_id', 'N/A')}` | {o.get('service_name', '?')[:25]}\n"
-                        f"💰 ₹{o.get('charge', 0)} | 📦 Qty: {o.get('quantity', 0)} | {date_str}"
-                    )
-                txt = "📦 **My SMM Orders:**\n\n" + "\n\n".join(lines)
-            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"smm_services")]])
-            await event.answer()
-            return
-
-        if data == "smm_confirm_order":
-            state = user_states.get(user_id)
-            if not state or state.get("action") != "smm_order" or state.get("step") != "confirm":
-                await event.answer("No pending order.", alert=True)
-                return
-
-            service = state["service"]
-            link = state["link"]
-            quantity = state["quantity"]
-            charge = state["charge"]
-
-            user = await users_col.find_one({"user_id": user_id})
-            balance = user["balance"] if user else 0
-            if balance < charge:
-                await event.answer("❌ Insufficient balance.", alert=True)
-                user_states.pop(user_id, None)
-                return
-
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(SMM_API_URL, data={
-                        "key": SMM_API_KEY,
-                        "action": "add",
-                        "service": service["service"],
-                        "link": link,
-                        "quantity": quantity,
-                    }) as r:
-                        result = await r.json(content_type=None)
-            except Exception as e:
-                await event.edit(f"❌ Order failed: {e}", buttons=[[Button.inline("🔙 Back", b"smm_services")]])
-                await event.answer()
-                user_states.pop(user_id, None)
-                return
-
-            if not isinstance(result, dict) or "order" not in result:
-                err = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown error"
-                await event.edit(f"❌ SMM panel rejected the order: {err}",
-                                  buttons=[[Button.inline("🔙 Back", b"smm_services")]])
-                await event.answer()
-                user_states.pop(user_id, None)
-                return
-
-            await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": -charge}}, upsert=True)
-            await smm_orders_col.insert_one({
-                "user_id": user_id,
-                "service_id": service["service"],
-                "service_name": service["name"],
-                "link": link,
-                "quantity": quantity,
-                "charge": charge,
-                "smm_order_id": result["order"],
-                "status": "pending",
-                "created_at": datetime.utcnow(),
-            })
-            user_states.pop(user_id, None)
-            await event.edit(
-                f"✅ **Order placed!**\n\n"
-                f"🆔 Order ID: `{result['order']}`\n"
-                f"📦 Service: {service['name']}\n"
-                f"🔗 Link: {link}\n"
-                f"📊 Quantity: {quantity}\n"
-                f"💰 Charged: ₹{charge}",
-                buttons=[[Button.inline("🔙 Back to Menu", b"main")]]
-            )
-            await event.answer()
-            return
-
-        if data == "smm_cancel_order":
-            user_states.pop(user_id, None)
-            await event.edit("❌ Order cancelled.", buttons=[[Button.inline("🔙 Back", b"smm_services")]])
-            await event.answer()
-            return
-
         # ---------- ADMIN PANEL ----------
         if data == "admin":
             if user_id not in ADMIN_IDS:
@@ -1442,7 +1160,6 @@ async def callback_handler(event):
                 [Button.inline("💸 Withdrawal History", b"admin_withdrawals")],
                 [Button.inline("📞 Set Support Link", b"admin_support")],
                 [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw")],
-                [Button.inline("📈 Set SMM Markup", b"admin_smm_markup")],
                 [Button.inline("🔙 Back", b"main")],
             ]
             # Remove None entries (if pyrogram not installed)
@@ -1554,18 +1271,6 @@ async def callback_handler(event):
                 return
             user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
             await event.edit("💸 Send new minimum withdrawal amount:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-            await event.answer()
-            return
-        if data == "admin_smm_markup":
-            if user_id not in ADMIN_IDS:
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            current = await get_smm_markup()
-            user_states[user_id] = {"action": "set_smm_markup", "step": "await_value"}
-            await event.edit(
-                f"📈 Current SMM markup: **{current}x**\n\nSend new markup multiplier (e.g. `1.2` for 20% markup):",
-                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
-            )
             await event.answer()
             return
 
@@ -2234,104 +1939,6 @@ async def handle_message(event):
             await set_min_withdrawal(val)
             await event.respond(f"✅ Min withdrawal ₹{val}.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
             user_states.pop(user_id, None)
-
-    elif action == "set_smm_markup":
-        step = state.get("step")
-        if step == "await_value":
-            try:
-                val = float(event.message.text.strip())
-                if val <= 0:
-                    raise ValueError
-            except:
-                await event.respond("❌ Invalid multiplier. Send a number like `1.2`.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin")]])
-                return
-            await set_smm_markup(val)
-            await event.respond(f"✅ SMM markup set to {val}x.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-            user_states.pop(user_id, None)
-
-    elif action == "smm_order":
-        step = state.get("step")
-
-        if step == "service_id":
-            sid_text = event.message.text.strip()
-            if not sid_text.isdigit():
-                await event.respond("❌ Invalid Service ID. Send numeric ID only.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
-                return
-            sid = int(sid_text)
-            if not _smm_all_services:
-                await fetch_smm_services()
-            service = next((s for s in _smm_all_services if str(s.get("service")) == str(sid)), None)
-            if not service:
-                await event.respond("❌ Service ID not found.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
-                return
-            state["service"] = service
-            state["step"] = "link"
-            await event.respond(
-                f"📦 **{service['name']}**\n"
-                f"Min: {service['min']} | Max: {service['max']}\n\n"
-                "🔗 Now send the **link** (post/profile/video URL) for this order:",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]]
-            )
-            return
-
-        if step == "link":
-            link = event.message.text.strip()
-            if not link.startswith("http"):
-                await event.respond("❌ Please send a valid link starting with http/https.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
-                return
-            state["link"] = link
-            state["step"] = "quantity"
-            service = state["service"]
-            await event.respond(
-                f"📊 Send the **quantity** you want (Min: {service['min']}, Max: {service['max']}):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]]
-            )
-            return
-
-        if step == "quantity":
-            service = state["service"]
-            try:
-                qty = int(event.message.text.strip())
-            except:
-                await event.respond("❌ Invalid quantity. Send a number.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
-                return
-            min_q, max_q = int(float(service["min"])), int(float(service["max"]))
-            if qty < min_q or qty > max_q:
-                await event.respond(f"❌ Quantity must be between {min_q} and {max_q}.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_cat_0")]])
-                return
-
-            usd = await get_usd_inr()
-            markup = await get_smm_markup()
-            charge = round((float(service["rate"]) / 1000) * qty * usd * markup, 2)
-
-            user = await users_col.find_one({"user_id": user_id})
-            balance = user["balance"] if user else 0
-
-            state["quantity"] = qty
-            state["charge"] = charge
-            state["step"] = "confirm"
-
-            text = (
-                f"🧾 **Order Summary**\n\n"
-                f"📦 Service: {service['name']}\n"
-                f"🔗 Link: {state['link']}\n"
-                f"📊 Quantity: {qty}\n"
-                f"💰 Charge: ₹{charge}\n"
-                f"👛 Your balance: ₹{balance}\n\n"
-                + ("✅ Confirm to place the order." if balance >= charge
-                   else "❌ Insufficient balance — please deposit first.")
-            )
-            buttons = [[Button.inline("✅ Confirm Order", b"smm_confirm_order")],
-                       [Button.inline("❌ Cancel", b"smm_cancel_order")]]
-            await event.respond(text, buttons=buttons)
-            return
-
     else:
         await send_main_menu(event)
 
