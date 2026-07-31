@@ -149,10 +149,21 @@ async def set_smm_markup(value: float, member: bool = False):
     )
 
 # ---------- LOGS CHANNEL HELPER ----------
+async def get_display_name(user_id: int) -> str:
+    """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
+    try:
+        entity = await bot.get_entity(user_id)
+        name = entity.first_name or "Unknown"
+        if entity.username:
+            return f"{name} (@{entity.username})"
+        return name
+    except Exception:
+        return str(user_id)
+
 async def log_event(text):
     if LOGS_CHANNEL_ID:
         try:
-            await bot.send_message(LOGS_CHANNEL_ID, text)
+            await bot.send_message(LOGS_CHANNEL_ID, text, parse_mode="markdown")
         except Exception as e:
             logging.error(f"Failed to send log to channel: {e}")
 
@@ -618,7 +629,12 @@ async def broadcast_callback(event):
             else:
                 pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
             await bot.pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
-            await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
+            admin_bc_name = await get_display_name(user_id)
+            await log_event(
+                f"📌 **Broadcast Pinned**\n"
+                f"👤 Admin: {admin_bc_name} (`{user_id}`)\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
         except Exception as e:
             logging.error(f"Failed to pin broadcast in logs channel: {e}")
             await event.respond(f"⚠️ Could not pin in logs channel: {e}")
@@ -879,6 +895,58 @@ async def show_all_transactions(event, user_id, type_filter="all", page=0):
         await event.edit("❌ Error loading transactions.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
 
 
+# ---------- SMM Orders: paginated list (admin) ----------
+SMM_ORDERS_PAGE_SIZE = 15
+
+async def show_all_smm_orders(event, user_id, page=0):
+    """Show all SMM orders placed through the bot, paginated, newest first."""
+    try:
+        total_count = await smm_orders_col.count_documents({})
+        total_pages = max(1, (total_count + SMM_ORDERS_PAGE_SIZE - 1) // SMM_ORDERS_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        skip = page * SMM_ORDERS_PAGE_SIZE
+
+        cursor = smm_orders_col.find({}).sort("created_at", -1).skip(skip).limit(SMM_ORDERS_PAGE_SIZE)
+        orders = await cursor.to_list(length=SMM_ORDERS_PAGE_SIZE)
+
+        if not orders:
+            txt = "🚀 **SMM Order History**\n\nNo SMM orders found."
+        else:
+            status_emoji = {"pending": "🟡", "completed": "🟢", "in progress": "🔵",
+                            "processing": "🔵", "partial": "🟠", "canceled": "🔴", "cancelled": "🔴"}
+            lines = []
+            for o in orders:
+                date_str = o["created_at"].strftime('%d/%m/%Y %H:%M')
+                st = status_emoji.get(str(o.get("status", "")).lower(), "❓")
+                lines.append(
+                    f"{st} User `{o['user_id']}` | {o.get('service_name', '?')[:28]}\n"
+                    f"   Qty: {o.get('quantity', 0)} | ₹{o.get('charge', 0)} | "
+                    f"SMM ID: `{o.get('smm_order_id', 'N/A')}` | {date_str}"
+                )
+            txt = (
+                f"🚀 **SMM Order History** (Total: {total_count} | Page {page+1}/{total_pages})\n\n"
+                + "\n\n".join(lines)
+            )
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(Button.inline("⬅️ Prev", f"admin_smm_orders|{page-1}".encode(), style="primary"))
+        if total_pages > 1:
+            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop", style="primary"))
+        if page < total_pages - 1:
+            nav_row.append(Button.inline("Next ➡️", f"admin_smm_orders|{page+1}".encode(), style="primary"))
+
+        buttons = []
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([Button.inline("🔙 Back", b"admin", style="primary")])
+
+        await event.edit(txt, buttons=buttons)
+    except Exception as e:
+        logging.error(f"Error in show_all_smm_orders: {e}", exc_info=True)
+        await event.edit("❌ Error loading SMM orders.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
+
+
 # ---------- Withdrawals: simple list (latest 50) ----------
 async def show_all_withdrawals(event, user_id):
     """Show all withdrawal requests (latest 50)."""
@@ -939,7 +1007,8 @@ async def callback_handler(event):
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
                     "admin_transactions", "admin_withdrawals", "my_withdrawals",
                     "smm_services", "smm_myorders", "admin_smm_markup", "smm_search",
-                    "admin_smm_markup_default", "admin_smm_markup_member"):
+                    "admin_smm_markup_default", "admin_smm_markup_member", "admin_smm_orders",
+                    "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -977,6 +1046,23 @@ async def callback_handler(event):
                     type_filter, page = "all", 0
 
             await show_all_transactions(event, user_id, type_filter, page)
+            await event.answer()
+            return
+
+        # ---------- ADMIN SMM ORDERS (record/logs view) ----------
+        if data.startswith("admin_smm_orders"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            if data == "admin_smm_orders":
+                page = 0
+            else:
+                try:
+                    _, page_str = data.split("|")
+                    page = int(page_str)
+                except (ValueError, IndexError):
+                    page = 0
+            await show_all_smm_orders(event, user_id, page)
             await event.answer()
             return
 
@@ -1381,7 +1467,15 @@ async def callback_handler(event):
                     )
                 except:
                     pass
-            await log_event(f"🛒 Purchase: {phone} by {user_id}")
+            await log_event(
+                f"🛒 **New Account Purchase**\n"
+                f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
+                f"📱 Phone: `{phone}`\n"
+                f"🌍 Country: {country}\n"
+                f"💰 Price: ₹{price}\n"
+                f"👛 Balance After: ₹{new_balance}\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
             await event.answer("✅ Purchase successful!", alert=True)
             return
 
@@ -1607,6 +1701,14 @@ async def callback_handler(event):
             except Exception as e:
                 await event.edit(f"❌ Order failed: {e}", buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
+                fail_name = await get_display_name(user_id)
+                await log_event(
+                    f"❌ **SMM Order Failed (API Error)**\n"
+                    f"👤 User: {fail_name} (`{user_id}`)\n"
+                    f"📦 Service: {service['name']} (`{service['service']}`)\n"
+                    f"⚠️ Error: {e}\n"
+                    f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                )
                 user_states.pop(user_id, None)
                 return
 
@@ -1615,6 +1717,14 @@ async def callback_handler(event):
                 await event.edit(f"❌ SMM panel rejected the order: {err}",
                                   buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
+                fail_name = await get_display_name(user_id)
+                await log_event(
+                    f"❌ **SMM Order Rejected (Panel Error)**\n"
+                    f"👤 User: {fail_name} (`{user_id}`)\n"
+                    f"📦 Service: {service['name']} (`{service['service']}`)\n"
+                    f"⚠️ Panel Error: {err}\n"
+                    f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                )
                 user_states.pop(user_id, None)
                 return
 
@@ -1623,6 +1733,7 @@ async def callback_handler(event):
                 "user_id": user_id,
                 "service_id": service["service"],
                 "service_name": service["name"],
+                "category": service.get("category", "Other"),
                 "link": link,
                 "quantity": quantity,
                 "charge": charge,
@@ -1631,6 +1742,21 @@ async def callback_handler(event):
                 "created_at": datetime.utcnow(),
             })
             user_states.pop(user_id, None)
+
+            smm_buyer_name = await get_display_name(user_id)
+            updated_user = await users_col.find_one({"user_id": user_id})
+            new_bal = updated_user["balance"] if updated_user else 0
+            await log_event(
+                f"🚀 **New SMM Order**\n"
+                f"👤 User: {smm_buyer_name} (`{user_id}`)\n"
+                f"🆔 SMM Order ID: `{result['order']}`\n"
+                f"📦 Service: {service['name']} (`{service['service']}`)\n"
+                f"🗂️ Category: {service.get('category', 'Other')}\n"
+                f"🔗 Link: {link}\n"
+                f"📊 Quantity: {quantity}\n"
+                f"💰 Charged: ₹{charge} | 👛 Balance After: ₹{new_bal}\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
             await event.edit(
                 f"✅ **Order placed!**\n\n"
                 f"🆔 Order ID: `{result['order']}`\n"
@@ -1655,23 +1781,70 @@ async def callback_handler(event):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
+                [Button.inline("📦 Accounts & Stock", b"admin_cat_accounts", style="primary")],
+                [Button.inline("💰 Finance & Transactions", b"admin_cat_finance", style="primary")],
+                [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="primary")],
+                [Button.inline("⚙️ Bot Settings", b"admin_cat_settings", style="primary")],
+                [Button.inline("🔙 Back", b"main", style="primary")],
+            ]
+            await event.edit("⚙️ **Admin Panel**\n\nChoose a category:", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_accounts":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
                 [Button.inline("➕ Add Account (OTP)", b"admin_add_otp", style="success")],
                 [Button.inline("📥 Add Account (Session)", b"admin_add_sess", style="success")],
                 [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock", style="success")],
                 [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("📦 **Accounts & Stock**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_finance":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
                 [Button.inline("💰 Add Balance", b"admin_addbal", style="success")],
                 [Button.inline("💲 Set Price", b"admin_setprice", style="primary")],
                 [Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")],
                 [Button.inline("📜 Transaction History", b"admin_transactions", style="primary")],
                 [Button.inline("📜 Withdrawal History", b"admin_withdrawals", style="primary")],
-                [Button.inline("📞 Set Support Link", b"admin_support", style="primary")],
                 [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw", style="primary")],
-                [Button.inline("📈 Set SMM Markup", b"admin_smm_markup", style="primary")],
-                [Button.inline("🔙 Back", b"main", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
-            # Remove None entries (if pyrogram not installed)
-            btns = [btn for btn in btns if btn is not None]
-            await event.edit("⚙️ **Admin Panel**", buttons=btns)
+            await event.edit("💰 **Finance & Transactions**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_smm":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("🚀 SMM Order History", b"admin_smm_orders", style="primary")],
+                [Button.inline("📈 Set SMM Markup", b"admin_smm_markup", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("🚀 **SMM Panel**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_settings":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("📞 Set Support Link", b"admin_support", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("⚙️ **Bot Settings**", buttons=btns)
             await event.answer()
             return
 
@@ -2257,7 +2430,15 @@ async def process_add_stock_step(event):
             summary += f"\n...and {len(fail_reasons) - 10} more."
 
     await event.respond(summary, buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
-    await log_event(f"📦 Stock added by {user_id}: {added} accounts ({country} @ ₹{price})")
+    admin_name = await get_display_name(user_id)
+    await log_event(
+        f"📦 **Stock Added**\n"
+        f"👤 Admin: {admin_name} (`{user_id}`)\n"
+        f"🌍 Country: {country}\n"
+        f"💰 Price: ₹{price} {'| 2FA set' if twofa else '| no 2FA'}\n"
+        f"➕ Added: {added} | ♻️ Duplicates: {duplicates} | ❌ Failed: {failed}\n"
+        f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+    )
     user_states.pop(user_id, None)
 
 
@@ -2329,7 +2510,15 @@ async def process_deposit_step(event):
                 pass
         await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"main", style="primary")]])
         user_states.pop(user_id, None)
-        await log_event(f"💳 Deposit request: {user_id} ₹{amount} Txn:{txn_id}")
+        dep_name = await get_display_name(user_id)
+        await log_event(
+            f"💳 **Deposit Request**\n"
+            f"👤 User: {dep_name} (`{user_id}`)\n"
+            f"💰 Amount: ₹{amount}\n"
+            f"🧾 Txn ID: `{txn_id}`\n"
+            f"🆔 Deposit ID: `{dep_id}`\n"
+            f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+        )
 
 
 # ============================================================
@@ -2433,7 +2622,15 @@ async def handle_message(event):
                 except:
                     pass
             await event.respond(f"✅ Withdrawal of ₹{amount} submitted.", buttons=[[Button.inline("🔙 Referral Info", b"referral_info", style="primary")]])
-            await log_event(f"💸 Withdrawal request: {user_id} ₹{amount} UPI:{upi}")
+            wd_name = await get_display_name(user_id)
+            await log_event(
+                f"💸 **Withdrawal Request**\n"
+                f"👤 User: {wd_name} (`{user_id}`)\n"
+                f"💰 Amount: ₹{amount}\n"
+                f"🏦 UPI: `{upi}`\n"
+                f"🆔 Withdrawal ID: `{w_id}`\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
             user_states.pop(user_id, None)
     elif action == "set_support_link":
         step = state.get("step")
