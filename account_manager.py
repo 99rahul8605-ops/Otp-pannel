@@ -6,13 +6,14 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests):
+    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
         self.api_hash = api_hash
         self.clients = {}
         self.pending_requests = pending_requests
+        self.admin_ids = admin_ids or []
 
     async def add_client(self, phone, session_str):
         if phone in self.clients:
@@ -42,10 +43,22 @@ class AccountManager:
             try:
                 await self.accounts_col.update_one(
                     {"phone": phone},
-                    {"$set": {"status": "invalid_session"}}
+                    {"$set": {"status": "inactive"}}
                 )
             except Exception as e:
-                logging.error(f"Could not flag {phone} as invalid_session: {e}")
+                logging.error(f"Could not flag {phone} as inactive: {e}")
+
+            for admin in self.admin_ids:
+                try:
+                    await self.bot.send_message(
+                        admin,
+                        f"⚠️ **Invalid Stock Detected on Startup!**\n"
+                        f"📱 Phone: `{phone}`\n"
+                        f"❌ Session is invalid/expired (logged out or revoked).\n"
+                        f"🔄 Status: Marked as `inactive` in DB — replace this account's session."
+                    )
+                except Exception:
+                    pass
             return False
 
         self.clients[phone] = client

@@ -2536,7 +2536,7 @@ async def main():
         sys.exit(1)
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, ADMIN_IDS)
     await acc_mgr.load_all()
     logging.info("🚀 Bot started successfully...")
     await bot.run_until_disconnected()
