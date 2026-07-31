@@ -128,6 +128,30 @@ class AccountManager:
         except Exception as e:
             return False, str(e)
 
+    async def terminate_own_session(self, phone):
+        """Log out the BOT'S OWN session for this account. Telegram does not allow
+        terminating your own current session via ResetAuthorizationRequest (it only
+        works on other devices' sessions) — the correct call is auth.LogOut, which
+        Telethon exposes as client.log_out(). This revokes the session and
+        disconnects, so OTP monitoring for this number stops permanently."""
+        client = self.clients.get(phone)
+        if not client:
+            return False, "No active connection for this number."
+        try:
+            await client.log_out()
+        except Exception as e:
+            return False, str(e)
+        finally:
+            self.clients.pop(phone, None)
+        try:
+            await self.accounts_col.update_one(
+                {"phone": phone},
+                {"$set": {"status": "logged_out"}}
+            )
+        except Exception as e:
+            logging.error(f"Could not flag {phone} as logged_out: {e}")
+        return True, "Bot's session logged out."
+
     async def logout_client(self, phone):
         """Terminate the Telethon client for this phone number."""
         if phone in self.clients:

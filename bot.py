@@ -1086,12 +1086,7 @@ async def callback_handler(event):
 
         if data.startswith("termcurrok_"):
             _, phone, hash_str = data.split("_", 2)
-            try:
-                hash_id = int(hash_str)
-            except ValueError:
-                await event.answer("❌ Invalid session.", alert=True)
-                return
-            ok, msg = await acc_mgr.terminate_session(phone, hash_id)
+            ok, msg = await acc_mgr.terminate_own_session(phone)
             if ok:
                 await event.answer("✅ Bot's session terminated. OTP delivery stopped.", alert=True)
                 try:
