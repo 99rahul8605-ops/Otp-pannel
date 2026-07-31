@@ -1007,16 +1007,60 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- LOGOUT ----------
-        if data.startswith("logout_"):
-            phone = data[len("logout_"):]
-            await acc_mgr.logout_client(phone)
-            await event.answer("🔒 Session terminated.", alert=True)
+        # ---------- MANAGE SESSIONS ----------
+        async def render_sessions(phone):
+            auths = await acc_mgr.get_authorizations(phone)
+            if auths is None:
+                return (f"❌ Could not fetch sessions for `{phone}`. "
+                        f"The account's monitoring client may be offline.", None)
+            if not auths:
+                return f"📱 No active sessions found for `{phone}`.", [
+                    [Button.inline("🔙 Close", b"close_sessions", style="primary")]
+                ]
+
+            lines = [f"📱 **Active Sessions — ** `{phone}`\n"]
+            buttons = []
+            for a in auths:
+                date_str = a.date_active.strftime('%d/%m/%Y %H:%M') if a.date_active else "N/A"
+                tag = " ⭐ *(this session)*" if a.current else ""
+                lines.append(
+                    f"{'⭐' if a.current else '📟'} **{a.device_model or 'Unknown device'}**{tag}\n"
+                    f"   App: {a.app_name} {a.app_version}\n"
+                    f"   Platform: {a.platform} {a.system_version}\n"
+                    f"   Last active: {date_str}\n"
+                    f"   IP: {a.ip} ({a.country})\n"
+                )
+                if not a.current:
+                    label = f"❌ Terminate: {(a.device_model or 'device')[:20]}"
+                    buttons.append([Button.inline(label, f"termsess_{phone}_{a.hash}", style="danger")])
+
+            buttons.append([Button.inline("🔄 Refresh", f"sessions_{phone}", style="primary")])
+            buttons.append([Button.inline("🔙 Close", b"close_sessions", style="primary")])
+            return "\n".join(lines), buttons
+
+        if data.startswith("sessions_"):
+            phone = data[len("sessions_"):]
+            text, buttons = await render_sessions(phone)
+            await event.edit(text, buttons=buttons)
+            await event.answer()
+            return
+
+        if data.startswith("termsess_"):
+            _, phone, hash_str = data.split("_", 2)
             try:
-                original_text = event.message.text if event.message else ""
-                await event.edit(original_text + "\n\n🔒 *Session terminated.*", buttons=None)
-            except:
-                pass
+                hash_id = int(hash_str)
+            except ValueError:
+                await event.answer("❌ Invalid session.", alert=True)
+                return
+            ok, msg = await acc_mgr.terminate_session(phone, hash_id)
+            await event.answer(("✅ " if ok else "❌ ") + msg, alert=True)
+            text, buttons = await render_sessions(phone)
+            await event.edit(text, buttons=buttons)
+            return
+
+        if data == "close_sessions":
+            await event.delete()
+            await event.answer()
             return
 
         # ---------- REFERRAL INFO ----------

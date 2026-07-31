@@ -1,6 +1,6 @@
 import re
 import logging
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, functions
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO)
@@ -89,7 +89,7 @@ class AccountManager:
                     # 🔥 Both buttons: Request New OTP & Logout from Bot
                     buttons = [[
                         Button.inline("🔄 Request New OTP", f"resend_{phone}"),
-                        Button.inline("🔓 Logout from Bot", f"logout_{phone}")
+                        Button.inline("📱 Manage Sessions", f"sessions_{phone}")
                     ]]
 
                     try:
@@ -103,6 +103,30 @@ class AccountManager:
                         logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
 
         logging.info(f"✅ Client started for {phone}")
+
+    async def get_authorizations(self, phone):
+        """Fetch the list of active device sessions (Authorization objects) for this account."""
+        client = self.clients.get(phone)
+        if not client:
+            return None
+        try:
+            result = await client(functions.account.GetAuthorizationsRequest())
+            return result.authorizations
+        except Exception as e:
+            logging.error(f"Failed to get authorizations for {phone}: {e}")
+            return None
+
+    async def terminate_session(self, phone, hash_id):
+        """Terminate a single device session (by its hash) on the account, keeping the
+        current session (the one this bot uses for OTP monitoring) intact."""
+        client = self.clients.get(phone)
+        if not client:
+            return False, "No active connection for this number."
+        try:
+            await client(functions.account.ResetAuthorizationRequest(hash=hash_id))
+            return True, "Session terminated."
+        except Exception as e:
+            return False, str(e)
 
     async def logout_client(self, phone):
         """Terminate the Telethon client for this phone number."""
