@@ -16,7 +16,8 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    AccessTokenInvalidError
+    AccessTokenInvalidError,
+    MessageNotModifiedError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -1049,7 +1050,10 @@ async def callback_handler(event):
         if data.startswith("sessions_"):
             phone = data[len("sessions_"):]
             text, buttons = await render_sessions(phone)
-            await event.edit(text, buttons=buttons)
+            try:
+                await event.edit(text, buttons=buttons)
+            except MessageNotModifiedError:
+                pass
             await event.answer()
             return
 
@@ -1057,26 +1061,27 @@ async def callback_handler(event):
         if data.startswith("termcurr_"):
             _, phone, hash_str = data.split("_", 2)
             await event.answer(
-                "⚠️ WARNING: This is the session THIS BOT uses to read your OTPs.\n\n"
-                "If you terminate it, you will STOP receiving further OTPs on this "
-                "number, and you will lose the ability to manage sessions here — "
-                "the bot will no longer be connected to this account at all.",
+                "⚠️ This is the bot's own OTP session! Terminating it stops "
+                "further OTPs and disables session management here.",
                 alert=True
             )
             confirm_buttons = [
                 [Button.inline("⚠️ Yes, Terminate Anyway", f"termcurrok_{phone}_{hash_str}", style="danger")],
                 [Button.inline("❌ Cancel", f"sessions_{phone}", style="primary")],
             ]
-            await event.edit(
+            new_text = (
                 f"⚠️ **Are you sure?**\n\n"
                 f"This is the **bot's own session** for `{phone}` — the one used to "
                 f"forward OTPs to you.\n\n"
                 f"❌ Terminating it means:\n"
                 f"• You will **not receive any further OTPs** on this number.\n"
                 f"• You will **not be able to manage sessions** here anymore.\n\n"
-                f"This action cannot be undone from this bot. Proceed?",
-                buttons=confirm_buttons
+                f"This action cannot be undone from this bot. Proceed?"
             )
+            try:
+                await event.edit(new_text, buttons=confirm_buttons)
+            except MessageNotModifiedError:
+                pass
             return
 
         if data.startswith("termcurrok_"):
@@ -1088,15 +1093,18 @@ async def callback_handler(event):
                 return
             ok, msg = await acc_mgr.terminate_session(phone, hash_id)
             if ok:
-                await event.answer("✅ Bot's session terminated. OTP delivery has stopped for this number.", alert=True)
-                await event.edit(
-                    f"🔒 **Bot's session for** `{phone}` **has been terminated.**\n\n"
-                    f"You will no longer receive OTPs on this number through this bot, "
-                    f"and session management is no longer available here.",
-                    buttons=None
-                )
+                await event.answer("✅ Bot's session terminated. OTP delivery stopped.", alert=True)
+                try:
+                    await event.edit(
+                        f"🔒 **Bot's session for** `{phone}` **has been terminated.**\n\n"
+                        f"You will no longer receive OTPs on this number through this bot, "
+                        f"and session management is no longer available here.",
+                        buttons=None
+                    )
+                except MessageNotModifiedError:
+                    pass
             else:
-                await event.answer(f"❌ {msg}", alert=True)
+                await event.answer((f"❌ {msg}")[:200], alert=True)
             return
 
         if data.startswith("termsess_"):
@@ -1107,13 +1115,19 @@ async def callback_handler(event):
                 await event.answer("❌ Invalid session.", alert=True)
                 return
             ok, msg = await acc_mgr.terminate_session(phone, hash_id)
-            await event.answer(("✅ " if ok else "❌ ") + msg, alert=True)
+            await event.answer((("✅ " if ok else "❌ ") + msg)[:200], alert=True)
             text, buttons = await render_sessions(phone)
-            await event.edit(text, buttons=buttons)
+            try:
+                await event.edit(text, buttons=buttons)
+            except MessageNotModifiedError:
+                pass
             return
 
         if data == "close_sessions":
-            await event.delete()
+            try:
+                await event.delete()
+            except Exception:
+                pass
             await event.answer()
             return
 
