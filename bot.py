@@ -1109,6 +1109,24 @@ async def callback_handler(event):
 
         if data.startswith("termsess_"):
             _, phone, hash_str = data.split("_", 2)
+            confirm_buttons = [
+                [Button.inline("✅ Yes, Terminate", f"termsessok_{phone}_{hash_str}", style="danger")],
+                [Button.inline("❌ Cancel", f"sessions_{phone}", style="primary")],
+            ]
+            new_text = (
+                f"⚠️ **Terminate this session?**\n\n"
+                f"This device will be logged out of `{phone}` immediately.\n"
+                f"This action cannot be undone. Proceed?"
+            )
+            try:
+                await event.edit(new_text, buttons=confirm_buttons)
+            except MessageNotModifiedError:
+                pass
+            await event.answer()
+            return
+
+        if data.startswith("termsessok_"):
+            _, phone, hash_str = data.split("_", 2)
             try:
                 hash_id = int(hash_str)
             except ValueError:
