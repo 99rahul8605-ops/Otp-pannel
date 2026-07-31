@@ -1022,7 +1022,7 @@ async def callback_handler(event):
             buttons = []
             for a in auths:
                 date_str = a.date_active.strftime('%d/%m/%Y %H:%M') if a.date_active else "N/A"
-                tag = " ⭐ *(this session)*" if a.current else ""
+                tag = " ⭐ *(bot's session — used for OTP delivery)*" if a.current else ""
                 lines.append(
                     f"{'⭐' if a.current else '📟'} **{a.device_model or 'Unknown device'}**{tag}\n"
                     f"   App: {a.app_name} {a.app_version}\n"
@@ -1030,9 +1030,17 @@ async def callback_handler(event):
                     f"   Last active: {date_str}\n"
                     f"   IP: {a.ip} ({a.country})\n"
                 )
-                if not a.current:
-                    label = f"❌ Terminate: {(a.device_model or 'device')[:20]}"
-                    buttons.append([Button.inline(label, f"termsess_{phone}_{a.hash}", style="danger")])
+                device_label = (a.device_model or 'device')[:20]
+                if a.current:
+                    buttons.append([Button.inline(
+                        f"⚠️ Terminate Bot's Session",
+                        f"termcurr_{phone}_{a.hash}", style="danger"
+                    )])
+                else:
+                    buttons.append([Button.inline(
+                        f"❌ Terminate: {device_label}",
+                        f"termsess_{phone}_{a.hash}", style="danger"
+                    )])
 
             buttons.append([Button.inline("🔄 Refresh", f"sessions_{phone}", style="primary")])
             buttons.append([Button.inline("🔙 Close", b"close_sessions", style="primary")])
@@ -1043,6 +1051,52 @@ async def callback_handler(event):
             text, buttons = await render_sessions(phone)
             await event.edit(text, buttons=buttons)
             await event.answer()
+            return
+
+        # Terminating the BOT'S OWN session requires an explicit warning + confirmation
+        if data.startswith("termcurr_"):
+            _, phone, hash_str = data.split("_", 2)
+            await event.answer(
+                "⚠️ WARNING: This is the session THIS BOT uses to read your OTPs.\n\n"
+                "If you terminate it, you will STOP receiving further OTPs on this "
+                "number, and you will lose the ability to manage sessions here — "
+                "the bot will no longer be connected to this account at all.",
+                alert=True
+            )
+            confirm_buttons = [
+                [Button.inline("⚠️ Yes, Terminate Anyway", f"termcurrok_{phone}_{hash_str}", style="danger")],
+                [Button.inline("❌ Cancel", f"sessions_{phone}", style="primary")],
+            ]
+            await event.edit(
+                f"⚠️ **Are you sure?**\n\n"
+                f"This is the **bot's own session** for `{phone}` — the one used to "
+                f"forward OTPs to you.\n\n"
+                f"❌ Terminating it means:\n"
+                f"• You will **not receive any further OTPs** on this number.\n"
+                f"• You will **not be able to manage sessions** here anymore.\n\n"
+                f"This action cannot be undone from this bot. Proceed?",
+                buttons=confirm_buttons
+            )
+            return
+
+        if data.startswith("termcurrok_"):
+            _, phone, hash_str = data.split("_", 2)
+            try:
+                hash_id = int(hash_str)
+            except ValueError:
+                await event.answer("❌ Invalid session.", alert=True)
+                return
+            ok, msg = await acc_mgr.terminate_session(phone, hash_id)
+            if ok:
+                await event.answer("✅ Bot's session terminated. OTP delivery has stopped for this number.", alert=True)
+                await event.edit(
+                    f"🔒 **Bot's session for** `{phone}` **has been terminated.**\n\n"
+                    f"You will no longer receive OTPs on this number through this bot, "
+                    f"and session management is no longer available here.",
+                    buttons=None
+                )
+            else:
+                await event.answer(f"❌ {msg}", alert=True)
             return
 
         if data.startswith("termsess_"):
