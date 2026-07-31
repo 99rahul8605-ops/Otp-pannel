@@ -18,7 +18,36 @@ class AccountManager:
         if phone in self.clients:
             await self.remove_client(phone)
         client = TelegramClient(StringSession(session_str), self.api_id, self.api_hash)
-        await client.start()
+
+        try:
+            await client.connect()
+        except Exception as e:
+            logging.error(f"❌ Could not connect client for {phone}: {e}")
+            return False
+
+        try:
+            authorized = await client.is_user_authorized()
+        except Exception as e:
+            logging.error(f"❌ Could not check authorization for {phone}: {e}")
+            await client.disconnect()
+            return False
+
+        if not authorized:
+            # Session is expired/invalid/logged-out. Never call client.start()
+            # here without credentials — Telethon falls back to an interactive
+            # input() prompt for phone/bot_token, which hangs a headless server.
+            logging.error(f"❌ Session for {phone} is invalid/expired — skipping this account. "
+                           f"Re-add it with a fresh session string.")
+            await client.disconnect()
+            try:
+                await self.accounts_col.update_one(
+                    {"phone": phone},
+                    {"$set": {"status": "invalid_session"}}
+                )
+            except Exception as e:
+                logging.error(f"Could not flag {phone} as invalid_session: {e}")
+            return False
+
         self.clients[phone] = client
 
         @client.on(events.NewMessage(from_users=777000))
@@ -83,4 +112,7 @@ class AccountManager:
 
     async def load_all(self):
         async for acc in self.accounts_col.find({"status": "available"}):
-            await self.add_client(acc["phone"], acc["session_string"])
+            try:
+                await self.add_client(acc["phone"], acc["session_string"])
+            except Exception as e:
+                logging.error(f"❌ Unexpected error loading account {acc.get('phone')}: {e}")
