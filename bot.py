@@ -1978,7 +1978,8 @@ async def callback_handler(event):
             )
             # referral bonus logic (simplified)
             admin_name = await get_display_name(user_id)
-            original_caption = event.message.text or event.message.message or ""
+            orig_msg = await event.get_message()
+            original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
             new_caption = (
                 original_caption
                 + f"\n\n✅ **APPROVED** by {admin_name}\n"
@@ -1988,6 +1989,8 @@ async def callback_handler(event):
                 await event.edit(new_caption, buttons=None)
             except MessageNotModifiedError:
                 pass
+            except Exception as e:
+                logging.error(f"Could not edit approve message: {e}")
             try:
                 await bot.send_message(
                     user_id_dep,
@@ -2005,7 +2008,8 @@ async def callback_handler(event):
                 return
             await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "rejected"}})
             admin_name = await get_display_name(user_id)
-            original_caption = event.message.text or event.message.message or ""
+            orig_msg = await event.get_message()
+            original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
             new_caption = (
                 original_caption
                 + f"\n\n❌ **REJECTED** by {admin_name}\n"
@@ -2015,6 +2019,8 @@ async def callback_handler(event):
                 await event.edit(new_caption, buttons=None)
             except MessageNotModifiedError:
                 pass
+            except Exception as e:
+                logging.error(f"Could not edit reject message: {e}")
             try:
                 await bot.send_message(
                     deposit["user_id"],
@@ -2559,7 +2565,7 @@ async def process_deposit_step(event):
         txn_id = f"DEP{datetime.now().strftime('%y%m%d%H%M')}{random.randint(1000,9999)}"
         state["txn_id"] = txn_id
 
-        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=ref{user_id}"
+        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn={txn_id}"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -2568,8 +2574,7 @@ async def process_deposit_step(event):
         caption = (
             f"💳 **Deposit ₹{amount}**\n"
             f"🔑 **Txn ID:** `{txn_id}`\n\n"
-            f"📌 **Mention this Txn ID in payment note.**\n"
-            f"🆔 **Your Referral/Payment ID:** `ref{user_id}`\n\n"
+            f"📌 **Mention this Txn ID in payment note.**\n\n"
             f"Scan QR or use UPI: `{UPI_ID}`\n\n"
             "Send screenshot after payment."
         )
