@@ -7,7 +7,14 @@ import logging
 import random
 import time
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist():
+    """Current time in IST, returned as a naive datetime so it stays
+    comparable/sortable with existing datetime fields already in MongoDB."""
+    return datetime.now(IST).replace(tzinfo=None)
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
 from telethon.sessions import StringSession
@@ -107,7 +114,7 @@ async def get_support_link():
 async def set_support_link(link: str):
     await settings_col.update_one(
         {"key": "support_link"},
-        {"$set": {"value": link, "updated_at": datetime.utcnow()}},
+        {"$set": {"value": link, "updated_at": now_ist()}},
         upsert=True
     )
 
@@ -120,7 +127,7 @@ async def get_min_withdrawal():
 async def set_min_withdrawal(value: float):
     await settings_col.update_one(
         {"key": "min_withdrawal"},
-        {"$set": {"value": value, "updated_at": datetime.utcnow()}},
+        {"$set": {"value": value, "updated_at": now_ist()}},
         upsert=True
     )
 
@@ -144,7 +151,7 @@ async def set_smm_markup(value: float, member: bool = False):
     key = "smm_markup_member" if member else "smm_markup_default"
     await settings_col.update_one(
         {"key": key},
-        {"$set": {"value": value, "updated_at": datetime.utcnow()}},
+        {"$set": {"value": value, "updated_at": now_ist()}},
         upsert=True
     )
 
@@ -633,7 +640,7 @@ async def broadcast_callback(event):
             await log_event(
                 f"📌 **Broadcast Pinned**\n"
                 f"👤 Admin: {admin_bc_name} (`{user_id}`)\n"
-                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
         except Exception as e:
             logging.error(f"Failed to pin broadcast in logs channel: {e}")
@@ -1415,7 +1422,7 @@ async def callback_handler(event):
             for acc in accounts:
                 updated = await accounts_col.find_one_and_update(
                     {"_id": acc["_id"], "status": "available"},
-                    {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": datetime.utcnow()}}
+                    {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": now_ist()}}
                 )
                 if updated is None:
                     continue
@@ -1472,7 +1479,7 @@ async def callback_handler(event):
                 "country": country,
                 "amount": price,
                 "status": "completed",
-                "created_at": datetime.utcnow()
+                "created_at": now_ist()
             })
 
             success_text = f"✅ **Purchase successful!**\n📱 Your number: `{phone}`\n"
@@ -1518,7 +1525,7 @@ async def callback_handler(event):
                 f"🌍 Country: {country}\n"
                 f"💰 Price: ₹{price}\n"
                 f"👛 Balance After: ₹{new_balance}\n"
-                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             await event.answer("✅ Purchase successful!", alert=True)
             return
@@ -1768,7 +1775,7 @@ async def callback_handler(event):
                     f"👤 User: {fail_name} (`{user_id}`)\n"
                     f"📦 Service: {service['name']} (`{service['service']}`)\n"
                     f"⚠️ Error: {e}\n"
-                    f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                    f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
                 )
                 user_states.pop(user_id, None)
                 return
@@ -1784,7 +1791,7 @@ async def callback_handler(event):
                     f"👤 User: {fail_name} (`{user_id}`)\n"
                     f"📦 Service: {service['name']} (`{service['service']}`)\n"
                     f"⚠️ Panel Error: {err}\n"
-                    f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                    f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
                 )
                 user_states.pop(user_id, None)
                 return
@@ -1800,7 +1807,7 @@ async def callback_handler(event):
                 "charge": charge,
                 "smm_order_id": result["order"],
                 "status": "pending",
-                "created_at": datetime.utcnow(),
+                "created_at": now_ist(),
             })
             user_states.pop(user_id, None)
 
@@ -1816,7 +1823,7 @@ async def callback_handler(event):
                 f"🔗 Link: {link}\n"
                 f"📊 Quantity: {quantity}\n"
                 f"💰 Charged: ₹{charge} | 👛 Balance After: ₹{new_bal}\n"
-                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             await event.edit(
                 f"✅ **Order placed!**\n\n"
@@ -1983,7 +1990,7 @@ async def callback_handler(event):
             new_caption = (
                 original_caption
                 + f"\n\n✅ **APPROVED** by {admin_name}\n"
-                + f"🕐 {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                + f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             try:
                 await event.edit(new_caption, buttons=None)
@@ -2013,7 +2020,7 @@ async def callback_handler(event):
             new_caption = (
                 original_caption
                 + f"\n\n❌ **REJECTED** by {admin_name}\n"
-                + f"🕐 {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                + f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             try:
                 await event.edit(new_caption, buttons=None)
@@ -2131,7 +2138,7 @@ async def callback_handler(event):
                 )
                 await withdrawals_col.update_one(
                     {"_id": ObjectId(w_id)},
-                    {"$set": {"status": "approved", "processed_at": datetime.utcnow()}}
+                    {"$set": {"status": "approved", "processed_at": now_ist()}}
                 )
                 try:
                     await bot.send_message(withdrawal["user_id"], f"✅ Withdrawal of ₹{withdrawal['amount']} approved.")
@@ -2141,7 +2148,7 @@ async def callback_handler(event):
             else:
                 await withdrawals_col.update_one(
                     {"_id": ObjectId(w_id)},
-                    {"$set": {"status": "rejected", "processed_at": datetime.utcnow()}}
+                    {"$set": {"status": "rejected", "processed_at": now_ist()}}
                 )
                 try:
                     await bot.send_message(withdrawal["user_id"], f"❌ Withdrawal of ₹{withdrawal['amount']} rejected.")
@@ -2538,7 +2545,7 @@ async def process_add_stock_step(event):
         f"🌍 Country: {country}\n"
         f"💰 Price: ₹{price} {'| 2FA set' if twofa else '| no 2FA'}\n"
         f"➕ Added: {added} | ♻️ Duplicates: {duplicates} | ❌ Failed: {failed}\n"
-        f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+        f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
     )
     user_states.pop(user_id, None)
 
@@ -2592,7 +2599,7 @@ async def process_deposit_step(event):
             "txn_id": txn_id,
             "proof_type": "screenshot",
             "status": "pending",
-            "created_at": datetime.utcnow()
+            "created_at": now_ist()
         })
         dep_id = result.inserted_id
         photo_bytes = await event.message.download_media(file=bytes)
@@ -2618,7 +2625,7 @@ async def process_deposit_step(event):
             f"💰 Amount: ₹{amount}\n"
             f"🧾 Txn ID: `{txn_id}`\n"
             f"🆔 Deposit ID: `{dep_id}`\n"
-            f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
         )
 
 
@@ -2668,7 +2675,7 @@ async def handle_message(event):
             uid = state["uid"]
             await users_col.update_one(
                 {"user_id": uid},
-                {"$inc": {"balance": amt}, "$setOnInsert": {"joined_at": datetime.utcnow()}},
+                {"$inc": {"balance": amt}, "$setOnInsert": {"joined_at": now_ist()}},
                 upsert=True
             )
             await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
@@ -2708,7 +2715,7 @@ async def handle_message(event):
                 "amount": amount,
                 "upi_id": upi,
                 "status": "pending",
-                "created_at": datetime.utcnow()
+                "created_at": now_ist()
             })
             w_id = result.inserted_id
             for admin in ADMIN_IDS:
@@ -2730,7 +2737,7 @@ async def handle_message(event):
                 f"💰 Amount: ₹{amount}\n"
                 f"🏦 UPI: `{upi}`\n"
                 f"🆔 Withdrawal ID: `{w_id}`\n"
-                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             user_states.pop(user_id, None)
     elif action == "set_support_link":
@@ -2756,7 +2763,7 @@ async def handle_message(event):
                 return
             await settings_col.update_one(
                 {"key": "default_price"},
-                {"$set": {"value": new_price, "updated_at": datetime.utcnow()}},
+                {"$set": {"value": new_price, "updated_at": now_ist()}},
                 upsert=True
             )
             global DEFAULT_PRICE
@@ -2911,7 +2918,7 @@ async def start_cmd(event):
         await users_col.insert_one({
             "user_id": user_id,
             "balance": 0,
-            "joined_at": datetime.utcnow(),
+            "joined_at": now_ist(),
             "referred_by": referrer_id,
             "referral_bonus_paid": False,
             "withdrawable_balance": 0
