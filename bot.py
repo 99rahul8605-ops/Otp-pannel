@@ -1,10 +1,11 @@
 import os
+import sys
 import io
-import time
 import tempfile
 import asyncio
 import logging
 import random
+import time
 import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
@@ -15,7 +16,8 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     ChannelPrivateError,
-    AccessTokenInvalidError
+    AccessTokenInvalidError,
+    MessageNotModifiedError
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -38,7 +40,8 @@ MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
 
 SMM_API_URL = os.getenv("SMM_API_URL", "").strip()
 SMM_API_KEY = os.getenv("SMM_API_KEY", "").strip()
-SMM_DEFAULT_MARKUP = float(os.getenv("SMM_DEFAULT_MARKUP", "1.3").strip())
+SMM_DEFAULT_MARKUP = 1 + float(os.getenv("DEFAULT_MARKUP_PERCENT", "20").strip()) / 100
+SMM_TG_MEMBER_MARKUP = 1 + float(os.getenv("TG_MEMBER_MARKUP_PERCENT", "50").strip()) / 100
 
 LOGS_CHANNEL_ID = os.getenv("LOGS_CHANNEL_ID", "").strip()
 if LOGS_CHANNEL_ID:
@@ -84,105 +87,6 @@ bot = TelegramClient(session_name, API_ID, API_HASH)
 user_states = {}
 pending_otp_requests = {}
 
-# ---------- SMM SERVICE (Reactions / Members panel) ----------
-_smm_services: list = []
-_smm_categorized: dict = {}
-_smm_cache_time: float = 0
-_smm_usd_inr: float = 95.0
-_smm_usd_fetched: float = 0
-
-SMM_TARGET_CATEGORIES = [
-    "Telegram: Post Reactions [Fast]",
-    "Telegram: Post Reactions [Cheap]",
-    "Telegram: Members &amp; Subscribers [ New ]",
-    "Telegram: Members &amp; Subscribers [ Cheap ]",
-]
-
-SMM_SHORT_NAMES = {
-    "Telegram: Post Reactions [Fast]":  "⚡ Fast Reaction",
-    "Telegram: Post Reactions [Cheap]": "💰 Cheap Reaction",
-    "Telegram: Members &amp; Subscribers [ New ]": "👥 Add Members",
-    "Telegram: Members &amp; Subscribers [ Cheap ]": "💸 Cheap Members",
-}
-
-SMM_PER_PAGE = 8
-
-async def fetch_smm_services():
-    global _smm_services, _smm_categorized, _smm_cache_time
-    if time.time() - _smm_cache_time < 3600 and _smm_categorized:
-        return True
-    if not SMM_API_URL or not SMM_API_KEY:
-        logging.warning("SMM_API_URL/SMM_API_KEY not set, SMM service disabled.")
-        return False
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(SMM_API_URL, data={"key": SMM_API_KEY, "action": "services"}) as r:
-                data = await r.json(content_type=None)
-        if not isinstance(data, list):
-            return False
-        _smm_services = data
-        _smm_categorized = {}
-        for cat in SMM_TARGET_CATEGORIES:
-            filtered = [s for s in data if s.get("category", "") == cat]
-            if filtered:
-                _smm_categorized[cat] = filtered
-        _smm_cache_time = time.time()
-        return True
-    except Exception as e:
-        logging.error(f"fetch_smm_services error: {e}")
-        return False
-
-async def get_smm_usd_inr() -> float:
-    global _smm_usd_inr, _smm_usd_fetched
-    if time.time() - _smm_usd_fetched < 3600:
-        return _smm_usd_inr
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://open.er-api.com/v6/latest/USD",
-                              timeout=aiohttp.ClientTimeout(total=5)) as r:
-                d = await r.json()
-                if d.get("result") == "success":
-                    _smm_usd_inr = float(d["rates"]["INR"])
-                    _smm_usd_fetched = time.time()
-    except Exception as e:
-        logging.warning(f"SMM USD/INR fetch failed, using {_smm_usd_inr}: {e}")
-    return _smm_usd_inr
-
-def get_smm_rate(svc: dict, usd: float) -> float:
-    return round(float(svc["rate"]) * usd * SMM_DEFAULT_MARKUP, 4)
-
-async def build_smm_page(cat_name: str, page: int, usd: float):
-    svcs = _smm_categorized[cat_name]
-    total = len(svcs)
-    tp = max(1, (total + SMM_PER_PAGE - 1) // SMM_PER_PAGE)
-    page = max(0, min(page, tp - 1))
-    chunk = svcs[page * SMM_PER_PAGE:(page + 1) * SMM_PER_PAGE]
-
-    text = f"🎯 **{cat_name}** ({page+1}/{tp})\n\n"
-    rows = []
-    for svc in chunk:
-        rate = get_smm_rate(svc, usd)
-        text += (
-            f"🆔 `{svc['service']}`\n"
-            f"📦 {svc['name']}\n"
-            f"💰 ₹{rate}/1k | Min: {svc['min']} Max: {svc['max']}\n\n"
-        )
-        rows.append([Button.inline(f"🛒 {svc['service']} — ₹{rate}/1k", f"smmpick_{svc['service']}".encode())])
-
-    cat_keys = list(_smm_categorized.keys())
-    cidx = cat_keys.index(cat_name)
-
-    nav = []
-    if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"smmsvc_{cidx}_{page-1}".encode()))
-    if page < tp - 1:
-        nav.append(Button.inline("Next ➡️", f"smmsvc_{cidx}_{page+1}".encode()))
-    if nav:
-        rows.append(nav)
-
-    rows.append([Button.inline("🔙 Categories", b"smm")])
-    return text, rows
-
 # ---------- Bot Username Cache ----------
 bot_username = None
 
@@ -220,17 +124,246 @@ async def set_min_withdrawal(value: float):
         upsert=True
     )
 
+def _is_member_category(cat: str) -> bool:
+    c = (cat or "").lower()
+    return "member" in c or "subscriber" in c
+
+async def get_smm_markup(cat: str = "") -> float:
+    """Category-aware markup: Members/Subscribers get the higher TG_MEMBER_MARKUP,
+    everything else gets DEFAULT_MARKUP. Admin-set overrides (via settings_col) win."""
+    is_member = _is_member_category(cat)
+    key = "smm_markup_member" if is_member else "smm_markup_default"
+    fallback = SMM_TG_MEMBER_MARKUP if is_member else SMM_DEFAULT_MARKUP
+
+    setting = await settings_col.find_one({"key": key})
+    if setting:
+        return float(setting.get("value", fallback))
+    return fallback
+
+async def set_smm_markup(value: float, member: bool = False):
+    key = "smm_markup_member" if member else "smm_markup_default"
+    await settings_col.update_one(
+        {"key": key},
+        {"$set": {"value": value, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+
 # ---------- LOGS CHANNEL HELPER ----------
+async def get_display_name(user_id: int) -> str:
+    """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
+    try:
+        entity = await bot.get_entity(user_id)
+        name = entity.first_name or "Unknown"
+        if entity.username:
+            return f"{name} (@{entity.username})"
+        return name
+    except Exception:
+        return str(user_id)
+
 async def log_event(text):
     if LOGS_CHANNEL_ID:
         try:
-            await bot.send_message(LOGS_CHANNEL_ID, text)
+            await bot.send_message(LOGS_CHANNEL_ID, text, parse_mode="markdown")
         except Exception as e:
             logging.error(f"Failed to send log to channel: {e}")
 
 # ---------- HELPER ----------
 async def get_existing_countries():
     return await accounts_col.distinct("country", {})
+
+# ============================================================
+#  SMM PANEL INTEGRATION
+# ============================================================
+
+_smm_all_services: list = []
+_smm_categorized: dict = {}
+_smm_cache_time: float = 0
+
+_usd_inr: float = 95.0
+_usd_fetched: float = 0
+
+SMM_CATS_PER_PAGE = 10
+SMM_SVCS_PER_PAGE = 8
+
+SMM_PLATFORMS = ["Telegram", "Instagram", "Facebook", "Other"]
+_SMM_PLATFORM_EMOJI = {
+    "Telegram": "✈️", "Instagram": "📸", "Facebook": "📘", "Other": "🌐",
+}
+
+def classify_smm_platform(cat: str) -> str:
+    c = (cat or "").lower()
+    if "telegram" in c or c.startswith("tg"):
+        return "Telegram"
+    if "instagram" in c or " ig " in f" {c} " or c.startswith("insta"):
+        return "Instagram"
+    if "facebook" in c or c.startswith("fb"):
+        return "Facebook"
+    return "Other"
+
+def get_smm_platform_categories(platform: str) -> list:
+    cats = [cat for cat in _smm_categorized.keys() if classify_smm_platform(cat) == platform]
+    if platform == "Telegram":
+        # Reaction services first, then alphabetical within each group
+        cats.sort(key=lambda c: (0 if "reaction" in c.lower() else 1, c.lower()))
+    else:
+        cats.sort(key=lambda c: c.lower())
+    return cats
+
+async def fetch_smm_services():
+    """Fetch and cache all services from the SMM panel, grouped by category."""
+    global _smm_all_services, _smm_categorized, _smm_cache_time
+    if not SMM_API_URL or not SMM_API_KEY:
+        return False
+    if time.time() - _smm_cache_time < 3600 and _smm_categorized:
+        return True
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(SMM_API_URL, data={
+                "key": SMM_API_KEY, "action": "services"
+            }) as r:
+                data = await r.json(content_type=None)
+        if not isinstance(data, list):
+            return False
+        _smm_all_services = data
+        _smm_categorized = {}
+        for svc in data:
+            cat = svc.get("category", "Other") or "Other"
+            _smm_categorized.setdefault(cat, []).append(svc)
+        _smm_cache_time = time.time()
+        logging.info(f"SMM: loaded {len(data)} services across {len(_smm_categorized)} categories")
+        return True
+    except Exception as e:
+        logging.error(f"fetch_smm_services error: {e}")
+        return False
+
+async def get_usd_inr() -> float:
+    global _usd_inr, _usd_fetched
+    if time.time() - _usd_fetched < 3600:
+        return _usd_inr
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://open.er-api.com/v6/latest/USD",
+                              timeout=aiohttp.ClientTimeout(total=5)) as r:
+                d = await r.json()
+                if d.get("result") == "success":
+                    _usd_inr = float(d["rates"]["INR"])
+                    _usd_fetched = time.time()
+    except Exception as e:
+        logging.warning(f"USD/INR fetch failed, using {_usd_inr}: {e}")
+    return _usd_inr
+
+async def build_smm_platform_menu():
+    buttons = []
+    for p in SMM_PLATFORMS:
+        cats = get_smm_platform_categories(p)
+        count = sum(len(_smm_categorized[c]) for c in cats)
+        emoji = _SMM_PLATFORM_EMOJI.get(p, "🌐")
+        label = f"{emoji} {p} ({count} services)"
+        buttons.append([Button.inline(label, f"smm_cat_{p}_0".encode(), style="primary")])
+    buttons.append([Button.inline("🔍 Search Service", b"smm_search", style="primary")])
+    buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order", style="success")])
+    buttons.append([Button.inline("📦 My SMM Orders", b"smm_myorders", style="primary")])
+    buttons.append([Button.inline("🔙 Back", b"main", style="primary")])
+    text = "🚀 **SMM Services** — choose a platform:"
+    return text, buttons
+
+async def build_smm_category_page(platform: str, page: int):
+    cat_keys = get_smm_platform_categories(platform)
+    total = len(cat_keys)
+    tp = max(1, (total + SMM_CATS_PER_PAGE - 1) // SMM_CATS_PER_PAGE)
+    page = max(0, min(page, tp - 1))
+    chunk = cat_keys[page * SMM_CATS_PER_PAGE:(page + 1) * SMM_CATS_PER_PAGE]
+
+    buttons = []
+    for cat in chunk:
+        idx = cat_keys.index(cat)
+        count = len(_smm_categorized[cat])
+        label = f"{cat[:55]} ({count})"
+        buttons.append([Button.inline(label, f"smm_svc_{platform}_{idx}_0".encode(), style="primary")])
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"smm_cat_{platform}_{page-1}".encode(), style="primary"))
+    if page < tp - 1:
+        nav.append(Button.inline("Next ➡️", f"smm_cat_{platform}_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([Button.inline("🔍 Search Service", b"smm_search", style="primary")])
+    buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order", style="success")])
+    buttons.append([Button.inline("🔙 Back to Platforms", b"smm_services", style="primary")])
+
+    emoji = _SMM_PLATFORM_EMOJI.get(platform, "🌐")
+    text = f"{emoji} **{platform} Services** — Select a category  ({page+1}/{tp})\nTotal categories: {total}"
+    return text, buttons
+
+async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float):
+    cat_keys = get_smm_platform_categories(platform)
+    if cidx >= len(cat_keys):
+        return None, None
+    cat_name = cat_keys[cidx]
+    svcs = _smm_categorized[cat_name]
+    total = len(svcs)
+    tp = max(1, (total + SMM_SVCS_PER_PAGE - 1) // SMM_SVCS_PER_PAGE)
+    page = max(0, min(page, tp - 1))
+    chunk = svcs[page * SMM_SVCS_PER_PAGE:(page + 1) * SMM_SVCS_PER_PAGE]
+
+    markup = await get_smm_markup(cat_name)
+    lines = [f"📋 **{cat_name}**  ({page+1}/{tp})\n"]
+    for svc in chunk:
+        rate = round(float(svc["rate"]) * usd * markup, 4)
+        lines.append(
+            f"🆔 `{svc['service']}`\n"
+            f"📦 {svc['name']}\n"
+            f"💰 ₹{rate}/1k | Min: {svc['min']} Max: {svc['max']}\n"
+        )
+    text = "\n".join(lines)
+
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"smm_svc_{platform}_{cidx}_{page-1}".encode(), style="primary"))
+    if page < tp - 1:
+        nav.append(Button.inline("Next ➡️", f"smm_svc_{platform}_{cidx}_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([Button.inline("🔍 Search Service", b"smm_search", style="primary")])
+    buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order", style="success")])
+    buttons.append([Button.inline("🔙 Back to Categories", f"smm_cat_{platform}_0".encode(), style="primary")])
+    return text, buttons
+
+SMM_SEARCH_LIMIT = 15
+
+async def build_smm_search_results(query: str, usd: float):
+    q = query.lower().strip()
+    matches = [
+        svc for svc in _smm_all_services
+        if q in svc.get("name", "").lower() or q in svc.get("category", "").lower()
+    ][:SMM_SEARCH_LIMIT]
+
+    if not matches:
+        text = f"🔍 No services found matching `{query}`."
+        buttons = [[Button.inline("🔙 Back", b"smm_services", style="primary")]]
+        return text, buttons
+
+    lines = [f"🔍 **Search results for:** `{query}` ({len(matches)} shown)\n"]
+    for svc in matches:
+        markup = await get_smm_markup(svc.get("category", ""))
+        rate = round(float(svc["rate"]) * usd * markup, 4)
+        lines.append(
+            f"🆔 `{svc['service']}`\n"
+            f"📦 {svc['name']}\n"
+            f"🏷 {svc.get('category', 'N/A')}\n"
+            f"💰 ₹{rate}/1k | Min: {svc['min']} Max: {svc['max']}\n"
+        )
+    text = "\n".join(lines)
+    buttons = [
+        [Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order", style="success")],
+        [Button.inline("🔍 Search Again", b"smm_search", style="primary")],
+        [Button.inline("🔙 Back", b"smm_services", style="primary")],
+    ]
+    return text, buttons
 
 # ---------- FORCE JOIN ----------
 def parse_chat_id(raw_id: str):
@@ -283,7 +416,7 @@ async def send_join_message(event):
             logging.warning(f"Could not get title for {raw_id}: {e}")
         if raw_id.startswith('@'):
             link = f"https://t.me/{raw_id[1:]}"
-            buttons.append([Button.url(f"📢 Join {title}", link)])
+            buttons.append([Button.url(f"📢 Join {title}", link, style="primary")])
         else:
             invite_link = None
             try:
@@ -298,12 +431,12 @@ async def send_join_message(event):
             except Exception as e:
                 logging.error(f"Failed to export invite for '{raw_id}': {type(e).__name__}: {e}")
             if invite_link:
-                buttons.append([Button.url(f"📢 Join {title}", invite_link)])
+                buttons.append([Button.url(f"📢 Join {title}", invite_link, style="primary")])
             else:
-                buttons.append([Button.inline(f"🔒 {title} (join manually)", b"noop")])
+                buttons.append([Button.inline(f"🔒 {title} (join manually)", b"noop", style="primary")])
     if not buttons:
         return
-    buttons.append([Button.inline("✅ Check Again", b"check_join")])
+    buttons.append([Button.inline("✅ Check Again", b"check_join", style="success")])
     msg = "🔒 **You must join the channels below to use the bot.**"
     if is_callback:
         await event.edit(msg, buttons=buttons)
@@ -322,18 +455,18 @@ async def show_welcome_menu(event, user_id):
         "Use the buttons below to get started."
     )
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
-        [Button.inline("🎯 SMM Service", b"smm")],
-        [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
+        [Button.inline("🛒 Buy Account", b"buy", style="primary"), Button.inline("💰 My Balance", b"balance", style="primary")],
+        [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
+        [Button.inline("🚀 SMM Services", b"smm_services", style="primary")],
     ]
-    row3 = [Button.inline("👥 Referral Program", b"referral_info")]
+    row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
     if user_id in ADMIN_IDS:
-        row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
 
     support_link = await get_support_link()
     if support_link:
-        buttons.append([Button.url("📞 Support", support_link)])
+        buttons.append([Button.url("📞 Support", support_link, style="primary")])
 
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(welcome_msg, buttons=buttons)
@@ -347,17 +480,17 @@ async def send_main_menu(event):
         await send_join_message(event)
         return
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy"), Button.inline("💰 My Balance", b"balance")],
-        [Button.inline("🎯 SMM Service", b"smm")],
-        [Button.inline("💳 Deposit", b"deposit"), Button.inline("📜 Order History", b"orders")],
+        [Button.inline("🛒 Buy Account", b"buy", style="primary"), Button.inline("💰 My Balance", b"balance", style="primary")],
+        [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
+        [Button.inline("🚀 SMM Services", b"smm_services", style="primary")],
     ]
-    row3 = [Button.inline("👥 Referral Program", b"referral_info")]
+    row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
     if user_id in ADMIN_IDS:
-        row3.append(Button.inline("⚙️ Admin Panel", b"admin"))
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
     support_link = await get_support_link()
     if support_link:
-        buttons.append([Button.url("📞 Support", support_link)])
+        buttons.append([Button.url("📞 Support", support_link, style="primary")])
     msg = "🌟 **OTP Bot Main Menu**"
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(msg, buttons=buttons)
@@ -450,8 +583,8 @@ async def broadcast_cmd(event):
     preview += "\nDo you want to send this broadcast?"
 
     buttons = [
-        [Button.inline("✅ Confirm", b"broadcast_confirm")],
-        [Button.inline("❌ Cancel", b"broadcast_cancel")],
+        [Button.inline("✅ Confirm", b"broadcast_confirm", style="success")],
+        [Button.inline("❌ Cancel", b"broadcast_cancel", style="danger")],
     ]
     await event.respond(preview, buttons=buttons)
 
@@ -496,7 +629,12 @@ async def broadcast_callback(event):
             else:
                 pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
             await bot.pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
-            await log_event(f"📌 Broadcast pinned in logs channel by admin {user_id}")
+            admin_bc_name = await get_display_name(user_id)
+            await log_event(
+                f"📌 **Broadcast Pinned**\n"
+                f"👤 Admin: {admin_bc_name} (`{user_id}`)\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
         except Exception as e:
             logging.error(f"Failed to pin broadcast in logs channel: {e}")
             await event.respond(f"⚠️ Could not pin in logs channel: {e}")
@@ -595,7 +733,7 @@ async def show_all_accounts(event, user_id, status_filter="all", page=0):
         def filter_btn(text, status):
             # highlight current filter
             display = f"• {text} •" if status == status_filter else text
-            return Button.inline(display, f"admin_accounts|{status}|0".encode())
+            return Button.inline(display, f"admin_accounts|{status}|0".encode(), style="primary")
 
         filter_row1 = [filter_btn("🟢 Available", "available"), filter_btn("🔴 Sold", "sold")]
         filter_row2 = [filter_btn("⚫ Invalid", "invalid"), filter_btn("📋 All", "all")]
@@ -603,21 +741,21 @@ async def show_all_accounts(event, user_id, status_filter="all", page=0):
         # ---- Pagination buttons (row 3) ----
         nav_row = []
         if page > 0:
-            nav_row.append(Button.inline("⬅️ Prev", f"admin_accounts|{status_filter}|{page-1}".encode()))
+            nav_row.append(Button.inline("⬅️ Prev", f"admin_accounts|{status_filter}|{page-1}".encode(), style="primary"))
         if total_pages > 1:
-            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop"))
+            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop", style="primary"))
         if page < total_pages - 1:
-            nav_row.append(Button.inline("Next ➡️", f"admin_accounts|{status_filter}|{page+1}".encode()))
+            nav_row.append(Button.inline("Next ➡️", f"admin_accounts|{status_filter}|{page+1}".encode(), style="primary"))
 
         buttons = [filter_row1, filter_row2]
         if nav_row:
             buttons.append(nav_row)
-        buttons.append([Button.inline("🔙 Back", b"admin")])
+        buttons.append([Button.inline("🔙 Back", b"admin", style="primary")])
 
         await event.edit(txt, buttons=buttons)
     except Exception as e:
         logging.error(f"Error in show_all_accounts: {e}", exc_info=True)
-        await event.edit("❌ Error loading accounts. Please try again.", buttons=[[Button.inline("🔙 Back", b"admin")]])
+        await event.edit("❌ Error loading accounts. Please try again.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
 
 
 # ---------- Transactions: type filter + pagination ----------
@@ -729,7 +867,7 @@ async def show_all_transactions(event, user_id, type_filter="all", page=0):
         # ---- Filter buttons ----
         def filter_btn(text, t_filter):
             display = f"• {text} •" if t_filter == type_filter else text
-            return Button.inline(display, f"admin_transactions|{t_filter}|0".encode())
+            return Button.inline(display, f"admin_transactions|{t_filter}|0".encode(), style="primary")
 
         filter_row = [
             filter_btn("🛒 Purchase", "purchase"),
@@ -740,21 +878,117 @@ async def show_all_transactions(event, user_id, type_filter="all", page=0):
         # ---- Pagination buttons ----
         nav_row = []
         if page > 0:
-            nav_row.append(Button.inline("⬅️ Prev", f"admin_transactions|{type_filter}|{page-1}".encode()))
+            nav_row.append(Button.inline("⬅️ Prev", f"admin_transactions|{type_filter}|{page-1}".encode(), style="primary"))
         if total_pages > 1:
-            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop"))
+            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop", style="primary"))
         if page < total_pages - 1:
-            nav_row.append(Button.inline("Next ➡️", f"admin_transactions|{type_filter}|{page+1}".encode()))
+            nav_row.append(Button.inline("Next ➡️", f"admin_transactions|{type_filter}|{page+1}".encode(), style="primary"))
 
         buttons = [filter_row]
         if nav_row:
             buttons.append(nav_row)
-        buttons.append([Button.inline("🔙 Back", b"admin")])
+        buttons.append([Button.inline("🔙 Back", b"admin", style="primary")])
 
         await event.edit(txt, buttons=buttons)
     except Exception as e:
         logging.error(f"Error in show_all_transactions: {e}", exc_info=True)
-        await event.edit("❌ Error loading transactions.", buttons=[[Button.inline("🔙 Back", b"admin")]])
+        await event.edit("❌ Error loading transactions.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
+
+
+async def fetch_smm_order_status(order_ids: list) -> dict:
+    """Fetch live status for one or more SMM orders from the panel.
+    Returns {str(order_id): {"status": ..., "charge": ..., ...}} or {} on failure."""
+    if not order_ids or not SMM_API_URL or not SMM_API_KEY:
+        return {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            if len(order_ids) == 1:
+                async with s.post(SMM_API_URL, data={
+                    "key": SMM_API_KEY, "action": "status", "order": str(order_ids[0])
+                }) as r:
+                    data = await r.json(content_type=None)
+                if isinstance(data, dict) and "error" not in data:
+                    return {str(order_ids[0]): data}
+                return {}
+            else:
+                async with s.post(SMM_API_URL, data={
+                    "key": SMM_API_KEY, "action": "status",
+                    "orders": ",".join(str(o) for o in order_ids)
+                }) as r:
+                    data = await r.json(content_type=None)
+                return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.error(f"fetch_smm_order_status error: {e}")
+        return {}
+
+SMM_STATUS_EMOJI = {
+    "pending": "🟡", "completed": "🟢", "in progress": "🔵",
+    "processing": "🔵", "partial": "🟠", "canceled": "🔴", "cancelled": "🔴"
+}
+
+# ---------- SMM Orders: paginated list (admin) ----------
+SMM_ORDERS_PAGE_SIZE = 15
+
+async def show_all_smm_orders(event, user_id, page=0):
+    """Show all SMM orders placed through the bot, paginated, newest first."""
+    try:
+        total_count = await smm_orders_col.count_documents({})
+        total_pages = max(1, (total_count + SMM_ORDERS_PAGE_SIZE - 1) // SMM_ORDERS_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        skip = page * SMM_ORDERS_PAGE_SIZE
+
+        cursor = smm_orders_col.find({}).sort("created_at", -1).skip(skip).limit(SMM_ORDERS_PAGE_SIZE)
+        orders = await cursor.to_list(length=SMM_ORDERS_PAGE_SIZE)
+
+        if not orders:
+            txt = "🚀 **SMM Order History**\n\nNo SMM orders found."
+        else:
+            order_ids = [o.get("smm_order_id") for o in orders if o.get("smm_order_id")]
+            live_status = await fetch_smm_order_status(order_ids)
+            for o in orders:
+                sid = str(o.get("smm_order_id", ""))
+                live = live_status.get(sid)
+                if live and live.get("status"):
+                    o["status"] = live["status"]
+                    try:
+                        await smm_orders_col.update_one(
+                            {"_id": o["_id"]}, {"$set": {"status": live["status"]}}
+                        )
+                    except Exception:
+                        pass
+
+            lines = []
+            for o in orders:
+                date_str = o["created_at"].strftime('%d/%m/%Y %H:%M')
+                status_text = o.get("status", "pending")
+                st = SMM_STATUS_EMOJI.get(str(status_text).lower(), "❓")
+                lines.append(
+                    f"{st} User `{o['user_id']}` | {o.get('service_name', '?')[:28]}\n"
+                    f"   Status: **{status_text}** | Qty: {o.get('quantity', 0)} | ₹{o.get('charge', 0)}\n"
+                    f"   SMM ID: `{o.get('smm_order_id', 'N/A')}` | {date_str}"
+                )
+            txt = (
+                f"🚀 **SMM Order History** (Total: {total_count} | Page {page+1}/{total_pages})\n\n"
+                + "\n\n".join(lines)
+            )
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(Button.inline("⬅️ Prev", f"admin_smm_orders|{page-1}".encode(), style="primary"))
+        if total_pages > 1:
+            nav_row.append(Button.inline(f"{page+1}/{total_pages}", b"noop", style="primary"))
+        if page < total_pages - 1:
+            nav_row.append(Button.inline("Next ➡️", f"admin_smm_orders|{page+1}".encode(), style="primary"))
+
+        buttons = []
+        if nav_row:
+            buttons.append(nav_row)
+        buttons.append([Button.inline("🔙 Back", b"admin", style="primary")])
+
+        await event.edit(txt, buttons=buttons)
+    except Exception as e:
+        logging.error(f"Error in show_all_smm_orders: {e}", exc_info=True)
+        await event.edit("❌ Error loading SMM orders.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
 
 
 # ---------- Withdrawals: simple list (latest 50) ----------
@@ -775,10 +1009,10 @@ async def show_all_withdrawals(event, user_id):
                 )
             txt = f"💸 **Withdrawal History** (Latest {len(lines)})\n" + "\n".join(lines)
 
-        await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"admin")]])
+        await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
     except Exception as e:
         logging.error(f"Error in show_all_withdrawals: {e}", exc_info=True)
-        await event.edit("❌ Error loading withdrawals.", buttons=[[Button.inline("🔙 Back", b"admin")]])
+        await event.edit("❌ Error loading withdrawals.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
 
 
 # ============================================================
@@ -811,11 +1045,14 @@ async def callback_handler(event):
             return
 
         # Clear states for menu switches
-        if data in ("main", "buy", "balance", "deposit", "orders", "admin", "smm",
+        if data in ("main", "buy", "balance", "deposit", "orders", "admin",
                     "admin_add_otp", "admin_add_sess", "admin_add_stock",
                     "admin_addbal", "admin_deposits",
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
-                    "admin_transactions", "admin_withdrawals", "my_withdrawals"):
+                    "admin_transactions", "admin_withdrawals", "my_withdrawals",
+                    "smm_services", "smm_myorders", "admin_smm_markup", "smm_search",
+                    "admin_smm_markup_default", "admin_smm_markup_member", "admin_smm_orders",
+                    "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -856,6 +1093,23 @@ async def callback_handler(event):
             await event.answer()
             return
 
+        # ---------- ADMIN SMM ORDERS (record/logs view) ----------
+        if data.startswith("admin_smm_orders"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            if data == "admin_smm_orders":
+                page = 0
+            else:
+                try:
+                    _, page_str = data.split("|")
+                    page = int(page_str)
+                except (ValueError, IndexError):
+                    page = 0
+            await show_all_smm_orders(event, user_id, page)
+            await event.answer()
+            return
+
         # ---------- ADMIN WITHDRAWALS (simple) ----------
         if data == "admin_withdrawals":
             if user_id not in ADMIN_IDS:
@@ -884,16 +1138,140 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        # ---------- LOGOUT ----------
-        if data.startswith("logout_"):
-            phone = data[len("logout_"):]
-            await acc_mgr.logout_client(phone)
-            await event.answer("🔒 Session terminated.", alert=True)
+        # ---------- MANAGE SESSIONS ----------
+        async def render_sessions(phone):
+            auths = await acc_mgr.get_authorizations(phone)
+            if auths is None:
+                return (f"❌ Could not fetch sessions for `{phone}`. "
+                        f"The account's monitoring client may be offline.", None)
+            if not auths:
+                return f"📱 No active sessions found for `{phone}`.", [
+                    [Button.inline("🔙 Close", b"close_sessions", style="primary")]
+                ]
+
+            lines = [f"📱 **Active Sessions — ** `{phone}`\n"]
+            buttons = []
+            for a in auths:
+                date_str = a.date_active.strftime('%d/%m/%Y %H:%M') if a.date_active else "N/A"
+                tag = " ⭐ *(bot's session — used for OTP delivery)*" if a.current else ""
+                lines.append(
+                    f"{'⭐' if a.current else '📟'} **{a.device_model or 'Unknown device'}**{tag}\n"
+                    f"   App: {a.app_name} {a.app_version}\n"
+                    f"   Platform: {a.platform} {a.system_version}\n"
+                    f"   Last active: {date_str}\n"
+                    f"   IP: {a.ip} ({a.country})\n"
+                )
+                device_label = (a.device_model or 'device')[:20]
+                if a.current:
+                    buttons.append([Button.inline(
+                        f"⚠️ Terminate Bot's Session",
+                        f"termcurr_{phone}_{a.hash}", style="danger"
+                    )])
+                else:
+                    buttons.append([Button.inline(
+                        f"❌ Terminate: {device_label}",
+                        f"termsess_{phone}_{a.hash}", style="danger"
+                    )])
+
+            buttons.append([Button.inline("🔄 Refresh", f"sessions_{phone}", style="primary")])
+            buttons.append([Button.inline("🔙 Close", b"close_sessions", style="primary")])
+            return "\n".join(lines), buttons
+
+        if data.startswith("sessions_"):
+            phone = data[len("sessions_"):]
+            text, buttons = await render_sessions(phone)
             try:
-                original_text = event.message.text if event.message else ""
-                await event.edit(original_text + "\n\n🔒 *Session terminated.*", buttons=None)
-            except:
+                await event.edit(text, buttons=buttons)
+            except MessageNotModifiedError:
                 pass
+            await event.answer()
+            return
+
+        # Terminating the BOT'S OWN session requires an explicit warning + confirmation
+        if data.startswith("termcurr_"):
+            _, phone, hash_str = data.split("_", 2)
+            await event.answer(
+                "⚠️ This is the bot's own OTP session! Terminating it stops "
+                "further OTPs and disables session management here.",
+                alert=True
+            )
+            confirm_buttons = [
+                [Button.inline("⚠️ Yes, Terminate Anyway", f"termcurrok_{phone}_{hash_str}", style="danger")],
+                [Button.inline("❌ Cancel", f"sessions_{phone}", style="primary")],
+            ]
+            new_text = (
+                f"⚠️ **Are you sure?**\n\n"
+                f"This is the **bot's own session** for `{phone}` — the one used to "
+                f"forward OTPs to you.\n\n"
+                f"❌ Terminating it means:\n"
+                f"• You will **not receive any further OTPs** on this number.\n"
+                f"• You will **not be able to manage sessions** here anymore.\n\n"
+                f"This action cannot be undone from this bot. Proceed?"
+            )
+            try:
+                await event.edit(new_text, buttons=confirm_buttons)
+            except MessageNotModifiedError:
+                pass
+            return
+
+        if data.startswith("termcurrok_"):
+            _, phone, hash_str = data.split("_", 2)
+            ok, msg = await acc_mgr.terminate_own_session(phone)
+            if ok:
+                await event.answer("✅ Bot's session terminated. OTP delivery stopped.", alert=True)
+                try:
+                    await event.edit(
+                        f"🔒 **Bot's session for** `{phone}` **has been terminated.**\n\n"
+                        f"You will no longer receive OTPs on this number through this bot, "
+                        f"and session management is no longer available here.",
+                        buttons=None
+                    )
+                except MessageNotModifiedError:
+                    pass
+            else:
+                await event.answer((f"❌ {msg}")[:200], alert=True)
+            return
+
+        if data.startswith("termsess_"):
+            _, phone, hash_str = data.split("_", 2)
+            confirm_buttons = [
+                [Button.inline("✅ Yes, Terminate", f"termsessok_{phone}_{hash_str}", style="danger")],
+                [Button.inline("❌ Cancel", f"sessions_{phone}", style="primary")],
+            ]
+            new_text = (
+                f"⚠️ **Terminate this session?**\n\n"
+                f"This device will be logged out of `{phone}` immediately.\n"
+                f"This action cannot be undone. Proceed?"
+            )
+            try:
+                await event.edit(new_text, buttons=confirm_buttons)
+            except MessageNotModifiedError:
+                pass
+            await event.answer()
+            return
+
+        if data.startswith("termsessok_"):
+            _, phone, hash_str = data.split("_", 2)
+            try:
+                hash_id = int(hash_str)
+            except ValueError:
+                await event.answer("❌ Invalid session.", alert=True)
+                return
+            ok, msg = await acc_mgr.terminate_session(phone, hash_id)
+            await event.answer((("✅ " if ok else "❌ ") + msg)[:200], alert=True)
+            text, buttons = await render_sessions(phone)
+            try:
+                await event.edit(text, buttons=buttons)
+            except MessageNotModifiedError:
+                pass
+            return
+
+        if data == "close_sessions":
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await event.answer()
             return
 
         # ---------- REFERRAL INFO ----------
@@ -920,9 +1298,9 @@ async def callback_handler(event):
                 "Share your link and start earning!"
             )
             buttons = [
-                [Button.inline("💸 Withdraw", b"withdraw")],
-                [Button.inline("📜 Withdrawal History", b"my_withdrawals")],
-                [Button.inline("🔙 Back", b"main")]
+                [Button.inline("💸 Withdraw", b"withdraw", style="primary")],
+                [Button.inline("📜 Withdrawal History", b"my_withdrawals", style="primary")],
+                [Button.inline("🔙 Back", b"main", style="primary")]
             ]
             await event.edit(text, buttons=buttons)
             await event.answer()
@@ -941,7 +1319,7 @@ async def callback_handler(event):
                 f"💸 **Withdraw**\n\nYour withdrawable balance: ₹{withdrawable}\n"
                 f"Minimum withdrawal: ₹{min_wd}\n"
                 "Enter the amount you wish to withdraw (in ₹):",
-                buttons=[[Button.inline("🔙 Cancel", b"referral_info")]]
+                buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]]
             )
             await event.answer()
             return
@@ -958,8 +1336,8 @@ async def callback_handler(event):
             if not countries:
                 await event.answer("❌ No accounts available!", alert=True)
                 return
-            btns = [[Button.inline(c, f"country_{c}")] for c in countries]
-            btns.append([Button.inline("🔙 Back", b"main")])
+            btns = [[Button.inline(c, f"country_{c}", style="primary")] for c in countries]
+            btns.append([Button.inline("🔙 Back", b"main", style="primary")])
             await event.edit("🌍 Choose a country:", buttons=btns)
             await event.answer()
             return
@@ -980,8 +1358,8 @@ async def callback_handler(event):
             for item in agg:
                 price = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
                 count = item["count"]
-                btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}")])
-            btns.append([Button.inline("🔙 Back", b"buy")])
+                btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}", style="primary")])
+            btns.append([Button.inline("🔙 Back", b"buy", style="primary")])
             await event.edit(
                 f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
                 buttons=btns
@@ -1005,8 +1383,8 @@ async def callback_handler(event):
                 f"📦 Stock: {stock}"
             )
             buttons = [
-                [Button.inline("✅ Confirm Purchase", b"confirm_purchase")],
-                [Button.inline("❌ Cancel", b"cancel_purchase")]
+                [Button.inline("✅ Confirm Purchase", b"confirm_purchase", style="success")],
+                [Button.inline("❌ Cancel", b"cancel_purchase", style="danger")]
             ]
             await event.edit(confirm_text, buttons=buttons)
             await event.answer()
@@ -1107,8 +1485,8 @@ async def callback_handler(event):
             await event.edit(
                 success_text,
                 buttons=[
-                    [Button.inline("🔄 Request New OTP", f"resend_{phone}")],
-                    [Button.inline("🔙 Main Menu", b"main")]
+                    [Button.inline("🔄 Request New OTP", f"resend_{phone}", style="primary")],
+                    [Button.inline("🔙 Main Menu", b"main", style="primary")]
                 ]
             )
             user_states.pop(user_id, None)
@@ -1133,7 +1511,15 @@ async def callback_handler(event):
                     )
                 except:
                     pass
-            await log_event(f"🛒 Purchase: {phone} by {user_id}")
+            await log_event(
+                f"🛒 **New Account Purchase**\n"
+                f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
+                f"📱 Phone: `{phone}`\n"
+                f"🌍 Country: {country}\n"
+                f"💰 Price: ₹{price}\n"
+                f"👛 Balance After: ₹{new_balance}\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
             await event.answer("✅ Purchase successful!", alert=True)
             return
 
@@ -1144,7 +1530,7 @@ async def callback_handler(event):
                 country = state["country"]
                 total_count = await accounts_col.count_documents({"country": country, "status": "available"})
                 if total_count == 0:
-                    await event.edit("❌ No accounts left in this country.", buttons=[[Button.inline("🔙 Back", b"buy")]])
+                    await event.edit("❌ No accounts left in this country.", buttons=[[Button.inline("🔙 Back", b"buy", style="primary")]])
                     return
                 pipeline = [
                     {"$match": {"country": country, "status": "available"}},
@@ -1156,14 +1542,14 @@ async def callback_handler(event):
                 for item in agg:
                     price_val = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
                     count = item["count"]
-                    btns.append([Button.inline(f"₹{price_val} ({count} available)", f"price_{country}_{price_val}")])
-                btns.append([Button.inline("🔙 Back", b"buy")])
+                    btns.append([Button.inline(f"₹{price_val} ({count} available)", f"price_{country}_{price_val}", style="primary")])
+                btns.append([Button.inline("🔙 Back", b"buy", style="primary")])
                 await event.edit(
                     f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
                     buttons=btns
                 )
             else:
-                await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
+                await event.edit("❌ Cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main", style="primary")]])
             await event.answer()
             return
 
@@ -1187,131 +1573,11 @@ async def callback_handler(event):
             asyncio.create_task(clear_pending())
             return
 
-        # ---------- SMM SERVICE ----------
-        if data == "smm":
-            wait_msg = await event.edit("⏳ Loading SMM services...")
-            ok = await fetch_smm_services()
-            if not ok or not _smm_categorized:
-                await event.edit(
-                    "❌ SMM service unavailable right now. Try again later or contact admin.",
-                    buttons=[[Button.inline("🔙 Back", b"main")]]
-                )
-                await event.answer()
-                return
-            cat_keys = list(_smm_categorized.keys())
-            rows = []
-            for i, cat in enumerate(cat_keys):
-                short = SMM_SHORT_NAMES.get(cat, cat[:20])
-                rows.append([Button.inline(short, f"smmsvc_{i}_0".encode())])
-            rows.append([Button.inline("🔙 Back", b"main")])
-            await event.edit("🎯 **SMM Service**\n\nSelect a category:", buttons=rows)
-            await event.answer()
-            return
-
-        # ---------- SMM CATEGORY PAGINATION ----------
-        if data.startswith("smmsvc_"):
-            _, cidx, page = data.split("_")
-            cidx, page = int(cidx), int(page)
-            cat_keys = list(_smm_categorized.keys())
-            if not cat_keys or cidx >= len(cat_keys):
-                await event.answer("❌ Session expired, reopen SMM Service.", alert=True)
-                return
-            usd = await get_smm_usd_inr()
-            text, rows = await build_smm_page(cat_keys[cidx], page, usd)
-            await event.edit(text, buttons=rows)
-            await event.answer()
-            return
-
-        # ---------- SMM PICK SERVICE ----------
-        if data.startswith("smmpick_"):
-            service_id = data.replace("smmpick_", "")
-            svc = next((s for s in _smm_services if str(s.get("service")) == service_id), None)
-            if not svc:
-                await event.answer("❌ Service not found, refresh and try again.", alert=True)
-                return
-            usd = await get_smm_usd_inr()
-            rate = get_smm_rate(svc, usd)
-            user_states[user_id] = {"action": "smm_link", "service": svc, "rate": rate}
-            await event.edit(
-                f"✅ **{svc['name']}**\n\n"
-                f"💰 ₹{rate}/1k | Min: {svc['min']} | Max: {svc['max']}\n\n"
-                f"Send the **link/username** to send this service to:",
-                buttons=[[Button.inline("🔙 Cancel", b"smm")]]
-            )
-            await event.answer()
-            return
-
-        # ---------- SMM ORDER CONFIRM/CANCEL ----------
-        if data == "smm_confirm":
-            state = user_states.get(user_id)
-            if not state or state.get("action") != "smm_confirm":
-                await event.answer("❌ Session expired, start again.", alert=True)
-                return
-            svc = state["service"]
-            link = state["link"]
-            qty = state["quantity"]
-            cost = state["cost"]
-            user = await users_col.find_one({"user_id": user_id})
-            balance = user["balance"] if user else 0
-            if balance < cost:
-                await event.answer("❌ Insufficient balance!", alert=True)
-                return
-            await event.answer("Placing order...")
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(SMM_API_URL, data={
-                        "key": SMM_API_KEY, "action": "add",
-                        "service": svc["service"], "link": link, "quantity": qty
-                    }) as r:
-                        res = await r.json(content_type=None)
-            except Exception as e:
-                logging.error(f"SMM add order error: {e}")
-                res = {}
-            if res.get("order"):
-                await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": -cost}})
-                await smm_orders_col.insert_one({
-                    "user_id": user_id,
-                    "smm_order_id": res["order"],
-                    "service_id": svc["service"],
-                    "service_name": svc["name"],
-                    "link": link,
-                    "quantity": qty,
-                    "cost": cost,
-                    "status": "pending",
-                    "created_at": datetime.utcnow()
-                })
-                updated_user = await users_col.find_one({"user_id": user_id})
-                new_bal = updated_user["balance"] if updated_user else 0
-                await event.edit(
-                    f"✅ **Order Placed!**\n\n"
-                    f"🆔 Order ID: `{res['order']}`\n"
-                    f"💰 Cost: ₹{cost}\n"
-                    f"👛 Balance: ₹{new_bal}",
-                    buttons=[[Button.inline("🔙 Main Menu", b"main")]]
-                )
-            else:
-                error = str(res.get("error", "")).lower()
-                if any(k in error for k in ["funds", "balance", "credit", "money"]):
-                    msg_text = "⚠️ Service temporarily unavailable. Please try again later or contact support."
-                elif "invalid" in error or "not found" in error:
-                    msg_text = "❌ Invalid order details. Please check the link and try again."
-                else:
-                    msg_text = "⚠️ Could not place order. Please try again later."
-                await event.edit(msg_text, buttons=[[Button.inline("🔙 Main Menu", b"main")]])
-            user_states.pop(user_id, None)
-            return
-
-        if data == "smm_cancel":
-            user_states.pop(user_id, None)
-            await event.edit("❌ Order cancelled.", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
-            await event.answer()
-            return
-
         # ---------- BALANCE ----------
         if data == "balance":
             user = await users_col.find_one({"user_id": user_id})
             bal = user["balance"] if user else 0
-            await event.edit(f"💰 Your balance: ₹{bal}", buttons=[[Button.inline("🔙 Back", b"main")]])
+            await event.edit(f"💰 Your balance: ₹{bal}", buttons=[[Button.inline("🔙 Back", b"main", style="primary")]])
             await event.answer()
             return
 
@@ -1320,7 +1586,7 @@ async def callback_handler(event):
             user_states[user_id] = {"action": "deposit", "step": "amount"}
             await event.edit(
                 f"💵 Enter amount (min ₹{MIN_DEPOSIT}):",
-                buttons=[[Button.inline("🔙 Cancel", b"main")]]
+                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
             )
             await event.answer()
             return
@@ -1331,26 +1597,6 @@ async def callback_handler(event):
             orders = await orders_cursor.to_list(length=20)
             deposits_cursor = deposits_col.find({"user_id": user_id, "status": "approved"}).sort("created_at", -1)
             deposits = await deposits_cursor.to_list(length=20)
-            smm_cursor = smm_orders_col.find({"user_id": user_id}).sort("created_at", -1)
-            smm_orders = await smm_cursor.to_list(length=10)
-
-            # Fetch live status for SMM orders from provider (batch, best-effort)
-            smm_status_map = {}
-            if smm_orders and SMM_API_URL and SMM_API_KEY:
-                order_ids = ",".join(str(o["smm_order_id"]) for o in smm_orders)
-                try:
-                    async with aiohttp.ClientSession() as s:
-                        async with s.post(SMM_API_URL, data={
-                            "key": SMM_API_KEY, "action": "status", "orders": order_ids
-                        }) as r:
-                            res = await r.json(content_type=None)
-                    if isinstance(res, dict):
-                        for oid, info in res.items():
-                            if isinstance(info, dict) and info.get("status"):
-                                smm_status_map[str(oid)] = info["status"]
-                except Exception as e:
-                    logging.warning(f"SMM status fetch failed: {e}")
-
             combined = []
             for o in orders:
                 combined.append({
@@ -1368,16 +1614,6 @@ async def callback_handler(event):
                     "amount": d.get("amount", 0),
                     "date": d["created_at"],
                 })
-            for so in smm_orders:
-                live_status = smm_status_map.get(str(so["smm_order_id"]), so.get("status", "pending"))
-                combined.append({
-                    "type": "SMM",
-                    "service": so.get("service_name", "N/A"),
-                    "smm_order_id": so.get("smm_order_id"),
-                    "amount": so.get("cost", 0),
-                    "status": live_status,
-                    "date": so["created_at"],
-                })
             combined.sort(key=lambda x: x["date"], reverse=True)
             combined = combined[:20]
             if not combined:
@@ -1388,15 +1624,10 @@ async def callback_handler(event):
                     date_str = item["date"].strftime('%d/%m/%Y')
                     if item["type"] == "Purchase":
                         lines.append(f"🛒 {item['phone']} ({item['country']}) - ₹{item['amount']} - {date_str}")
-                    elif item["type"] == "SMM":
-                        lines.append(
-                            f"🎯 {item['service']} (#{item['smm_order_id']}) - ₹{item['amount']} - "
-                            f"Status: **{item['status']}** - {date_str}"
-                        )
                     else:
                         lines.append(f"💰 Deposit +₹{item['amount']} - {date_str}")
                 txt = "📜 **Transaction History:**\n" + "\n".join(lines)
-            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main")]])
+            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"main", style="primary")]])
             await event.answer()
             return
 
@@ -1406,28 +1637,275 @@ async def callback_handler(event):
             await event.answer()
             return
 
+        # ============================================================
+        #  SMM SERVICES CALLBACKS
+        # ============================================================
+        if data == "smm_services":
+            if not SMM_API_URL or not SMM_API_KEY:
+                await event.answer("❌ SMM panel not configured yet.", alert=True)
+                return
+            ok = await fetch_smm_services()
+            if not ok or not _smm_categorized:
+                await event.edit("❌ Could not load SMM services. Try again later.",
+                                  buttons=[[Button.inline("🔙 Back", b"main", style="primary")]])
+                await event.answer()
+                return
+            text, btns = await build_smm_platform_menu()
+            await event.edit(text, buttons=btns)
+            await event.answer()
+            return
+
+        if data.startswith("smm_cat_"):
+            parts = data.split("_")
+            platform, page = parts[2], int(parts[3])
+            if not _smm_categorized:
+                await fetch_smm_services()
+            text, btns = await build_smm_category_page(platform, page)
+            await event.edit(text, buttons=btns)
+            await event.answer()
+            return
+
+        if data.startswith("smm_svc_"):
+            parts = data.split("_")
+            platform, cidx, page = parts[2], int(parts[3]), int(parts[4])
+            text, btns = await build_smm_service_page(platform, cidx, page, await get_usd_inr())
+            if text is None:
+                await event.answer("Not found.", alert=True)
+                return
+            await event.edit(text, buttons=btns)
+            await event.answer()
+            return
+
+        if data == "smm_search":
+            if not _smm_all_services:
+                await fetch_smm_services()
+            user_states[user_id] = {"action": "smm_search", "step": "query"}
+            await event.edit(
+                "🔍 Send a keyword to search services (e.g. `views`, `members`, `reaction`, `Instagram`):",
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+            )
+            await event.answer()
+            return
+
+        if data == "smm_place_order":
+            user_states[user_id] = {"action": "smm_order", "step": "service_id"}
+            await event.edit(
+                "🆔 Enter the **Service ID** you want to order (shown above each service):",
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+            )
+            await event.answer()
+            return
+
+        if data == "smm_myorders":
+            cursor = smm_orders_col.find({"user_id": user_id}).sort("created_at", -1)
+            orders = await cursor.to_list(length=20)
+            if not orders:
+                txt = "📦 No SMM orders yet."
+            else:
+                order_ids = [o.get("smm_order_id") for o in orders if o.get("smm_order_id")]
+                live_status = await fetch_smm_order_status(order_ids)
+                for o in orders:
+                    sid = str(o.get("smm_order_id", ""))
+                    live = live_status.get(sid)
+                    if live and live.get("status"):
+                        o["status"] = live["status"]
+                        try:
+                            await smm_orders_col.update_one(
+                                {"_id": o["_id"]}, {"$set": {"status": live["status"]}}
+                            )
+                        except Exception:
+                            pass
+
+                lines = []
+                for o in orders:
+                    date_str = o["created_at"].strftime('%d/%m/%Y')
+                    status_text = o.get("status", "pending")
+                    st = SMM_STATUS_EMOJI.get(str(status_text).lower(), "❓")
+                    lines.append(
+                        f"🆔 Order `{o.get('smm_order_id', 'N/A')}` | {o.get('service_name', '?')[:25]}\n"
+                        f"{st} Status: **{status_text}**\n"
+                        f"💰 ₹{o.get('charge', 0)} | 📦 Qty: {o.get('quantity', 0)} | {date_str}"
+                    )
+                txt = "📦 **My SMM Orders:**\n\n" + "\n\n".join(lines)
+            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
+            await event.answer()
+            return
+
+        if data == "smm_confirm_order":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "smm_order" or state.get("step") != "confirm":
+                await event.answer("No pending order.", alert=True)
+                return
+
+            service = state["service"]
+            link = state["link"]
+            quantity = state["quantity"]
+            charge = state["charge"]
+
+            user = await users_col.find_one({"user_id": user_id})
+            balance = user["balance"] if user else 0
+            if balance < charge:
+                await event.answer("❌ Insufficient balance.", alert=True)
+                user_states.pop(user_id, None)
+                return
+
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(SMM_API_URL, data={
+                        "key": SMM_API_KEY,
+                        "action": "add",
+                        "service": service["service"],
+                        "link": link,
+                        "quantity": quantity,
+                    }) as r:
+                        result = await r.json(content_type=None)
+            except Exception as e:
+                await event.edit(f"❌ Order failed: {e}", buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
+                await event.answer()
+                fail_name = await get_display_name(user_id)
+                await log_event(
+                    f"❌ **SMM Order Failed (API Error)**\n"
+                    f"👤 User: {fail_name} (`{user_id}`)\n"
+                    f"📦 Service: {service['name']} (`{service['service']}`)\n"
+                    f"⚠️ Error: {e}\n"
+                    f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                )
+                user_states.pop(user_id, None)
+                return
+
+            if not isinstance(result, dict) or "order" not in result:
+                err = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown error"
+                await event.edit(f"❌ SMM panel rejected the order: {err}",
+                                  buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
+                await event.answer()
+                fail_name = await get_display_name(user_id)
+                await log_event(
+                    f"❌ **SMM Order Rejected (Panel Error)**\n"
+                    f"👤 User: {fail_name} (`{user_id}`)\n"
+                    f"📦 Service: {service['name']} (`{service['service']}`)\n"
+                    f"⚠️ Panel Error: {err}\n"
+                    f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                )
+                user_states.pop(user_id, None)
+                return
+
+            await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": -charge}}, upsert=True)
+            await smm_orders_col.insert_one({
+                "user_id": user_id,
+                "service_id": service["service"],
+                "service_name": service["name"],
+                "category": service.get("category", "Other"),
+                "link": link,
+                "quantity": quantity,
+                "charge": charge,
+                "smm_order_id": result["order"],
+                "status": "pending",
+                "created_at": datetime.utcnow(),
+            })
+            user_states.pop(user_id, None)
+
+            smm_buyer_name = await get_display_name(user_id)
+            updated_user = await users_col.find_one({"user_id": user_id})
+            new_bal = updated_user["balance"] if updated_user else 0
+            await log_event(
+                f"🚀 **New SMM Order**\n"
+                f"👤 User: {smm_buyer_name} (`{user_id}`)\n"
+                f"🆔 SMM Order ID: `{result['order']}`\n"
+                f"📦 Service: {service['name']} (`{service['service']}`)\n"
+                f"🗂️ Category: {service.get('category', 'Other')}\n"
+                f"🔗 Link: {link}\n"
+                f"📊 Quantity: {quantity}\n"
+                f"💰 Charged: ₹{charge} | 👛 Balance After: ₹{new_bal}\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
+            await event.edit(
+                f"✅ **Order placed!**\n\n"
+                f"🆔 Order ID: `{result['order']}`\n"
+                f"📦 Service: {service['name']}\n"
+                f"🔗 Link: {link}\n"
+                f"📊 Quantity: {quantity}\n"
+                f"💰 Charged: ₹{charge}",
+                buttons=[[Button.inline("🔙 Back to Menu", b"main", style="primary")]]
+            )
+            await event.answer()
+            return
+
+        if data == "smm_cancel_order":
+            user_states.pop(user_id, None)
+            await event.edit("❌ Order cancelled.", buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
+            await event.answer()
+            return
+
         # ---------- ADMIN PANEL ----------
         if data == "admin":
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
-                [Button.inline("➕ Add Account (OTP)", b"admin_add_otp")],
-                [Button.inline("📥 Add Account (Session)", b"admin_add_sess")],
-                [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock")],
-                [Button.inline("📋 Accounts (List)", b"admin_accounts")],
-                [Button.inline("💰 Add Balance", b"admin_addbal")],
-                [Button.inline("💲 Set Price", b"admin_setprice")],
-                [Button.inline("🕒 Pending Deposits", b"admin_deposits")],
-                [Button.inline("📜 Transaction History", b"admin_transactions")],
-                [Button.inline("💸 Withdrawal History", b"admin_withdrawals")],
-                [Button.inline("📞 Set Support Link", b"admin_support")],
-                [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw")],
-                [Button.inline("🔙 Back", b"main")],
+                [Button.inline("📦 Accounts & Stock", b"admin_cat_accounts", style="primary")],
+                [Button.inline("💰 Finance & Transactions", b"admin_cat_finance", style="primary")],
+                [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="primary")],
+                [Button.inline("⚙️ Bot Settings", b"admin_cat_settings", style="primary")],
+                [Button.inline("🔙 Back", b"main", style="primary")],
             ]
-            # Remove None entries (if pyrogram not installed)
-            btns = [btn for btn in btns if btn is not None]
-            await event.edit("⚙️ **Admin Panel**", buttons=btns)
+            await event.edit("⚙️ **Admin Panel**\n\nChoose a category:", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_accounts":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("➕ Add Account (OTP)", b"admin_add_otp", style="success")],
+                [Button.inline("📥 Add Account (Session)", b"admin_add_sess", style="success")],
+                [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock", style="success")],
+                [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("📦 **Accounts & Stock**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_finance":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("💰 Add Balance", b"admin_addbal", style="success")],
+                [Button.inline("💲 Set Price", b"admin_setprice", style="primary")],
+                [Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")],
+                [Button.inline("📜 Transaction History", b"admin_transactions", style="primary")],
+                [Button.inline("📜 Withdrawal History", b"admin_withdrawals", style="primary")],
+                [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("💰 **Finance & Transactions**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_smm":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("🚀 SMM Order History", b"admin_smm_orders", style="primary")],
+                [Button.inline("📈 Set SMM Markup", b"admin_smm_markup", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("🚀 **SMM Panel**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_settings":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("📞 Set Support Link", b"admin_support", style="primary")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit("⚙️ **Bot Settings**", buttons=btns)
             await event.answer()
             return
 
@@ -1448,7 +1926,7 @@ async def callback_handler(event):
                 "`....`\n\n"
                 "First line = country|price|2FA (2FA password, send `none` if accounts have no 2FA), "
                 "every line after that = one session string (one account per line).",
-                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]]
             )
             await event.answer()
             return
@@ -1464,7 +1942,7 @@ async def callback_handler(event):
             return
         if data == "admin_addbal":
             user_states[user_id] = {"action": "add_balance", "step": "await_user_id"}
-            await event.edit("👤 Send user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.edit("👤 Send user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             await event.answer()
             return
         if data == "admin_deposits":
@@ -1477,10 +1955,10 @@ async def callback_handler(event):
             for dep in pending:
                 txn_id = dep.get('txn_id', 'N/A')
                 btns.append([
-                    Button.inline(f"✅ Approve ₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}"),
-                    Button.inline(f"❌ Reject", f"reject_{dep['_id']}")
+                    Button.inline(f"✅ Approve ₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}", style="success"),
+                    Button.inline(f"❌ Reject", f"reject_{dep['_id']}", style="danger")
                 ])
-            btns.append([Button.inline("🔙 Back", b"admin")])
+            btns.append([Button.inline("🔙 Back", b"admin", style="primary")])
             await event.edit("🕒 **Pending Deposits**", buttons=btns)
             await event.answer()
             return
@@ -1492,7 +1970,6 @@ async def callback_handler(event):
                 return
             user_id_dep = deposit["user_id"]
             amount = deposit["amount"]
-            txn_id = deposit.get("txn_id", "N/A")
             await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "approved"}})
             await users_col.update_one(
                 {"user_id": user_id_dep},
@@ -1500,18 +1977,25 @@ async def callback_handler(event):
                 upsert=True
             )
             # referral bonus logic (simplified)
-            await event.edit(
-                f"✅ **Deposit Approved**\n\n"
-                f"👤 User: `{user_id_dep}`\n"
-                f"💰 Amount: ₹{amount}\n"
-                f"🔑 Txn ID: `{txn_id}`",
-                buttons=[[Button.inline("🔙 Admin Menu", b"admin")]]
+            admin_name = await get_display_name(user_id)
+            original_caption = event.message.text or event.message.message or ""
+            new_caption = (
+                original_caption
+                + f"\n\n✅ **APPROVED** by {admin_name}\n"
+                + f"🕐 {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
             )
-            await event.answer()
             try:
-                await bot.send_message(user_id_dep, f"✅ Your deposit of ₹{amount} has been approved!")
+                await event.edit(new_caption, buttons=None)
+            except MessageNotModifiedError:
+                pass
+            try:
+                await bot.send_message(
+                    user_id_dep,
+                    f"✅ **Deposit Approved!**\n💰 ₹{amount} added to your balance."
+                )
             except Exception:
                 pass
+            await event.answer("✅ Approved")
             return
         if data.startswith("reject_"):
             dep_id = data.split("_", 1)[1]
@@ -1519,29 +2003,33 @@ async def callback_handler(event):
             if not deposit or deposit["status"] != "pending":
                 await event.answer("Already processed.", alert=True)
                 return
-            user_id_dep = deposit["user_id"]
-            amount = deposit["amount"]
-            txn_id = deposit.get("txn_id", "N/A")
             await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "rejected"}})
-            await event.edit(
-                f"❌ **Deposit Rejected**\n\n"
-                f"👤 User: `{user_id_dep}`\n"
-                f"💰 Amount: ₹{amount}\n"
-                f"🔑 Txn ID: `{txn_id}`",
-                buttons=[[Button.inline("🔙 Admin Menu", b"admin")]]
+            admin_name = await get_display_name(user_id)
+            original_caption = event.message.text or event.message.message or ""
+            new_caption = (
+                original_caption
+                + f"\n\n❌ **REJECTED** by {admin_name}\n"
+                + f"🕐 {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
             )
-            await event.answer()
             try:
-                await bot.send_message(user_id_dep, f"❌ Your deposit of ₹{amount} was rejected. Contact support if this is a mistake.")
+                await event.edit(new_caption, buttons=None)
+            except MessageNotModifiedError:
+                pass
+            try:
+                await bot.send_message(
+                    deposit["user_id"],
+                    f"❌ **Deposit Rejected.**\nIf you believe this is a mistake, please contact support."
+                )
             except Exception:
                 pass
+            await event.answer("❌ Rejected")
             return
         if data == "admin_setprice":
             if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_price", "step": "await_price"}
-            await event.edit("💲 Send new default price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.edit("💲 Send new default price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             await event.answer()
             return
         if data == "admin_support":
@@ -1549,7 +2037,7 @@ async def callback_handler(event):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_support_link", "step": "await_link"}
-            await event.edit("📞 Send support link or 'remove':", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.edit("📞 Send support link or 'remove':", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             await event.answer()
             return
         if data == "admin_minwithdraw":
@@ -1557,7 +2045,39 @@ async def callback_handler(event):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
-            await event.edit("💸 Send new minimum withdrawal amount:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.edit("💸 Send new minimum withdrawal amount:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
+            await event.answer()
+            return
+        if data == "admin_smm_markup":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            default_m = await get_smm_markup("")
+            member_m = await get_smm_markup("Members Subscribers")
+            await event.edit(
+                f"📈 **SMM Markup Settings**\n\n"
+                f"• Default (all other services): **{default_m}x** ({round((default_m-1)*100)}%)\n"
+                f"• Members/Subscribers: **{member_m}x** ({round((member_m-1)*100)}%)\n\n"
+                "Which one do you want to change?",
+                buttons=[
+                    [Button.inline("✏️ Edit Default Markup", b"admin_smm_markup_default", style="primary")],
+                    [Button.inline("✏️ Edit Member Markup", b"admin_smm_markup_member", style="primary")],
+                    [Button.inline("🔙 Back", b"admin", style="primary")],
+                ]
+            )
+            await event.answer()
+            return
+        if data in ("admin_smm_markup_default", "admin_smm_markup_member"):
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            is_member = data.endswith("_member")
+            label = "Members/Subscribers" if is_member else "Default"
+            user_states[user_id] = {"action": "set_smm_markup", "step": "await_value", "member": is_member}
+            await event.edit(
+                f"📈 Send new **{label}** markup multiplier (e.g. `1.5` = 50% markup):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_smm_markup", style="danger")]]
+            )
             await event.answer()
             return
 
@@ -1569,7 +2089,7 @@ async def callback_handler(event):
                     await event.answer("❌ Session expired. Start again.", alert=True)
                     return
                 state["step"] = "country_manual"
-                await event.edit("🌍 Send new country code (e.g., IN):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                await event.edit("🌍 Send new country code (e.g., IN):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             else:
                 country = data[len("addcountry_"):]
                 state = user_states.get(user_id)
@@ -1578,7 +2098,7 @@ async def callback_handler(event):
                     return
                 state["country"] = country
                 state["step"] = "price"
-                await event.edit("💵 Send price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                await event.edit("💵 Send price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             await event.answer()
             return
 
@@ -1611,7 +2131,7 @@ async def callback_handler(event):
                     await bot.send_message(withdrawal["user_id"], f"✅ Withdrawal of ₹{withdrawal['amount']} approved.")
                 except:
                     pass
-                await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             else:
                 await withdrawals_col.update_one(
                     {"_id": ObjectId(w_id)},
@@ -1621,7 +2141,7 @@ async def callback_handler(event):
                     await bot.send_message(withdrawal["user_id"], f"❌ Withdrawal of ₹{withdrawal['amount']} rejected.")
                 except:
                     pass
-                await event.edit("❌ Withdrawal rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await event.edit("❌ Withdrawal rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             await event.answer()
             return
 
@@ -1673,17 +2193,17 @@ async def show_user_withdrawals(event, user_id):
         btns = []
         page_row = []
         if page > 1:
-            page_row.append(Button.inline("⬅️ Prev", f"user_wd_page_{page-1}"))
+            page_row.append(Button.inline("⬅️ Prev", f"user_wd_page_{page-1}", style="primary"))
         if page < total_pages:
-            page_row.append(Button.inline("Next ➡️", f"user_wd_page_{page+1}"))
+            page_row.append(Button.inline("Next ➡️", f"user_wd_page_{page+1}", style="primary"))
         if page_row:
             btns.append(page_row)
-        btns.append([Button.inline("🔙 Back to Referral", b"referral_info")])
+        btns.append([Button.inline("🔙 Back to Referral", b"referral_info", style="primary")])
 
         await event.edit(txt, buttons=btns)
     except Exception as e:
         logging.error(f"Error in show_user_withdrawals: {e}", exc_info=True)
-        await event.edit("❌ Error loading withdrawals.", buttons=[[Button.inline("🔙 Back", b"referral_info")]])
+        await event.edit("❌ Error loading withdrawals.", buttons=[[Button.inline("🔙 Back", b"referral_info", style="primary")]])
 
 
 # ============================================================
@@ -1692,7 +2212,7 @@ async def show_user_withdrawals(event, user_id):
 
 async def start_add_phone_flow(event):
     user_states[event.sender_id] = {"action": "add_phone_otp", "step": "phone"}
-    await event.edit("📱 Send phone (e.g., +919876543210):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+    await event.edit("📱 Send phone (e.g., +919876543210):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
 
 async def process_phone_otp_step(event):
     user_id = event.sender_id
@@ -1710,10 +2230,10 @@ async def process_phone_otp_step(event):
             state["temp_client"] = temp_client
             state["phone_code_hash"] = sent.phone_code_hash
             state["step"] = "otp"
-            await event.respond("✉️ OTP sent! Send code:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond("✉️ OTP sent! Send code:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
         except Exception as e:
             await temp_client.disconnect()
-            await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             user_states.pop(user_id, None)
     elif step == "otp":
         code = event.message.text.strip()
@@ -1722,20 +2242,20 @@ async def process_phone_otp_step(event):
             await temp_client.sign_in(state["phone"], code)
         except SessionPasswordNeededError:
             state["step"] = "2fa"
-            await event.respond("🔒 2FA password required. Send password:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond("🔒 2FA password required. Send password:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             return
         except Exception as e:
             await temp_client.disconnect()
-            await event.respond(f"❌ Login failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond(f"❌ Login failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             user_states.pop(user_id, None)
             return
         session_str = temp_client.session.save()
         state["session"] = session_str
         state["step"] = "choose_country"
         existing = await get_existing_countries()
-        btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-        btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-        btns.append([Button.inline("🔙 Cancel", b"admin")])
+        btns = [[Button.inline(c, f"addcountry_{c}", style="primary")] for c in existing]
+        btns.append([Button.inline("➕ New Country", b"addcountry_new", style="primary")])
+        btns.append([Button.inline("🔙 Cancel", b"admin", style="danger")])
         await temp_client.disconnect()
         await event.respond("🌍 Select country or add new:", buttons=btns)
     elif step == "2fa":
@@ -1748,27 +2268,27 @@ async def process_phone_otp_step(event):
             state["twofa_password"] = password
             state["step"] = "choose_country"
             existing = await get_existing_countries()
-            btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-            btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-            btns.append([Button.inline("🔙 Cancel", b"admin")])
+            btns = [[Button.inline(c, f"addcountry_{c}", style="primary")] for c in existing]
+            btns.append([Button.inline("➕ New Country", b"addcountry_new", style="primary")])
+            btns.append([Button.inline("🔙 Cancel", b"admin", style="danger")])
             await temp_client.disconnect()
             await event.respond("🌍 Select country or add new:", buttons=btns)
         except Exception as e:
             await temp_client.disconnect()
-            await event.respond(f"❌ 2FA failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond(f"❌ 2FA failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             user_states.pop(user_id, None)
     elif step == "country_manual":
         country = event.message.text.strip().upper()
         state["country"] = country
         state["step"] = "price"
-        await event.respond("💵 Send price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+        await event.respond("💵 Send price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
     elif step == "price":
         try:
             price = float(event.message.text.strip())
             if price <= 0:
                 raise ValueError
         except:
-            await event.respond("❌ Invalid price. Send positive number:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond("❌ Invalid price. Send positive number:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             return
         state["price"] = price
         phone = state["phone"]
@@ -1786,12 +2306,12 @@ async def process_phone_otp_step(event):
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, session_str)
-        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
         user_states.pop(user_id, None)
 
 async def start_add_session_flow(event):
     user_states[event.sender_id] = {"action": "add_session", "step": "session"}
-    await event.edit("🔑 Send session string:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+    await event.edit("🔑 Send session string:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
 
 async def process_session_step(event):
     user_id = event.sender_id
@@ -1807,7 +2327,7 @@ async def process_session_step(event):
             await temp_client.connect()
             if not await temp_client.is_user_authorized():
                 await temp_client.disconnect()
-                await event.respond("❌ Invalid session.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await event.respond("❌ Invalid session.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
                 user_states.pop(user_id, None)
                 return
             me = await temp_client.get_me()
@@ -1815,10 +2335,10 @@ async def process_session_step(event):
             state["phone"] = phone
             state["client"] = temp_client
             state["step"] = "ask_2fa"
-            await event.respond(f"📱 Number: {phone}\n\n🔐 2FA password? (send or 'skip'):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond(f"📱 Number: {phone}\n\n🔐 2FA password? (send or 'skip'):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
         except Exception as e:
             await temp_client.disconnect()
-            await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond(f"❌ Error: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             user_states.pop(user_id, None)
     elif step == "ask_2fa":
         answer = event.message.text.strip()
@@ -1826,22 +2346,22 @@ async def process_session_step(event):
             state["twofa_password"] = answer
         state["step"] = "choose_country"
         existing = await get_existing_countries()
-        btns = [[Button.inline(c, f"addcountry_{c}")] for c in existing]
-        btns.append([Button.inline("➕ New Country", b"addcountry_new")])
-        btns.append([Button.inline("🔙 Cancel", b"admin")])
+        btns = [[Button.inline(c, f"addcountry_{c}", style="primary")] for c in existing]
+        btns.append([Button.inline("➕ New Country", b"addcountry_new", style="primary")])
+        btns.append([Button.inline("🔙 Cancel", b"admin", style="danger")])
         await event.respond("🌍 Select country or add new:", buttons=btns)
     elif step == "country_manual":
         country = event.message.text.strip().upper()
         state["country"] = country
         state["step"] = "price"
-        await event.respond("💵 Send price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+        await event.respond("💵 Send price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
     elif step == "price":
         try:
             price = float(event.message.text.strip())
             if price <= 0:
                 raise ValueError
         except:
-            await event.respond("❌ Invalid price. Send a positive number:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond("❌ Invalid price. Send a positive number:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             return
         
         phone = state.get("phone")
@@ -1869,7 +2389,7 @@ async def process_session_step(event):
             logging.error(f"[ERROR] No session found in state: {state}")
             await event.respond(
                 "❌ No session found. Please start again using the 'Add Account (Session File)' option.",
-                buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+                buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]]
             )
             user_states.pop(user_id, None)
             return
@@ -1886,7 +2406,7 @@ async def process_session_step(event):
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, new_session)
-        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
         user_states.pop(user_id, None)
 
 
@@ -1907,7 +2427,7 @@ async def process_add_stock_step(event):
         await event.respond(
             "❌ Invalid format. Send the header line and at least one session string.\n\n"
             "Example:\n`India|55|real1`\n`session_string_1`",
-            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]]
         )
         return
 
@@ -1916,7 +2436,7 @@ async def process_add_stock_step(event):
     if len(parts) < 2:
         await event.respond(
             "❌ Invalid header. Use format: `CountryName|price|2FA`",
-            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]]
         )
         return
 
@@ -1928,7 +2448,7 @@ async def process_add_stock_step(event):
     except ValueError:
         await event.respond(
             "❌ Invalid price in header. Use format: `CountryName|price|2FA`",
-            buttons=[[Button.inline("🔙 Cancel", b"admin")]]
+            buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]]
         )
         return
     twofa = parts[2] if len(parts) > 2 and parts[2].lower() not in ("", "none", "skip") else None
@@ -2004,8 +2524,16 @@ async def process_add_stock_step(event):
         if len(fail_reasons) > 10:
             summary += f"\n...and {len(fail_reasons) - 10} more."
 
-    await event.respond(summary, buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
-    await log_event(f"📦 Stock added by {user_id}: {added} accounts ({country} @ ₹{price})")
+    await event.respond(summary, buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+    admin_name = await get_display_name(user_id)
+    await log_event(
+        f"📦 **Stock Added**\n"
+        f"👤 Admin: {admin_name} (`{user_id}`)\n"
+        f"🌍 Country: {country}\n"
+        f"💰 Price: ₹{price} {'| 2FA set' if twofa else '| no 2FA'}\n"
+        f"➕ Added: {added} | ♻️ Duplicates: {duplicates} | ❌ Failed: {failed}\n"
+        f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+    )
     user_states.pop(user_id, None)
 
 
@@ -2025,13 +2553,13 @@ async def process_deposit_step(event):
             if amount <= 0 or amount < MIN_DEPOSIT:
                 raise ValueError
         except:
-            await event.respond(f"❌ Invalid. Min ₹{MIN_DEPOSIT}.", buttons=[[Button.inline("🔙 Cancel", b"main")]])
+            await event.respond(f"❌ Invalid. Min ₹{MIN_DEPOSIT}.", buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
             return
         state["amount"] = amount
         txn_id = f"DEP{datetime.now().strftime('%y%m%d%H%M')}{random.randint(1000,9999)}"
         state["txn_id"] = txn_id
 
-        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=REF{user_id}"
+        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn=ref{user_id}"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -2039,18 +2567,17 @@ async def process_deposit_step(event):
         buf.name = "qr_code.png"
         caption = (
             f"💳 **Deposit ₹{amount}**\n"
-            f"🔑 **Txn ID:** `{txn_id}`\n"
-            f"🆔 **Referral ID:** `REF{user_id}`\n\n"
-            f"📌 **Payment note will auto-fill with your Referral ID.**\n"
-            f"If it doesn't auto-fill, mention `REF{user_id}` manually in the payment note.\n\n"
+            f"🔑 **Txn ID:** `{txn_id}`\n\n"
+            f"📌 **Mention this Txn ID in payment note.**\n"
+            f"🆔 **Your Referral/Payment ID:** `ref{user_id}`\n\n"
             f"Scan QR or use UPI: `{UPI_ID}`\n\n"
             "Send screenshot after payment."
         )
-        await bot.send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main")]])
+        await bot.send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
         state["step"] = "screenshot"
     elif step == "screenshot":
         if not event.message.photo:
-            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"main")]])
+            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
             return
         amount = state["amount"]
         txn_id = state.get("txn_id", "N/A")
@@ -2071,15 +2598,23 @@ async def process_deposit_step(event):
                 await bot.send_file(admin, photo_io,
                     caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`",
                     buttons=[
-                        [Button.inline("✅ Approve", f"approve_{dep_id}"),
-                         Button.inline("❌ Reject", f"reject_{dep_id}")]
+                        [Button.inline("✅ Approve", f"approve_{dep_id}", style="success"),
+                         Button.inline("❌ Reject", f"reject_{dep_id}", style="danger")]
                     ])
                 photo_io.seek(0)
             except:
                 pass
-        await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"main")]])
+        await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"main", style="primary")]])
         user_states.pop(user_id, None)
-        await log_event(f"💳 Deposit request: {user_id} ₹{amount} Txn:{txn_id}")
+        dep_name = await get_display_name(user_id)
+        await log_event(
+            f"💳 **Deposit Request**\n"
+            f"👤 User: {dep_name} (`{user_id}`)\n"
+            f"💰 Amount: ₹{amount}\n"
+            f"🧾 Txn ID: `{txn_id}`\n"
+            f"🆔 Deposit ID: `{dep_id}`\n"
+            f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+        )
 
 
 # ============================================================
@@ -2103,51 +2638,6 @@ async def handle_message(event):
         await process_add_stock_step(event)
         return
 
-    # ---- SMM SERVICE ORDER FLOW ----
-    if action == "smm_link":
-        link = (event.message.text or "").strip()
-        if not link:
-            await event.respond("❌ Send a valid link/username.")
-            return
-        svc = state["service"]
-        state["link"] = link
-        state["action"] = "smm_quantity"
-        await event.respond(
-            f"📊 Enter **quantity** (Min: {svc['min']} | Max: {svc['max']}):",
-            buttons=[[Button.inline("🔙 Cancel", b"smm")]]
-        )
-        return
-
-    if action == "smm_quantity":
-        svc = state["service"]
-        rate = state["rate"]
-        try:
-            qty = int((event.message.text or "").strip())
-        except ValueError:
-            await event.respond("❌ Enter a valid number.")
-            return
-        if qty < int(svc["min"]) or qty > int(svc["max"]):
-            await event.respond(f"❌ Quantity must be between {svc['min']} and {svc['max']}.")
-            return
-        cost = round(rate * qty / 1000, 2)
-        user = await users_col.find_one({"user_id": user_id})
-        balance = user["balance"] if user else 0
-        state.update({"action": "smm_confirm", "quantity": qty, "cost": cost})
-        bal_ok = balance >= cost
-        await event.respond(
-            f"📋 **Order Summary**\n\n"
-            f"📦 {svc['name']}\n"
-            f"🔗 {state['link']}\n"
-            f"📊 Qty: {qty}\n"
-            f"💰 Cost: ₹{cost}\n"
-            f"👛 Balance: ₹{balance}\n\n"
-            f"{'✅ Sufficient balance' if bal_ok else '❌ Insufficient balance — add funds first'}",
-            buttons=[
-                [Button.inline("✅ Confirm", b"smm_confirm"), Button.inline("❌ Cancel", b"smm_cancel")]
-            ]
-        )
-        return
-
     # ---- OTHER FLOWS ----
     if action == "add_phone_otp":
         await process_phone_otp_step(event)
@@ -2159,16 +2649,16 @@ async def handle_message(event):
             try:
                 uid = int(event.message.text.strip())
             except:
-                await event.respond("❌ Invalid ID.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                await event.respond("❌ Invalid ID.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
                 return
             state["uid"] = uid
             state["step"] = "await_amount"
-            await event.respond("💵 Send amount to add:", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+            await event.respond("💵 Send amount to add:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
         elif step == "await_amount":
             try:
                 amt = float(event.message.text.strip())
             except:
-                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
                 return
             uid = state["uid"]
             await users_col.update_one(
@@ -2176,7 +2666,7 @@ async def handle_message(event):
                 {"$inc": {"balance": amt}, "$setOnInsert": {"joined_at": datetime.utcnow()}},
                 upsert=True
             )
-            await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
@@ -2188,24 +2678,24 @@ async def handle_message(event):
                 if amount <= 0:
                     raise ValueError
             except:
-                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"referral_info")]])
+                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]])
                 return
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
             if amount > withdrawable:
-                await event.respond(f"❌ You have ₹{withdrawable} only.", buttons=[[Button.inline("🔙 Cancel", b"referral_info")]])
+                await event.respond(f"❌ You have ₹{withdrawable} only.", buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]])
                 return
             min_wd = await get_min_withdrawal()
             if amount < min_wd:
-                await event.respond(f"❌ Minimum withdrawal ₹{min_wd}.", buttons=[[Button.inline("🔙 Cancel", b"referral_info")]])
+                await event.respond(f"❌ Minimum withdrawal ₹{min_wd}.", buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]])
                 return
             state["amount"] = amount
             state["step"] = "upi"
-            await event.respond("💳 Enter UPI ID (e.g., example@upi):", buttons=[[Button.inline("🔙 Cancel", b"referral_info")]])
+            await event.respond("💳 Enter UPI ID (e.g., example@upi):", buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]])
         elif step == "upi":
             upi = event.message.text.strip()
             if not upi or "@" not in upi:
-                await event.respond("❌ Invalid UPI. Try again:", buttons=[[Button.inline("🔙 Cancel", b"referral_info")]])
+                await event.respond("❌ Invalid UPI. Try again:", buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]])
                 return
             amount = state["amount"]
             result = await withdrawals_col.insert_one({
@@ -2221,14 +2711,22 @@ async def handle_message(event):
                     await bot.send_message(admin,
                         f"🔔 **Withdrawal Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nUPI: `{upi}`",
                         buttons=[
-                            [Button.inline("✅ Approve", f"wapprove_{w_id}"),
-                             Button.inline("❌ Reject", f"wreject_{w_id}")]
+                            [Button.inline("✅ Approve", f"wapprove_{w_id}", style="success"),
+                             Button.inline("❌ Reject", f"wreject_{w_id}", style="danger")]
                         ]
                     )
                 except:
                     pass
-            await event.respond(f"✅ Withdrawal of ₹{amount} submitted.", buttons=[[Button.inline("🔙 Referral Info", b"referral_info")]])
-            await log_event(f"💸 Withdrawal request: {user_id} ₹{amount} UPI:{upi}")
+            await event.respond(f"✅ Withdrawal of ₹{amount} submitted.", buttons=[[Button.inline("🔙 Referral Info", b"referral_info", style="primary")]])
+            wd_name = await get_display_name(user_id)
+            await log_event(
+                f"💸 **Withdrawal Request**\n"
+                f"👤 User: {wd_name} (`{user_id}`)\n"
+                f"💰 Amount: ₹{amount}\n"
+                f"🏦 UPI: `{upi}`\n"
+                f"🆔 Withdrawal ID: `{w_id}`\n"
+                f"🕐 Time: {datetime.utcnow().strftime('%d/%m/%Y %H:%M:%S')} UTC"
+            )
             user_states.pop(user_id, None)
     elif action == "set_support_link":
         step = state.get("step")
@@ -2236,10 +2734,10 @@ async def handle_message(event):
             link = event.message.text.strip()
             if link.lower() == "remove":
                 await settings_col.delete_one({"key": "support_link"})
-                await event.respond("✅ Removed.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await event.respond("✅ Removed.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             else:
                 await set_support_link(link)
-                await event.respond(f"✅ Updated to `{link}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+                await event.respond(f"✅ Updated to `{link}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
     elif action == "set_price":
         step = state.get("step")
@@ -2249,7 +2747,7 @@ async def handle_message(event):
                 if new_price <= 0:
                     raise ValueError
             except:
-                await event.respond("❌ Invalid price.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                await event.respond("❌ Invalid price.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
                 return
             await settings_col.update_one(
                 {"key": "default_price"},
@@ -2258,7 +2756,7 @@ async def handle_message(event):
             )
             global DEFAULT_PRICE
             DEFAULT_PRICE = new_price
-            await event.respond(f"✅ Default price ₹{new_price}.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await event.respond(f"✅ Default price ₹{new_price}.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
     elif action == "set_min_withdraw":
         step = state.get("step")
@@ -2268,11 +2766,126 @@ async def handle_message(event):
                 if val <= 0:
                     raise ValueError
             except:
-                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"admin")]])
+                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
                 return
             await set_min_withdrawal(val)
-            await event.respond(f"✅ Min withdrawal ₹{val}.", buttons=[[Button.inline("🔙 Admin Menu", b"admin")]])
+            await event.respond(f"✅ Min withdrawal ₹{val}.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
+
+    elif action == "set_smm_markup":
+        step = state.get("step")
+        if step == "await_value":
+            try:
+                val = float(event.message.text.strip())
+                if val <= 0:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid multiplier. Send a number like `1.2`.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_smm_markup", style="danger")]])
+                return
+            is_member = state.get("member", False)
+            await set_smm_markup(val, member=is_member)
+            label = "Members/Subscribers" if is_member else "Default"
+            await event.respond(f"✅ {label} SMM markup set to {val}x.",
+                                 buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+            user_states.pop(user_id, None)
+
+    elif action == "smm_search":
+        step = state.get("step")
+        if step == "query":
+            query = event.message.text.strip()
+            if len(query) < 2:
+                await event.respond("❌ Please send at least 2 characters to search.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                return
+            usd = await get_usd_inr()
+            text, btns = await build_smm_search_results(query, usd)
+            user_states.pop(user_id, None)
+            await event.respond(text, buttons=btns)
+            return
+
+    elif action == "smm_order":
+        step = state.get("step")
+
+        if step == "service_id":
+            sid_text = event.message.text.strip()
+            if not sid_text.isdigit():
+                await event.respond("❌ Invalid Service ID. Send numeric ID only.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                return
+            sid = int(sid_text)
+            if not _smm_all_services:
+                await fetch_smm_services()
+            service = next((s for s in _smm_all_services if str(s.get("service")) == str(sid)), None)
+            if not service:
+                await event.respond("❌ Service ID not found.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                return
+            state["service"] = service
+            state["step"] = "link"
+            await event.respond(
+                f"📦 **{service['name']}**\n"
+                f"Min: {service['min']} | Max: {service['max']}\n\n"
+                "🔗 Now send the **link** (post/profile/video URL) for this order:",
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+            )
+            return
+
+        if step == "link":
+            link = event.message.text.strip()
+            if not link.startswith("http"):
+                await event.respond("❌ Please send a valid link starting with http/https.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                return
+            state["link"] = link
+            state["step"] = "quantity"
+            service = state["service"]
+            await event.respond(
+                f"📊 Send the **quantity** you want (Min: {service['min']}, Max: {service['max']}):",
+                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+            )
+            return
+
+        if step == "quantity":
+            service = state["service"]
+            try:
+                qty = int(event.message.text.strip())
+            except:
+                await event.respond("❌ Invalid quantity. Send a number.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                return
+            min_q, max_q = int(float(service["min"])), int(float(service["max"]))
+            if qty < min_q or qty > max_q:
+                await event.respond(f"❌ Quantity must be between {min_q} and {max_q}.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                return
+
+            usd = await get_usd_inr()
+            markup = await get_smm_markup(service.get("category", ""))
+            charge = round((float(service["rate"]) / 1000) * qty * usd * markup, 2)
+
+            user = await users_col.find_one({"user_id": user_id})
+            balance = user["balance"] if user else 0
+
+            state["quantity"] = qty
+            state["charge"] = charge
+            state["step"] = "confirm"
+
+            text = (
+                f"🧾 **Order Summary**\n\n"
+                f"📦 Service: {service['name']}\n"
+                f"🔗 Link: {state['link']}\n"
+                f"📊 Quantity: {qty}\n"
+                f"💰 Charge: ₹{charge}\n"
+                f"👛 Your balance: ₹{balance}\n\n"
+                + ("✅ Confirm to place the order." if balance >= charge
+                   else "❌ Insufficient balance — please deposit first.")
+            )
+            buttons = [[Button.inline("✅ Confirm Order", b"smm_confirm_order", style="success")],
+                       [Button.inline("❌ Cancel", b"smm_cancel_order", style="danger")]]
+            await event.respond(text, buttons=buttons)
+            return
+
     else:
         await send_main_menu(event)
 
@@ -2316,18 +2929,32 @@ async def start_cmd(event):
 # ---------- MAIN ----------
 async def main():
     if not BOT_TOKEN:
-        logging.error("❌ BOT_TOKEN missing!")
-        return
+        logging.error("❌ BOT_TOKEN missing! Exiting.")
+        sys.exit(1)
+
+    masked = BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:] if len(BOT_TOKEN) > 12 else "***"
+    logging.info(f"Starting with BOT_TOKEN={masked} (len={len(BOT_TOKEN)}), cwd={os.getcwd()}")
+
     try:
-        await bot.start(bot_token=BOT_TOKEN)
-    except AccessTokenInvalidError:
-        logging.error("❌ Invalid BOT_TOKEN!")
-        return
+        await bot.connect()
     except Exception as e:
-        logging.error(f"❌ Start error: {e}")
-        return
+        logging.error(f"❌ Could not connect to Telegram: {e}")
+        sys.exit(1)
+
+    try:
+        if not await bot.is_user_authorized():
+            # Explicit bot sign-in only — never falls back to interactive
+            # phone/token input() the way client.start() can on a flaky env.
+            await bot.sign_in(bot_token=BOT_TOKEN)
+    except AccessTokenInvalidError:
+        logging.error("❌ Invalid BOT_TOKEN! Check your .env value against @BotFather.")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"❌ Sign-in error: {e}")
+        sys.exit(1)
+
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, ADMIN_IDS)
     await acc_mgr.load_all()
     logging.info("🚀 Bot started successfully...")
     await bot.run_until_disconnected()
