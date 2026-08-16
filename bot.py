@@ -1508,11 +1508,19 @@ async def callback_handler(event):
 
             old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
             new_withdrawable = max(0, old_withdrawable - price)
-            await users_col.update_one(
-                {"user_id": user_id},
-                {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}},
-                upsert=True
+            deduct_result = await users_col.update_one(
+                {"user_id": user_id, "balance": {"$gte": price}},
+                {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}}
             )
+            if deduct_result.modified_count == 0:
+                # Balance was insufficient at the moment of deduction (e.g. spent
+                # elsewhere concurrently) — release the reserved account back to stock.
+                await accounts_col.update_one(
+                    {"_id": acc["_id"]},
+                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
+                )
+                await event.answer("❌ Insufficient balance! Please deposit and try again.", alert=True)
+                return
 
             await orders_col.insert_one({
                 "user_id": user_id,
@@ -1791,9 +1799,13 @@ async def callback_handler(event):
             quantity = state["quantity"]
             charge = state["charge"]
 
-            user = await users_col.find_one({"user_id": user_id})
-            balance = user["balance"] if user else 0
-            if balance < charge:
+            # Atomically reserve the charge FIRST — prevents both double-spend
+            # (e.g. fast double-tap) and placing a paid order without payment.
+            deduct_result = await users_col.update_one(
+                {"user_id": user_id, "balance": {"$gte": charge}},
+                {"$inc": {"balance": -charge}}
+            )
+            if deduct_result.modified_count == 0:
                 await event.answer("❌ Insufficient balance.", alert=True)
                 user_states.pop(user_id, None)
                 return
@@ -1809,7 +1821,10 @@ async def callback_handler(event):
                     }) as r:
                         result = await r.json(content_type=None)
             except Exception as e:
-                await event.edit(f"❌ Order failed: {e}", buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
+                # Refund since the order was never placed.
+                await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
+                await event.edit(f"❌ Order failed: {e}\n\n💰 Your ₹{charge} has been refunded.",
+                                  buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
                 fail_name = await get_display_name(user_id)
                 await log_event(
@@ -1817,6 +1832,7 @@ async def callback_handler(event):
                     f"👤 User: {fail_name} (`{user_id}`)\n"
                     f"📦 Service: {service['name']} (`{service['service']}`)\n"
                     f"⚠️ Error: {e}\n"
+                    f"💰 Refunded: ₹{charge}\n"
                     f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
                 )
                 user_states.pop(user_id, None)
@@ -1824,7 +1840,9 @@ async def callback_handler(event):
 
             if not isinstance(result, dict) or "order" not in result:
                 err = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown error"
-                await event.edit(f"❌ SMM panel rejected the order: {err}",
+                # Refund since the panel did not accept the order.
+                await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
+                await event.edit(f"❌ SMM panel rejected the order: {err}\n\n💰 Your ₹{charge} has been refunded.",
                                   buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
                 fail_name = await get_display_name(user_id)
@@ -1833,12 +1851,12 @@ async def callback_handler(event):
                     f"👤 User: {fail_name} (`{user_id}`)\n"
                     f"📦 Service: {service['name']} (`{service['service']}`)\n"
                     f"⚠️ Panel Error: {err}\n"
+                    f"💰 Refunded: ₹{charge}\n"
                     f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
                 )
                 user_states.pop(user_id, None)
                 return
 
-            await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": -charge}}, upsert=True)
             await smm_orders_col.insert_one({
                 "user_id": user_id,
                 "service_id": service["service"],
@@ -2258,14 +2276,8 @@ async def callback_handler(event):
                 await event.answer("Already processed.", alert=True)
                 return
             if action == "wapprove":
-                user_doc = await users_col.find_one({"user_id": withdrawal["user_id"]})
-                if not user_doc or user_doc.get("withdrawable_balance", 0) < withdrawal["amount"]:
-                    await event.answer("Insufficient balance.", alert=True)
-                    return
-                await users_col.update_one(
-                    {"user_id": withdrawal["user_id"]},
-                    {"$inc": {"balance": -withdrawal["amount"], "withdrawable_balance": -withdrawal["amount"]}}
-                )
+                # Funds were already reserved (deducted) when the request was
+                # submitted — approval just confirms it, no further deduction.
                 await withdrawals_col.update_one(
                     {"_id": ObjectId(w_id)},
                     {"$set": {"status": "approved", "processed_at": now_ist()}}
@@ -2276,15 +2288,26 @@ async def callback_handler(event):
                     pass
                 await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             else:
+                # Refund the reserved amount back since the withdrawal did not happen.
+                await users_col.update_one(
+                    {"user_id": withdrawal["user_id"]},
+                    {"$inc": {"balance": withdrawal["amount"], "withdrawable_balance": withdrawal["amount"]}},
+                    upsert=True
+                )
                 await withdrawals_col.update_one(
                     {"_id": ObjectId(w_id)},
                     {"$set": {"status": "rejected", "processed_at": now_ist()}}
                 )
                 try:
-                    await bot.send_message(withdrawal["user_id"], f"❌ Withdrawal of ₹{withdrawal['amount']} rejected.")
+                    await bot.send_message(
+                        withdrawal["user_id"],
+                        f"❌ Withdrawal of ₹{withdrawal['amount']} rejected. "
+                        f"The amount has been refunded to your withdrawable balance."
+                    )
                 except:
                     pass
-                await event.edit("❌ Withdrawal rejected.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+                await event.edit("❌ Withdrawal rejected (amount refunded to user).",
+                                  buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             await event.answer()
             return
 
@@ -2840,6 +2863,23 @@ async def handle_message(event):
                 await event.respond("❌ Invalid UPI. Try again:", buttons=[[Button.inline("🔙 Cancel", b"referral_info", style="danger")]])
                 return
             amount = state["amount"]
+
+            # Atomically reserve the funds right now so the same balance can't be
+            # used for another withdrawal request or a purchase while this one
+            # is pending. Refunded automatically if the admin rejects it.
+            reserve_result = await users_col.update_one(
+                {"user_id": user_id, "withdrawable_balance": {"$gte": amount}},
+                {"$inc": {"balance": -amount, "withdrawable_balance": -amount}}
+            )
+            if reserve_result.modified_count == 0:
+                await event.respond(
+                    "❌ Insufficient withdrawable balance (it may have changed). "
+                    "Please check your balance and try again.",
+                    buttons=[[Button.inline("🔙 Referral Info", b"referral_info", style="primary")]]
+                )
+                user_states.pop(user_id, None)
+                return
+
             result = await withdrawals_col.insert_one({
                 "user_id": user_id,
                 "amount": amount,
