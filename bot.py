@@ -2083,7 +2083,7 @@ async def callback_handler(event):
                 if bonus > 0:
                     await users_col.update_one(
                         {"user_id": referrer_id},
-                        {"$inc": {"balance": bonus, "referral_earnings": bonus}},
+                        {"$inc": {"balance": bonus, "withdrawable_balance": bonus, "referral_earnings": bonus}},
                         upsert=True
                     )
                     await users_col.update_one(
