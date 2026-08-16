@@ -42,7 +42,8 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 UPI_ID = os.getenv("UPI_ID", "example@upi").strip()
 PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop").strip()
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50").strip())
-REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "5").strip())
+REFERRAL_BONUS_PERCENT = float(os.getenv("REFERRAL_BONUS_PERCENT", "10").strip())
+REFERRAL_BONUS_MAX = float(os.getenv("REFERRAL_BONUS_MAX", "5").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
 
 SMM_API_URL = os.getenv("SMM_API_URL", "").strip()
@@ -151,6 +152,32 @@ async def set_smm_markup(value: float, member: bool = False):
     key = "smm_markup_member" if member else "smm_markup_default"
     await settings_col.update_one(
         {"key": key},
+        {"$set": {"value": value, "updated_at": now_ist()}},
+        upsert=True
+    )
+
+async def get_referral_bonus_percent() -> float:
+    setting = await settings_col.find_one({"key": "referral_bonus_percent"})
+    if setting:
+        return float(setting.get("value", REFERRAL_BONUS_PERCENT))
+    return REFERRAL_BONUS_PERCENT
+
+async def get_referral_bonus_max() -> float:
+    setting = await settings_col.find_one({"key": "referral_bonus_max"})
+    if setting:
+        return float(setting.get("value", REFERRAL_BONUS_MAX))
+    return REFERRAL_BONUS_MAX
+
+async def set_referral_bonus_percent(value: float):
+    await settings_col.update_one(
+        {"key": "referral_bonus_percent"},
+        {"$set": {"value": value, "updated_at": now_ist()}},
+        upsert=True
+    )
+
+async def set_referral_bonus_max(value: float):
+    await settings_col.update_one(
+        {"key": "referral_bonus_max"},
         {"$set": {"value": value, "updated_at": now_ist()}},
         upsert=True
     )
@@ -1059,7 +1086,8 @@ async def callback_handler(event):
                     "admin_transactions", "admin_withdrawals", "my_withdrawals",
                     "smm_services", "smm_myorders", "admin_smm_markup", "smm_search",
                     "admin_smm_markup_default", "admin_smm_markup_member", "admin_smm_orders",
-                    "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings"):
+                    "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings",
+                    "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -1289,19 +1317,23 @@ async def callback_handler(event):
             paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
-            total_earned = paid_count * REFERRAL_BONUS
+            total_earned = round(user_doc.get('referral_earnings', 0), 2) if user_doc else 0
+            cur_percent = await get_referral_bonus_percent()
+            cur_max = await get_referral_bonus_max()
+            min_wd = await get_min_withdrawal()
 
             text = (
                 "👥 **Referral Program**\n\n"
                 "🔗 **Your Referral Link:**\n"
                 f"`{ref_link}`\n\n"
-                f"💰 **Bonus:** ₹{REFERRAL_BONUS} per referral\n"
-                f"(When your referred friend deposits ₹50 or more)\n\n"
+                f"💰 **Bonus:** {cur_percent}% of your referral's **first deposit**, "
+                f"up to ₹{cur_max} max\n\n"
                 "📊 **Your Stats:**\n"
                 f"• Total Invited: **{invited_count}** users\n"
                 f"• Bonus Paid: **{paid_count}** users\n"
                 f"• Total Earned: **₹{total_earned}**\n\n"
-                f"💸 **Withdrawable Balance:** ₹{withdrawable}\n\n"
+                f"💸 **Withdrawable Balance:** ₹{withdrawable}\n"
+                f"📏 **Minimum Withdrawal:** ₹{min_wd}\n\n"
                 "Share your link and start earning!"
             )
             buttons = [
@@ -1317,10 +1349,20 @@ async def callback_handler(event):
         if data == "withdraw":
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
-            if withdrawable <= 0:
-                await event.answer("❌ You have no withdrawable balance.", alert=True)
-                return
             min_wd = await get_min_withdrawal()
+            if withdrawable <= 0:
+                await event.answer(
+                    f"❌ You have no withdrawable balance.\nMinimum withdrawal is ₹{min_wd}.",
+                    alert=True
+                )
+                return
+            if withdrawable < min_wd:
+                await event.answer(
+                    f"❌ Your withdrawable balance (₹{withdrawable}) is below the "
+                    f"minimum withdrawal of ₹{min_wd}.",
+                    alert=True
+                )
+                return
             user_states[user_id] = {"action": "withdraw", "step": "amount"}
             await event.edit(
                 f"💸 **Withdraw**\n\nYour withdrawable balance: ₹{withdrawable}\n"
@@ -1885,9 +1927,55 @@ async def callback_handler(event):
                 [Button.inline("📜 Transaction History", b"admin_transactions", style="primary")],
                 [Button.inline("📜 Withdrawal History", b"admin_withdrawals", style="primary")],
                 [Button.inline("💸 Set Min Withdrawal", b"admin_minwithdraw", style="primary")],
+                [Button.inline("🎁 Referral Bonus Settings", b"admin_referral_settings", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("💰 **Finance & Transactions**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_referral_settings":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            cur_percent = await get_referral_bonus_percent()
+            cur_max = await get_referral_bonus_max()
+            btns = [
+                [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
+                [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
+                [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
+            ]
+            await event.edit(
+                f"🎁 **Referral Bonus Settings**\n\n"
+                f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
+                f"Example: A ₹100 deposit currently pays a "
+                f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
+                buttons=btns
+            )
+            await event.answer()
+            return
+
+        if data == "admin_set_ref_percent":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "set_ref_percent", "step": "await_value"}
+            await event.edit(
+                "📈 Send new referral bonus **percentage** (e.g. `10` for 10%):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_referral_settings", style="primary")]]
+            )
+            await event.answer()
+            return
+
+        if data == "admin_set_ref_max":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "set_ref_max", "step": "await_value"}
+            await event.edit(
+                "💸 Send new referral bonus **max cap** in ₹ (e.g. `5`):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_referral_settings", style="primary")]]
+            )
             await event.answer()
             return
 
@@ -1983,7 +2071,49 @@ async def callback_handler(event):
                 {"$inc": {"balance": amount}},
                 upsert=True
             )
-            # referral bonus logic (simplified)
+            # ---------- Referral Bonus: 10% of referred user's FIRST deposit, capped ----------
+            user_doc = await users_col.find_one({"user_id": user_id_dep})
+            referrer_id = user_doc.get("referred_by") if user_doc else None
+            bonus_already_paid = user_doc.get("referral_bonus_paid", False) if user_doc else False
+
+            if referrer_id and not bonus_already_paid:
+                ref_percent = await get_referral_bonus_percent()
+                ref_max = await get_referral_bonus_max()
+                bonus = round(min(amount * (ref_percent / 100), ref_max), 2)
+                if bonus > 0:
+                    await users_col.update_one(
+                        {"user_id": referrer_id},
+                        {"$inc": {"balance": bonus, "referral_earnings": bonus}},
+                        upsert=True
+                    )
+                    await users_col.update_one(
+                        {"user_id": user_id_dep},
+                        {"$set": {"referral_bonus_paid": True}}
+                    )
+                    try:
+                        await bot.send_message(
+                            referrer_id,
+                            f"🎉 **Referral Bonus Earned!**\n\n"
+                            f"Your referral made their first deposit of ₹{amount}.\n"
+                            f"💰 You earned: ₹{bonus} ({ref_percent}% up to ₹{ref_max})"
+                        )
+                    except Exception:
+                        pass
+                    referrer_name = await get_display_name(referrer_id)
+                    await log_event(
+                        f"🎁 **Referral Bonus Paid**\n"
+                        f"👤 Referrer: {referrer_name} (`{referrer_id}`)\n"
+                        f"👤 Referred User: `{user_id_dep}` (first deposit ₹{amount})\n"
+                        f"💰 Bonus: ₹{bonus}\n"
+                        f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+                    )
+                else:
+                    # Still mark as paid so we don't re-check every future deposit
+                    await users_col.update_one(
+                        {"user_id": user_id_dep},
+                        {"$set": {"referral_bonus_paid": True}}
+                    )
+
             admin_name = await get_display_name(user_id)
             orig_msg = await event.get_message()
             original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
@@ -2800,6 +2930,38 @@ async def handle_message(event):
             label = "Members/Subscribers" if is_member else "Default"
             await event.respond(f"✅ {label} SMM markup set to {val}x.",
                                  buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+            user_states.pop(user_id, None)
+
+    elif action == "set_ref_percent":
+        step = state.get("step")
+        if step == "await_value":
+            try:
+                val = float(event.message.text.strip())
+                if val < 0 or val > 100:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid percentage. Send a number between 0-100, e.g. `10`.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_referral_settings", style="danger")]])
+                return
+            await set_referral_bonus_percent(val)
+            await event.respond(f"✅ Referral bonus percentage set to {val}%.",
+                                 buttons=[[Button.inline("🔙 Referral Settings", b"admin_referral_settings", style="primary")]])
+            user_states.pop(user_id, None)
+
+    elif action == "set_ref_max":
+        step = state.get("step")
+        if step == "await_value":
+            try:
+                val = float(event.message.text.strip())
+                if val <= 0:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid amount. Send a number like `5`.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_referral_settings", style="danger")]])
+                return
+            await set_referral_bonus_max(val)
+            await event.respond(f"✅ Referral bonus max cap set to ₹{val}.",
+                                 buttons=[[Button.inline("🔙 Referral Settings", b"admin_referral_settings", style="primary")]])
             user_states.pop(user_id, None)
 
     elif action == "smm_search":
