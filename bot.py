@@ -489,9 +489,9 @@ async def show_welcome_menu(event, user_id):
         "Use the buttons below to get started."
     )
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy", style="primary"), Button.inline("💰 My Balance", b"balance", style="primary")],
+        [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
         [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
-        [Button.inline("🚀 SMM Services", b"smm_services", style="primary")],
+        [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
     if user_id in ADMIN_IDS:
@@ -514,9 +514,9 @@ async def send_main_menu(event):
         await send_join_message(event)
         return
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy", style="primary"), Button.inline("💰 My Balance", b"balance", style="primary")],
+        [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
         [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
-        [Button.inline("🚀 SMM Services", b"smm_services", style="primary")],
+        [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
     if user_id in ADMIN_IDS:
@@ -1911,7 +1911,7 @@ async def callback_handler(event):
             btns = [
                 [Button.inline("📦 Accounts & Stock", b"admin_cat_accounts", style="primary")],
                 [Button.inline("💰 Finance & Transactions", b"admin_cat_finance", style="primary")],
-                [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="primary")],
+                [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="success")],
                 [Button.inline("⚙️ Bot Settings", b"admin_cat_settings", style="primary")],
                 [Button.inline("🔙 Back", b"main", style="primary")],
             ]
