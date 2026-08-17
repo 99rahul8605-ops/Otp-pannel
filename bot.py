@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import io
 import tempfile
@@ -185,6 +186,45 @@ async def set_support_link(link: str):
         upsert=True
     )
 
+# ---------- DYNAMIC ADMINS ----------
+# ADMIN_IDS from .env are permanent "founding" admins (can't be removed here).
+# Anyone else can be added/removed live, from inside the bot, no .env edit or
+# restart needed. Stored in settings_col, which is franchise-scoped — so each
+# franchise clone manages its own admin list independently of the master's.
+async def get_dynamic_admin_ids() -> list:
+    setting = await settings_col.find_one({"key": "dynamic_admins"})
+    return setting.get("value", []) if setting else []
+
+async def add_dynamic_admin(uid: int):
+    ids = await get_dynamic_admin_ids()
+    if uid not in ids:
+        ids.append(uid)
+        await settings_col.update_one(
+            {"key": "dynamic_admins"},
+            {"$set": {"value": ids, "updated_at": now_ist()}},
+            upsert=True
+        )
+
+async def remove_dynamic_admin(uid: int):
+    ids = await get_dynamic_admin_ids()
+    if uid in ids:
+        ids.remove(uid)
+        await settings_col.update_one(
+            {"key": "dynamic_admins"},
+            {"$set": {"value": ids, "updated_at": now_ist()}},
+            upsert=True
+        )
+
+async def is_admin(user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    return user_id in await get_dynamic_admin_ids()
+
+async def get_all_admin_ids() -> list:
+    """Founding (.env) admins + dynamically added ones, deduped — use this for
+    notification loops so newly-added admins get alerts too."""
+    return list(set(ADMIN_IDS) | set(await get_dynamic_admin_ids()))
+
 async def get_min_withdrawal():
     setting = await settings_col.find_one({"key": "min_withdrawal"})
     if setting:
@@ -329,14 +369,15 @@ async def set_account_markup(value: float):
 
 # ---------- CLONE PROVISIONING ----------
 async def validate_bot_token(token: str):
-    """Ping Telegram's Bot API to confirm a token is real and get its @username."""
+    """Ping Telegram's Bot API to confirm a token is real and get its @username + display name."""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"https://api.telegram.org/bot{token}/getMe",
                               timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await r.json()
         if data.get("ok"):
-            return True, data["result"].get("username", "unknown")
+            res = data["result"]
+            return True, {"username": res.get("username", "unknown"), "display_name": res.get("first_name", "My Bot")}
         return False, data.get("description", "Invalid token")
     except Exception as e:
         return False, str(e)
@@ -661,7 +702,7 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
-    if user_id in ADMIN_IDS:
+    if await is_admin(user_id):
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
     if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
@@ -688,7 +729,7 @@ async def send_main_menu(event):
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
     row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
-    if user_id in ADMIN_IDS:
+    if await is_admin(user_id):
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
     if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
@@ -706,7 +747,7 @@ async def send_main_menu(event):
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
     user_id = event.sender_id
-    if user_id not in ADMIN_IDS:
+    if not await is_admin(user_id):
         await event.respond("❌ Unauthorized.")
         return
 
@@ -796,7 +837,7 @@ async def broadcast_cmd(event):
 @bot.on(events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
 async def broadcast_callback(event):
     user_id = event.sender_id
-    if user_id not in ADMIN_IDS:
+    if not await is_admin(user_id):
         await event.answer("❌ Unauthorized.", alert=True)
         return
 
@@ -1260,12 +1301,13 @@ async def callback_handler(event):
                     "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings",
                     "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max",
                     "admin_cat_franchise", "admin_franchise_list", "admin_franchise_credit",
-                    "admin_account_markup", "my_franchise_wallet", "admin_clone_bot"):
+                    "admin_account_markup", "my_franchise_wallet", "admin_clone_bot",
+                    "admin_manage_admins", "admin_add_admin", "admin_remove_admin"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
         if data.startswith("admin_accounts"):
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
 
@@ -1284,7 +1326,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN TRANSACTIONS (type filter + pagination) ----------
         if data.startswith("admin_transactions"):
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
 
@@ -1303,7 +1345,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN SMM ORDERS (record/logs view) ----------
         if data.startswith("admin_smm_orders"):
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             if data == "admin_smm_orders":
@@ -1320,7 +1362,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN WITHDRAWALS (simple) ----------
         if data == "admin_withdrawals":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             await show_all_withdrawals(event, user_id)
@@ -1677,7 +1719,7 @@ async def callback_handler(event):
                         error_msg = str(e)[:150]
                         logging.warning(f"Session invalid for {phone}: {e}")
                         await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
-                        for admin in ADMIN_IDS:
+                        for admin in await get_all_admin_ids():
                             try:
                                 await bot.send_message(admin,
                                     f"⚠️ **Inactive Session Detected!**\n"
@@ -1771,7 +1813,7 @@ async def callback_handler(event):
             updated_user = await users_col.find_one({"user_id": user_id})
             new_balance = updated_user["balance"] if updated_user else 0
             wallet_line = f"\nWholesale Cost: ₹{price} (franchise wallet)" if IS_FRANCHISE else ""
-            for admin in ADMIN_IDS:
+            for admin in await get_all_admin_ids():
                 try:
                     await bot.send_message(admin,
                         f"🛒 **New Purchase**\n"
@@ -2137,7 +2179,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN PANEL ----------
         if data == "admin":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2154,7 +2196,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_franchise":
-            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+            if not await is_admin(user_id) or IS_FRANCHISE:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2175,21 +2217,23 @@ async def callback_handler(event):
             return
 
         if data == "admin_clone_bot":
-            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+            if not await is_admin(user_id) or IS_FRANCHISE:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "clone_bot", "step": "token"}
             await event.edit(
-                "🤖 **Clone Bot — New Franchise**\n\n"
-                "Step 1/4 — Send the **bot token** for the new franchise bot "
-                "(get one from @BotFather → /newbot).",
+                "🤖 **Clone Bot**\n\n"
+                "Just send the **bot token** for the new bot "
+                "(get one from @BotFather → /newbot).\n\n"
+                "Everything else is automatic — the bot's name, a unique franchise ID, "
+                "and **you become that bot's admin/owner automatically.**",
                 buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
             )
             await event.answer()
             return
 
         if data == "admin_franchise_list":
-            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+            if not await is_admin(user_id) or IS_FRANCHISE:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             wallets = await franchise_wallets_col.find({}).sort("balance", -1).to_list(length=50)
@@ -2210,7 +2254,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_franchise_credit":
-            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+            if not await is_admin(user_id) or IS_FRANCHISE:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "franchise_credit", "step": "franchise_id"}
@@ -2223,7 +2267,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_accounts":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2239,7 +2283,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_account_markup":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             cur = await get_account_markup()
@@ -2261,7 +2305,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_finance":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2279,7 +2323,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_referral_settings":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             cur_percent = await get_referral_bonus_percent()
@@ -2300,7 +2344,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_set_ref_percent":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_ref_percent", "step": "await_value"}
@@ -2312,7 +2356,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_set_ref_max":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_ref_max", "step": "await_value"}
@@ -2324,7 +2368,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_smm":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2337,15 +2381,90 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_settings":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
                 [Button.inline("📞 Set Support Link", b"admin_support", style="primary")],
+                [Button.inline("👤 Manage Admins", b"admin_manage_admins", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("⚙️ **Bot Settings**", buttons=btns)
             await event.answer()
+            return
+
+        if data == "admin_manage_admins":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            dynamic_ids = await get_dynamic_admin_ids()
+            lines = ["👑 **Founding Admins** (from .env, permanent):"]
+            for aid in ADMIN_IDS:
+                name = await get_display_name(aid)
+                lines.append(f"• {name} — `{aid}`")
+            lines.append("\n👤 **Added Admins** (removable, no restart needed):")
+            if dynamic_ids:
+                for aid in dynamic_ids:
+                    name = await get_display_name(aid)
+                    lines.append(f"• {name} — `{aid}`")
+            else:
+                lines.append("_None yet._")
+            btns = [
+                [Button.inline("➕ Add Admin", b"admin_add_admin", style="success")],
+                [Button.inline("➖ Remove Admin", b"admin_remove_admin", style="danger")],
+                [Button.inline("🔙 Back", b"admin_cat_settings", style="primary")],
+            ]
+            await event.edit("\n".join(lines), buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_add_admin":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "add_admin", "step": "await_id"}
+            await event.edit(
+                "➕ Send the **Telegram user ID** to make admin (ask them to message "
+                "@userinfobot to get their ID):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_manage_admins", style="danger")]]
+            )
+            await event.answer()
+            return
+
+        if data == "admin_remove_admin":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            dynamic_ids = await get_dynamic_admin_ids()
+            if not dynamic_ids:
+                await event.answer("No added admins to remove (founding admins can't be removed here).", alert=True)
+                return
+            btns = []
+            for aid in dynamic_ids:
+                name = await get_display_name(aid)
+                btns.append([Button.inline(f"❌ {name} ({aid})", f"do_remove_admin_{aid}", style="danger")])
+            btns.append([Button.inline("🔙 Back", b"admin_manage_admins", style="primary")])
+            await event.edit("➖ **Select an admin to remove:**", buttons=btns)
+            await event.answer()
+            return
+
+        if data.startswith("do_remove_admin_"):
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            target_id = int(data[len("do_remove_admin_"):])
+            await remove_dynamic_admin(target_id)
+            await event.answer(f"✅ Removed admin {target_id}.", alert=True)
+            dynamic_ids = await get_dynamic_admin_ids()
+            btns = []
+            for aid in dynamic_ids:
+                name = await get_display_name(aid)
+                btns.append([Button.inline(f"❌ {name} ({aid})", f"do_remove_admin_{aid}", style="danger")])
+            btns.append([Button.inline("🔙 Back", b"admin_manage_admins", style="primary")])
+            await event.edit(
+                "➖ **Select an admin to remove:**" if dynamic_ids else "➖ No added admins left.",
+                buttons=btns if dynamic_ids else [[Button.inline("🔙 Back", b"admin_manage_admins", style="primary")]]
+            )
             return
 
         # ---------- ADMIN ADD ACCOUNTS TO STOCK (BULK) ----------
@@ -2512,7 +2631,7 @@ async def callback_handler(event):
             await event.answer("❌ Rejected")
             return
         if data == "admin_setprice":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_price", "step": "await_price"}
@@ -2520,7 +2639,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_support":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_support_link", "step": "await_link"}
@@ -2528,7 +2647,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_minwithdraw":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
@@ -2536,7 +2655,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_smm_markup":
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             default_m = await get_smm_markup("")
@@ -2555,7 +2674,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data in ("admin_smm_markup_default", "admin_smm_markup_member"):
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             is_member = data.endswith("_member")
@@ -2591,7 +2710,7 @@ async def callback_handler(event):
 
         # ---------- APPROVE / REJECT WITHDRAWAL ----------
         if data.startswith("wapprove_") or data.startswith("wreject_"):
-            if user_id not in ADMIN_IDS:
+            if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             parts = data.split("_", 1)
@@ -3084,7 +3203,7 @@ async def process_deposit_step(event):
         photo_bytes = await event.message.download_media(file=bytes)
         photo_io = io.BytesIO(photo_bytes)
         photo_io.name = "payment_proof.jpg"
-        for admin in ADMIN_IDS:
+        for admin in await get_all_admin_ids():
             try:
                 await bot.send_file(admin, photo_io,
                     caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`",
@@ -3214,7 +3333,7 @@ async def handle_message(event):
                 "created_at": now_ist()
             })
             w_id = result.inserted_id
-            for admin in ADMIN_IDS:
+            for admin in await get_all_admin_ids():
                 try:
                     await bot.send_message(admin,
                         f"🔔 **Withdrawal Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nUPI: `{upi}`",
@@ -3390,64 +3509,55 @@ async def handle_message(event):
             )
             user_states.pop(user_id, None)
 
+    elif action == "add_admin":
+        step = state.get("step")
+        if step == "await_id":
+            id_text = event.message.text.strip()
+            if not id_text.isdigit():
+                await event.respond("❌ Invalid ID. Send numbers only.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_manage_admins", style="danger")]])
+                return
+            new_admin_id = int(id_text)
+            await add_dynamic_admin(new_admin_id)
+            new_name = await get_display_name(new_admin_id)
+            await event.respond(
+                f"✅ {new_name} (`{new_admin_id}`) is now an admin — no restart needed.",
+                buttons=[[Button.inline("🔙 Manage Admins", b"admin_manage_admins", style="primary")]]
+            )
+            try:
+                await bot.send_message(new_admin_id, "🎉 You've been made an admin of this bot!")
+            except Exception:
+                pass
+            await log_event(
+                f"👤 **New Admin Added**\n"
+                f"🆔 New Admin: `{new_admin_id}`\n"
+                f"👤 By: `{user_id}`\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
+            user_states.pop(user_id, None)
+
     elif action == "clone_bot":
         step = state.get("step")
 
         if step == "token":
             token = event.message.text.strip()
-            wait = await event.respond("⏳ Validating token with Telegram...")
+            wait = await event.respond("⏳ Validating token and setting everything up...")
             ok, result = await validate_bot_token(token)
             if not ok:
                 await wait.edit(f"❌ Invalid bot token: {result}\n\nSend a valid token from @BotFather, or /cancel.")
                 return
-            state["token"] = token
-            state["bot_username"] = result
-            state["step"] = "owner_id"
-            await wait.edit(
-                f"✅ Token valid — bot is @{result}\n\n"
-                f"Step 2/4 — Send the **Telegram user ID** of the franchise owner "
-                f"(they'll be admin of this clone; ask them to message @userinfobot to get it):"
-            )
-            return
 
-        if step == "owner_id":
-            owner_text = event.message.text.strip()
-            if not owner_text.isdigit():
-                await event.respond("❌ Invalid user ID. Send numbers only.")
-                return
-            state["owner_id"] = int(owner_text)
-            state["step"] = "franchise_id"
-            suggested = state["bot_username"].lower().replace("bot", "")[:20] or "franchise"
-            await event.respond(
-                f"Step 3/4 — Send a unique **Franchise ID** for this partner "
-                f"(short, no spaces — e.g. `{suggested}`):"
-            )
-            return
+            bot_username = result["username"]
+            display_name = result["display_name"]
+            owner_id = user_id  # whoever submits the token owns & administers this clone
+            fid = re.sub(r'[^a-z0-9_]', '', bot_username.lower())[:24] or f"franchise_{owner_id}"
 
-        if step == "franchise_id":
-            fid = event.message.text.strip()
-            if not fid or " " in fid:
-                await event.respond("❌ Invalid Franchise ID — no spaces, try again:")
-                return
-            existing = await bot_clones_col.find_one({"franchise_id": fid})
-            if existing:
-                await event.respond(f"❌ Franchise ID `{fid}` is already in use. Send a different one:")
-                return
-            state["franchise_id"] = fid
-            state["step"] = "display_name"
-            await event.respond("Step 4/4 — Send a **display name** for this bot (shown to their customers, e.g. `Rahul's OTP Store`):")
-            return
-
-        if step == "display_name":
-            display_name = event.message.text.strip()
-            if not display_name:
-                await event.respond("❌ Invalid name, try again:")
-                return
-
-            token = state["token"]
-            bot_username = state["bot_username"]
-            owner_id = state["owner_id"]
-            fid = state["franchise_id"]
+            # Guarantee a unique franchise_id even if two bots share a similar username
+            base_fid = fid
+            suffix = 1
+            while await bot_clones_col.find_one({"franchise_id": fid}):
+                suffix += 1
+                fid = f"{base_fid}{suffix}"
 
             await bot_clones_col.insert_one({
                 "franchise_id": fid,
@@ -3469,15 +3579,15 @@ async def handle_message(event):
             await bot.send_file(
                 event.chat_id, env_file,
                 caption=(
-                    f"✅ **Clone Provisioned!**\n\n"
+                    f"✅ **Clone Ready!**\n\n"
                     f"🤖 Bot: @{bot_username}\n"
-                    f"👤 Owner: `{owner_id}`\n"
+                    f"👤 Owner/Admin: `{owner_id}` (you)\n"
                     f"🆔 Franchise ID: `{fid}`\n"
                     f"💰 Wallet: ₹0 (add credit next)\n\n"
-                    f"Send this `.env` file to the partner. They put it next to a copy "
-                    f"of this bot's code and run it on their own server. "
-                    f"⚠️ It contains their bot token and your shared SMM API key — "
-                    f"send it privately, not in a group."
+                    f"Put this `.env` next to a copy of this bot's code on a server "
+                    f"and run it — @{bot_username} will come online as its own fully "
+                    f"admin-owned bot, with you as its admin automatically. "
+                    f"⚠️ This file has your bot token — keep it private."
                 ),
                 buttons=[[Button.inline("💰 Add Wallet Credit", f"admin_franchise_credit".encode(), style="success")],
                          [Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]]
@@ -3486,7 +3596,6 @@ async def handle_message(event):
                 f"🤖 **New Clone Provisioned**\n"
                 f"🆔 Franchise: `{fid}` | @{bot_username}\n"
                 f"👤 Owner: `{owner_id}`\n"
-                f"👤 By Admin: `{user_id}`\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             user_states.pop(user_id, None)
@@ -3657,7 +3766,7 @@ async def main():
         sys.exit(1)
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, ADMIN_IDS)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, await get_all_admin_ids())
     await acc_mgr.load_all()
     logging.info("🚀 Bot started successfully...")
     await bot.run_until_disconnected()
