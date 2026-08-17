@@ -707,6 +707,8 @@ async def show_welcome_menu(event, user_id):
     buttons.append(row3)
     if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
+    if not IS_FRANCHISE:
+        buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
 
     support_link = await get_support_link()
     if support_link:
@@ -734,6 +736,8 @@ async def send_main_menu(event):
     buttons.append(row3)
     if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
+    if not IS_FRANCHISE:
+        buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link, style="primary")])
@@ -1302,7 +1306,7 @@ async def callback_handler(event):
                     "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max",
                     "admin_cat_franchise", "admin_franchise_list", "admin_franchise_credit",
                     "admin_account_markup", "my_franchise_wallet", "admin_clone_bot",
-                    "admin_manage_admins", "admin_add_admin", "admin_remove_admin"):
+                    "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -2228,6 +2232,24 @@ async def callback_handler(event):
                 "Everything else is automatic — the bot's name, a unique franchise ID, "
                 "and **you become that bot's admin/owner automatically.**",
                 buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
+            )
+            await event.answer()
+            return
+
+        if data == "self_clone_bot":
+            if IS_FRANCHISE:
+                await event.answer("❌ Cloning is only available from the main bot.", alert=True)
+                return
+            user_states[user_id] = {"action": "clone_bot", "step": "token"}
+            await event.edit(
+                "🤖 **Clone This Bot — Run Your Own!**\n\n"
+                "Want your own version of this bot, fully under your control?\n\n"
+                "1️⃣ Message @BotFather → /newbot → get a bot token\n"
+                "2️⃣ Send that token here\n\n"
+                "That's it — your bot gets its own customers, its own settings, "
+                "and **you become its admin automatically.** Stock/services are "
+                "drawn from a prepaid wallet (top up anytime).",
+                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
             )
             await event.answer()
             return
@@ -3576,6 +3598,20 @@ async def handle_message(event):
             env_content = build_clone_env(token, fid, owner_id, display_name)
             env_file = io.BytesIO(env_content.encode())
             env_file.name = f"{fid}.env"
+
+            requester_is_admin = await is_admin(user_id)
+            if requester_is_admin:
+                completion_buttons = [
+                    [Button.inline("💰 Add Wallet Credit", f"admin_franchise_credit".encode(), style="success")],
+                    [Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]
+                ]
+                wallet_note = "💰 Wallet: ₹0 (add credit next)"
+            else:
+                completion_buttons = [[Button.inline("🔙 Back to Menu", b"main", style="primary")]]
+                support_link = await get_support_link()
+                contact = f" or contact support: {support_link}" if support_link else ""
+                wallet_note = f"💰 Wallet: ₹0 — message the bot owner to top it up{contact}"
+
             await bot.send_file(
                 event.chat_id, env_file,
                 caption=(
@@ -3583,14 +3619,13 @@ async def handle_message(event):
                     f"🤖 Bot: @{bot_username}\n"
                     f"👤 Owner/Admin: `{owner_id}` (you)\n"
                     f"🆔 Franchise ID: `{fid}`\n"
-                    f"💰 Wallet: ₹0 (add credit next)\n\n"
+                    f"{wallet_note}\n\n"
                     f"Put this `.env` next to a copy of this bot's code on a server "
                     f"and run it — @{bot_username} will come online as its own fully "
                     f"admin-owned bot, with you as its admin automatically. "
                     f"⚠️ This file has your bot token — keep it private."
                 ),
-                buttons=[[Button.inline("💰 Add Wallet Credit", f"admin_franchise_credit".encode(), style="success")],
-                         [Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]]
+                buttons=completion_buttons
             )
             await log_event(
                 f"🤖 **New Clone Provisioned**\n"
