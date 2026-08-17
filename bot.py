@@ -61,6 +61,17 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
+# ---------- FRANCHISE MODE ----------
+# Leave FRANCHISE_ID empty to run this bot as the MASTER (source of stock/SMM API,
+# owns the shared MongoDB, no wallet gating). Set FRANCHISE_ID on a franchise
+# partner's deployment (same MongoDB, same codebase) — every purchase in that
+# instance will then draw down from a prepaid wallet the master controls.
+FRANCHISE_ID = os.getenv("FRANCHISE_ID", "").strip()
+IS_FRANCHISE = bool(FRANCHISE_ID)
+FRANCHISE_OWNER_ID = os.getenv("FRANCHISE_OWNER_ID", "").strip()
+FRANCHISE_OWNER_ID = int(FRANCHISE_OWNER_ID) if FRANCHISE_OWNER_ID.isdigit() else None
+BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "OTP Shop Bot").strip()
+
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -85,6 +96,7 @@ deposits_col = db['deposits']
 settings_col = db['settings']
 withdrawals_col = db['withdrawals']
 smm_orders_col = db['smm_orders']
+franchise_wallets_col = db['franchise_wallets']
 
 # ---------- BOT INSTANCE ----------
 import hashlib
@@ -200,6 +212,66 @@ async def log_event(text):
             await bot.send_message(LOGS_CHANNEL_ID, text, parse_mode="markdown")
         except Exception as e:
             logging.error(f"Failed to send log to channel: {e}")
+
+# ---------- FRANCHISE WALLET ----------
+async def get_franchise_wallet_balance(franchise_id: str) -> float:
+    doc = await franchise_wallets_col.find_one({"franchise_id": franchise_id})
+    return doc.get("balance", 0) if doc else 0
+
+async def reserve_franchise_wallet(wholesale_cost: float) -> bool:
+    """Atomically deduct wholesale_cost from THIS instance's franchise wallet.
+    On the master bot (no FRANCHISE_ID) this is always a no-op success —
+    the master IS the source, nothing to gate."""
+    if not IS_FRANCHISE or wholesale_cost <= 0:
+        return True
+    result = await franchise_wallets_col.update_one(
+        {"franchise_id": FRANCHISE_ID, "balance": {"$gte": wholesale_cost}},
+        {"$inc": {"balance": -wholesale_cost}}
+    )
+    return result.modified_count > 0
+
+async def refund_franchise_wallet(amount: float):
+    if not IS_FRANCHISE or amount <= 0:
+        return
+    await franchise_wallets_col.update_one(
+        {"franchise_id": FRANCHISE_ID},
+        {"$inc": {"balance": amount}},
+        upsert=True
+    )
+
+async def notify_franchise_low_balance(attempted_cost: float):
+    """Alert the franchise owner privately — never expose wholesale mechanics to
+    the end customer, who just sees a generic 'unavailable' message."""
+    if not IS_FRANCHISE or not FRANCHISE_OWNER_ID:
+        return
+    try:
+        bal = await get_franchise_wallet_balance(FRANCHISE_ID)
+        await bot.send_message(
+            FRANCHISE_OWNER_ID,
+            f"🔴 **Low Wallet Balance!**\n\n"
+            f"A customer just tried to buy something costing ₹{attempted_cost} "
+            f"wholesale, but your franchise wallet balance is only ₹{bal}.\n\n"
+            f"The order was blocked and your customer's own balance was NOT charged. "
+            f"Please recharge your franchise wallet to keep selling."
+        )
+    except Exception as e:
+        logging.error(f"Could not notify franchise owner of low balance: {e}")
+
+async def get_account_markup() -> float:
+    """Retail markup this instance applies on top of the wholesale account price.
+    On the master bot this defaults to 1.0 (no markup — price IS the retail price).
+    A franchise sets its own via the admin panel."""
+    setting = await settings_col.find_one({"key": "account_markup"})
+    if setting:
+        return float(setting.get("value", 1.0))
+    return 1.0
+
+async def set_account_markup(value: float):
+    await settings_col.update_one(
+        {"key": "account_markup"},
+        {"$set": {"value": value, "updated_at": now_ist()}},
+        upsert=True
+    )
 
 # ---------- HELPER ----------
 async def get_existing_countries():
@@ -482,7 +554,7 @@ async def show_welcome_menu(event, user_id):
     username = await get_bot_username()
     ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
     welcome_msg = (
-        "👋 **Welcome to the OTP Shop Bot!**\n\n"
+        f"👋 **Welcome to the {BOT_DISPLAY_NAME}!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
         "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
@@ -497,6 +569,8 @@ async def show_welcome_menu(event, user_id):
     if user_id in ADMIN_IDS:
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
+    if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
+        buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
 
     support_link = await get_support_link()
     if support_link:
@@ -522,10 +596,12 @@ async def send_main_menu(event):
     if user_id in ADMIN_IDS:
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
+    if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
+        buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link, style="primary")])
-    msg = "🌟 **OTP Bot Main Menu**"
+    msg = f"🌟 **{BOT_DISPLAY_NAME} — Main Menu**"
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(msg, buttons=buttons)
     else:
@@ -1087,7 +1163,9 @@ async def callback_handler(event):
                     "smm_services", "smm_myorders", "admin_smm_markup", "smm_search",
                     "admin_smm_markup_default", "admin_smm_markup_member", "admin_smm_orders",
                     "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings",
-                    "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max"):
+                    "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max",
+                    "admin_cat_franchise", "admin_franchise_list", "admin_franchise_credit",
+                    "admin_account_markup", "my_franchise_wallet"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -1310,6 +1388,24 @@ async def callback_handler(event):
             return
 
         # ---------- REFERRAL INFO ----------
+        if data == "my_franchise_wallet":
+            if not (IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            bal = await get_franchise_wallet_balance(FRANCHISE_ID)
+            low_warn = "\n\n⚠️ **Balance is low** — top up soon to avoid interrupted sales." if bal < 50 else ""
+            await event.edit(
+                f"🏢 **My Franchise Wallet**\n\n"
+                f"🆔 Franchise ID: `{FRANCHISE_ID}`\n"
+                f"💰 Current Balance: ₹{bal}\n\n"
+                f"This is the prepaid credit your bot draws from for every account "
+                f"and SMM order your customers buy — it's charged at wholesale "
+                f"price. Contact the platform owner to top it up.{low_warn}",
+                buttons=[[Button.inline("🔙 Back", b"main", style="primary")]]
+            )
+            await event.answer()
+            return
+
         if data == "referral_info":
             username = await get_bot_username()
             ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
@@ -1403,11 +1499,13 @@ async def callback_handler(event):
                 {"$sort": {"_id": 1}}
             ]
             agg = await accounts_col.aggregate(pipeline).to_list(length=None)
+            acct_markup = await get_account_markup()
             btns = []
             for item in agg:
                 price = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
                 count = item["count"]
-                btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}", style="primary")])
+                retail = round(price * acct_markup, 2)
+                btns.append([Button.inline(f"₹{retail} ({count} available)", f"price_{country}_{price}", style="primary")])
             btns.append([Button.inline("🔙 Back", b"buy", style="primary")])
             await event.edit(
                 f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
@@ -1419,16 +1517,21 @@ async def callback_handler(event):
         if data.startswith("price_"):
             parts = data.split("_", 2)
             country = parts[1]
-            price = float(parts[2])
+            price = float(parts[2])  # wholesale price (matches accounts_col.price)
+            acct_markup = await get_account_markup()
+            retail_price = round(price * acct_markup, 2)
             stock = await accounts_col.count_documents({"country": country, "status": "available", "price": price})
-            user_states[user_id] = {"action": "awaiting_confirmation", "country": country, "price": price}
+            user_states[user_id] = {
+                "action": "awaiting_confirmation", "country": country,
+                "price": price, "retail_price": retail_price
+            }
             confirm_text = (
                 "👋 Dear customer, after you agree to the terms and click the confirm button, "
                 "the number will be reserved for you.\n\n"
                 "💰 The amount will only be deducted from your account when you successfully receive the login codes.\n\n"
                 "⚠️ Please note that cancellation is not available in this server because OTP Delivery is guaranteed!\n\n"
                 f"🌏 Country: {country} 🇮🇳\n"
-                f"💰 Price: ₹{price}\n"
+                f"💰 Price: ₹{retail_price}\n"
                 f"📦 Stock: {stock}"
             )
             buttons = [
@@ -1446,11 +1549,12 @@ async def callback_handler(event):
                 await event.answer("Session expired. Please start again.", alert=True)
                 return
             country = state["country"]
-            price = state["price"]
+            price = state["price"]  # wholesale price (what the franchise wallet pays)
+            retail_price = state.get("retail_price", price)  # what the end-user pays
 
             user = await users_col.find_one({"user_id": user_id})
             balance = user["balance"] if user else 0
-            if balance < price:
+            if balance < retail_price:
                 await event.answer("❌ Insufficient balance!", alert=True)
                 return
 
@@ -1506,19 +1610,33 @@ async def callback_handler(event):
             phone = acc["phone"]
             twofa_password = acc.get("twofa_password")
 
-            old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
-            new_withdrawable = max(0, old_withdrawable - price)
-            deduct_result = await users_col.update_one(
-                {"user_id": user_id, "balance": {"$gte": price}},
-                {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}}
-            )
-            if deduct_result.modified_count == 0:
-                # Balance was insufficient at the moment of deduction (e.g. spent
-                # elsewhere concurrently) — release the reserved account back to stock.
+            # Franchise wallet gate: on a franchise deployment, this must succeed
+            # BEFORE the end-user is charged — protects the master's wholesale stock
+            # from being sold on credit. No-op (always True) on the master bot itself.
+            if not await reserve_franchise_wallet(price):
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
                 )
+                await notify_franchise_low_balance(price)
+                await event.answer("⚠️ Service temporarily unavailable. Please try again shortly.", alert=True)
+                return
+
+            old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
+            new_withdrawable = max(0, old_withdrawable - retail_price)
+            deduct_result = await users_col.update_one(
+                {"user_id": user_id, "balance": {"$gte": retail_price}},
+                {"$inc": {"balance": -retail_price}, "$set": {"withdrawable_balance": new_withdrawable}}
+            )
+            if deduct_result.modified_count == 0:
+                # Balance was insufficient at the moment of deduction (e.g. spent
+                # elsewhere concurrently) — release the reserved account back to stock
+                # and refund the franchise wallet since the sale didn't complete.
+                await accounts_col.update_one(
+                    {"_id": acc["_id"]},
+                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
+                )
+                await refund_franchise_wallet(price)
                 await event.answer("❌ Insufficient balance! Please deposit and try again.", alert=True)
                 return
 
@@ -1527,7 +1645,8 @@ async def callback_handler(event):
                 "account_id": str(acc["_id"]),
                 "phone": phone,
                 "country": country,
-                "amount": price,
+                "amount": retail_price,
+                "wholesale_amount": price,
                 "status": "completed",
                 "created_at": now_ist()
             })
@@ -1556,6 +1675,7 @@ async def callback_handler(event):
                 buyer_name = str(user_id)
             updated_user = await users_col.find_one({"user_id": user_id})
             new_balance = updated_user["balance"] if updated_user else 0
+            wallet_line = f"\nWholesale Cost: ₹{price} (franchise wallet)" if IS_FRANCHISE else ""
             for admin in ADMIN_IDS:
                 try:
                     await bot.send_message(admin,
@@ -1563,7 +1683,7 @@ async def callback_handler(event):
                         f"Buyer: `{user_id}` - {buyer_name}\n"
                         f"Phone: `{phone}`\n"
                         f"Country: {country}\n"
-                        f"Price: ₹{price}\n"
+                        f"Price: ₹{retail_price}{wallet_line}\n"
                         f"Balance After: ₹{new_balance}"
                     )
                 except:
@@ -1573,7 +1693,7 @@ async def callback_handler(event):
                 f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
                 f"📱 Phone: `{phone}`\n"
                 f"🌍 Country: {country}\n"
-                f"💰 Price: ₹{price}\n"
+                f"💰 Price: ₹{retail_price}" + (f" (wholesale ₹{price})" if IS_FRANCHISE else "") + "\n"
                 f"👛 Balance After: ₹{new_balance}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
@@ -1798,6 +1918,7 @@ async def callback_handler(event):
             link = state["link"]
             quantity = state["quantity"]
             charge = state["charge"]
+            wholesale_cost = state.get("wholesale_cost", charge)
 
             # Atomically reserve the charge FIRST — prevents both double-spend
             # (e.g. fast double-tap) and placing a paid order without payment.
@@ -1807,6 +1928,18 @@ async def callback_handler(event):
             )
             if deduct_result.modified_count == 0:
                 await event.answer("❌ Insufficient balance.", alert=True)
+                user_states.pop(user_id, None)
+                return
+
+            # Franchise wallet gate: must succeed BEFORE the (irreversible) panel
+            # API call. No-op on the master bot itself.
+            if not await reserve_franchise_wallet(wholesale_cost):
+                await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
+                await notify_franchise_low_balance(wholesale_cost)
+                await event.edit("⚠️ Service temporarily unavailable. Please try again shortly.\n\n"
+                                  f"💰 Your ₹{charge} has not been charged.",
+                                  buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
+                await event.answer()
                 user_states.pop(user_id, None)
                 return
 
@@ -1823,6 +1956,7 @@ async def callback_handler(event):
             except Exception as e:
                 # Refund since the order was never placed.
                 await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
+                await refund_franchise_wallet(wholesale_cost)
                 await event.edit(f"❌ Order failed: {e}\n\n💰 Your ₹{charge} has been refunded.",
                                   buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
@@ -1842,6 +1976,7 @@ async def callback_handler(event):
                 err = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown error"
                 # Refund since the panel did not accept the order.
                 await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
+                await refund_franchise_wallet(wholesale_cost)
                 await event.edit(f"❌ SMM panel rejected the order: {err}\n\n💰 Your ₹{charge} has been refunded.",
                                   buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
@@ -1865,6 +2000,7 @@ async def callback_handler(event):
                 "link": link,
                 "quantity": quantity,
                 "charge": charge,
+                "wholesale_cost": wholesale_cost,
                 "smm_order_id": result["order"],
                 "status": "pending",
                 "created_at": now_ist(),
@@ -1874,6 +2010,7 @@ async def callback_handler(event):
             smm_buyer_name = await get_display_name(user_id)
             updated_user = await users_col.find_one({"user_id": user_id})
             new_bal = updated_user["balance"] if updated_user else 0
+            wallet_note = f" (wholesale ₹{wholesale_cost})" if IS_FRANCHISE else ""
             await log_event(
                 f"🚀 **New SMM Order**\n"
                 f"👤 User: {smm_buyer_name} (`{user_id}`)\n"
@@ -1882,7 +2019,7 @@ async def callback_handler(event):
                 f"🗂️ Category: {service.get('category', 'Other')}\n"
                 f"🔗 Link: {link}\n"
                 f"📊 Quantity: {quantity}\n"
-                f"💰 Charged: ₹{charge} | 👛 Balance After: ₹{new_bal}\n"
+                f"💰 Charged: ₹{charge}{wallet_note} | 👛 Balance After: ₹{new_bal}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             await event.edit(
@@ -1913,9 +2050,58 @@ async def callback_handler(event):
                 [Button.inline("💰 Finance & Transactions", b"admin_cat_finance", style="primary")],
                 [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="success")],
                 [Button.inline("⚙️ Bot Settings", b"admin_cat_settings", style="primary")],
-                [Button.inline("🔙 Back", b"main", style="primary")],
             ]
+            if not IS_FRANCHISE:
+                btns.append([Button.inline("🏢 Franchises", b"admin_cat_franchise", style="success")])
+            btns.append([Button.inline("🔙 Back", b"main", style="primary")])
             await event.edit("⚙️ **Admin Panel**\n\nChoose a category:", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_cat_franchise":
+            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            btns = [
+                [Button.inline("📋 List Franchise Wallets", b"admin_franchise_list", style="primary")],
+                [Button.inline("💰 Add Wallet Credit", b"admin_franchise_credit", style="success")],
+                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+            ]
+            await event.edit(
+                "🏢 **Franchise Management**\n\n"
+                "Each franchise partner runs their own bot (same codebase, its own "
+                "`FRANCHISE_ID` + `FRANCHISE_OWNER_ID` in `.env`), pointed at this "
+                "same database. Every sale on their bot draws down from the wallet "
+                "credit you top up here.",
+                buttons=btns
+            )
+            await event.answer()
+            return
+
+        if data == "admin_franchise_list":
+            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            wallets = await franchise_wallets_col.find({}).sort("balance", -1).to_list(length=50)
+            if not wallets:
+                txt = "🏢 **Franchise Wallets**\n\nNo franchises yet. A wallet is created automatically the first time you add credit for a new `FRANCHISE_ID`."
+            else:
+                lines = [f"• `{w['franchise_id']}` — ₹{w.get('balance', 0)}" for w in wallets]
+                txt = "🏢 **Franchise Wallets**\n\n" + "\n".join(lines)
+            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"admin_cat_franchise", style="primary")]])
+            await event.answer()
+            return
+
+        if data == "admin_franchise_credit":
+            if user_id not in ADMIN_IDS or IS_FRANCHISE:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "franchise_credit", "step": "franchise_id"}
+            await event.edit(
+                "🏢 Send the **Franchise ID** to credit (this is the `FRANCHISE_ID` "
+                "value in that partner's `.env`):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
+            )
             await event.answer()
             return
 
@@ -1928,9 +2114,32 @@ async def callback_handler(event):
                 [Button.inline("📥 Add Account (Session)", b"admin_add_sess", style="success")],
                 [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock", style="success")],
                 [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
+                [Button.inline("📈 Set Account Markup", b"admin_account_markup", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("📦 **Accounts & Stock**", buttons=btns)
+            await event.answer()
+            return
+
+        if data == "admin_account_markup":
+            if user_id not in ADMIN_IDS:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            cur = await get_account_markup()
+            user_states[user_id] = {"action": "set_account_markup", "step": "await_value"}
+            note = (
+                "\n\nOn a **franchise** bot: this is your retail markup on top of the "
+                "wholesale price the master sets — e.g. `1.2` charges your customers 20% "
+                "more than what your franchise wallet is billed."
+                if IS_FRANCHISE else
+                "\n\nOn the **master** bot this normally stays `1.0` (no markup) since "
+                "`price` already IS the retail/wholesale price."
+            )
+            await event.edit(
+                f"📈 Current account markup: **{cur}x**\n\n"
+                f"Send new multiplier (e.g. `1.2` for 20% markup, `1.0` for none):" + note,
+                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]]
+            )
             await event.answer()
             return
 
@@ -3004,6 +3213,66 @@ async def handle_message(event):
                                  buttons=[[Button.inline("🔙 Referral Settings", b"admin_referral_settings", style="primary")]])
             user_states.pop(user_id, None)
 
+    elif action == "set_account_markup":
+        step = state.get("step")
+        if step == "await_value":
+            try:
+                val = float(event.message.text.strip())
+                if val <= 0:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid multiplier. Send a number like `1.2`.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]])
+                return
+            await set_account_markup(val)
+            await event.respond(f"✅ Account markup set to {val}x.",
+                                 buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]])
+            user_states.pop(user_id, None)
+
+    elif action == "franchise_credit":
+        step = state.get("step")
+        if step == "franchise_id":
+            fid = event.message.text.strip()
+            if not fid:
+                await event.respond("❌ Invalid Franchise ID.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]])
+                return
+            state["franchise_id"] = fid
+            state["step"] = "amount"
+            await event.respond(
+                f"💰 Send the amount (₹) to add to franchise `{fid}`'s wallet:",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
+            )
+            return
+        if step == "amount":
+            try:
+                amt = float(event.message.text.strip())
+                if amt <= 0:
+                    raise ValueError
+            except:
+                await event.respond("❌ Invalid amount. Send a number like `500`.",
+                                     buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]])
+                return
+            fid = state["franchise_id"]
+            await franchise_wallets_col.update_one(
+                {"franchise_id": fid},
+                {"$inc": {"balance": amt}, "$set": {"updated_at": now_ist()}},
+                upsert=True
+            )
+            new_bal = await get_franchise_wallet_balance(fid)
+            await event.respond(
+                f"✅ Added ₹{amt} to franchise `{fid}`.\n💰 New wallet balance: ₹{new_bal}",
+                buttons=[[Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]]
+            )
+            await log_event(
+                f"🏢 **Franchise Wallet Credited**\n"
+                f"🆔 Franchise: `{fid}`\n"
+                f"💰 Added: ₹{amt} | New Balance: ₹{new_bal}\n"
+                f"👤 By Admin: `{user_id}`\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
+            user_states.pop(user_id, None)
+
     elif action == "smm_search":
         step = state.get("step")
         if step == "query":
@@ -3077,12 +3346,14 @@ async def handle_message(event):
             usd = await get_usd_inr()
             markup = await get_smm_markup(service.get("category", ""))
             charge = round((float(service["rate"]) / 1000) * qty * usd * markup, 2)
+            wholesale_cost = round((float(service["rate"]) / 1000) * qty * usd, 2)
 
             user = await users_col.find_one({"user_id": user_id})
             balance = user["balance"] if user else 0
 
             state["quantity"] = qty
             state["charge"] = charge
+            state["wholesale_cost"] = wholesale_cost
             state["step"] = "confirm"
 
             text = (
