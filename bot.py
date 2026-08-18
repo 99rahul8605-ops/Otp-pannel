@@ -469,6 +469,11 @@ async def set_account_markup(value: float):
     )
 
 # ---------- CLONE PROVISIONING ----------
+async def get_user_clone(user_id: int):
+    """Return the bot_clones_col doc this user already owns, if any — used to
+    enforce one clone per user, and to power the 'Remove My Clone' flow."""
+    return await bot_clones_col.find_one({"owner_id": user_id})
+
 async def validate_bot_token(token: str):
     """Ping Telegram's Bot API to confirm a token is real and get its @username + display name."""
     try:
@@ -783,7 +788,11 @@ async def show_welcome_menu(event, user_id):
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
     if not ctx()['is_franchise']:
-        buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
+        my_clone = await get_user_clone(user_id)
+        if my_clone:
+            buttons.append([Button.inline(f"🗑️ Remove My Clone (@{my_clone['bot_username']})", b"remove_my_clone", style="danger")])
+        else:
+            buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
 
     support_link = await get_support_link()
     if support_link:
@@ -812,7 +821,11 @@ async def send_main_menu(event):
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
     if not ctx()['is_franchise']:
-        buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
+        my_clone = await get_user_clone(user_id)
+        if my_clone:
+            buttons.append([Button.inline(f"🗑️ Remove My Clone (@{my_clone['bot_username']})", b"remove_my_clone", style="danger")])
+        else:
+            buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link, style="primary")])
@@ -1385,7 +1398,8 @@ async def callback_handler(event):
                     "admin_cat_franchise", "admin_franchise_list", "admin_franchise_credit",
                     "admin_account_markup", "my_franchise_wallet", "admin_clone_bot",
                     "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot",
-                    "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name"):
+                    "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name",
+                    "remove_my_clone", "admin_remove_clone_list"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -2295,22 +2309,49 @@ async def callback_handler(event):
                 [Button.inline("🤖 Clone Bot (New Franchise)", b"admin_clone_bot", style="success")],
                 [Button.inline("📋 List Clones/Wallets", b"admin_franchise_list", style="primary")],
                 [Button.inline("💰 Add Wallet Credit", b"admin_franchise_credit", style="success")],
+                [Button.inline("🗑️ Remove a Clone", b"admin_remove_clone_list", style="danger")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit(
                 "🏢 **Franchise Management**\n\n"
-                "Each franchise partner runs their own bot (same codebase, its own "
-                "`FRANCHISE_ID` + `FRANCHISE_OWNER_ID` in `.env`), pointed at this "
-                "same database. Every sale on their bot draws down from the wallet "
-                "credit you top up here.",
+                "Each franchise partner's bot runs live in this same process — "
+                "one clone per user. Every sale on their bot draws down from the "
+                "wallet credit you top up here.",
                 buttons=btns
             )
             await event.answer()
             return
 
+        if data == "admin_remove_clone_list":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            clones = await bot_clones_col.find({}).to_list(length=50)
+            if not clones:
+                await event.answer("No clones to remove.", alert=True)
+                return
+            btns = [
+                [Button.inline(f"🗑️ @{c['bot_username']} (owner {c['owner_id']})",
+                                f"do_remove_clone_{c['franchise_id']}".encode(), style="danger")]
+                for c in clones
+            ]
+            btns.append([Button.inline("🔙 Back", b"admin_cat_franchise", style="primary")])
+            await event.edit("🗑️ **Select a clone to remove:**", buttons=btns)
+            await event.answer()
+            return
+
+
         if data == "admin_clone_bot":
             if not await is_admin(user_id) or ctx()['is_franchise']:
                 await event.answer("❌ Unauthorized", alert=True)
+                return
+            existing = await get_user_clone(user_id)
+            if existing:
+                await event.answer(
+                    f"❌ You already own a clone: @{existing['bot_username']}. "
+                    f"Remove it first if you want to create a new one.",
+                    alert=True
+                )
                 return
             user_states[user_id] = {"action": "clone_bot", "step": "token"}
             await event.edit(
@@ -2328,6 +2369,14 @@ async def callback_handler(event):
             if ctx()['is_franchise']:
                 await event.answer("❌ Cloning is only available from the main bot.", alert=True)
                 return
+            existing = await get_user_clone(user_id)
+            if existing:
+                await event.answer(
+                    f"❌ You already own a clone: @{existing['bot_username']}. "
+                    f"Remove it first (Main Menu → Remove My Clone) if you want to create a new one.",
+                    alert=True
+                )
+                return
             user_states[user_id] = {"action": "clone_bot", "step": "token"}
             await event.edit(
                 "🤖 **Clone This Bot — Run Your Own!**\n\n"
@@ -2336,8 +2385,59 @@ async def callback_handler(event):
                 "2️⃣ Send that token here\n\n"
                 "That's it — your bot gets its own customers, its own settings, "
                 "and **you become its admin automatically.** Stock/services are "
-                "drawn from a prepaid wallet (top up anytime).",
+                "drawn from a prepaid wallet (top up anytime).\n\n"
+                "⚠️ One clone per user — remove it later if you ever want a fresh one.",
                 buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
+            )
+            await event.answer()
+            return
+
+        if data == "remove_my_clone":
+            if ctx()['is_franchise']:
+                await event.answer("❌ Not available here.", alert=True)
+                return
+            my_clone = await get_user_clone(user_id)
+            if not my_clone:
+                await event.answer("You don't own a clone.", alert=True)
+                return
+            await event.edit(
+                f"⚠️ **Remove your clone @{my_clone['bot_username']}?**\n\n"
+                f"This will take it offline immediately. Its data (customers, "
+                f"orders, wallet balance) is kept — recreating a clone with the "
+                f"same bot token later would pick it back up. Proceed?",
+                buttons=[
+                    [Button.inline("🗑️ Yes, Remove It", f"do_remove_clone_{my_clone['franchise_id']}".encode(), style="danger")],
+                    [Button.inline("❌ Cancel", b"main", style="primary")],
+                ]
+            )
+            await event.answer()
+            return
+
+        if data.startswith("do_remove_clone_"):
+            fid = data[len("do_remove_clone_"):]
+            clone = await bot_clones_col.find_one({"franchise_id": fid})
+            if not clone:
+                await event.answer("❌ Clone not found.", alert=True)
+                return
+            is_owner = (clone["owner_id"] == user_id)
+            is_master_admin = (not ctx()['is_franchise']) and await is_admin(user_id)
+            if not (is_owner or is_master_admin):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+
+            await stop_clone(fid)
+            await bot_clones_col.delete_one({"franchise_id": fid})
+            await log_event(
+                f"🗑️ **Clone Removed**\n"
+                f"🆔 Franchise: `{fid}` | @{clone['bot_username']}\n"
+                f"👤 Owner: `{clone['owner_id']}`\n"
+                f"👤 Removed by: `{user_id}`\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
+            back_button = b"admin_cat_franchise" if is_master_admin and not is_owner else b"main"
+            await event.edit(
+                f"✅ @{clone['bot_username']} has been removed and taken offline.",
+                buttons=[[Button.inline("🔙 Back", back_button, style="primary")]]
             )
             await event.answer()
             return
