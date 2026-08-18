@@ -123,7 +123,7 @@ db = mongo_client['otp_bot']
 
 # Unique tenant key for THIS running instance — every franchise clone gets its
 # own scope, the master bot's scope is "master". Shared stock (accounts_col)
-# and master-only management collections (franchise_wallets_col, bot_clones_col)
+# and master-only management collections (bot_clones_col)
 # stay unscoped/global on purpose — everything else that holds a customer's
 # money or personal data (balance, deposits, withdrawals, order history,
 # per-tenant settings like markup/referral %/min-withdrawal) must NEVER leak
@@ -188,7 +188,6 @@ deposits_col = ScopedCollection(db['deposits'])
 settings_col = ScopedCollection(db['settings'])
 withdrawals_col = ScopedCollection(db['withdrawals'])
 smm_orders_col = ScopedCollection(db['smm_orders'])
-franchise_wallets_col = db['franchise_wallets']  # master-only, intentionally NOT scoped
 bot_clones_col = db['bot_clones']                # master-only, intentionally NOT scoped
 
 # ---------- BOT INSTANCE ----------
@@ -409,30 +408,48 @@ async def log_event(text):
             logging.error(f"Failed to send log to channel: {e}")
 
 # ---------- FRANCHISE WALLET ----------
-async def get_franchise_wallet_balance(franchise_id: str) -> float:
-    doc = await franchise_wallets_col.find_one({"franchise_id": franchise_id})
+# Linked directly to the owner's own MASTER-bot personal balance — there is no
+# separate wallet pool anymore. Whatever the owner has in their own account on
+# the master bot IS what their franchise draws from, always in sync.
+async def get_owner_master_balance(owner_id: int) -> float:
+    doc = await users_col._col.find_one({"user_id": owner_id, "franchise_id": "master"})
     return doc.get("balance", 0) if doc else 0
 
-async def reserve_franchise_wallet(wholesale_cost: float) -> bool:
-    """Atomically deduct wholesale_cost from THIS instance's franchise wallet.
-    On the master bot (no ctx()['franchise_id']) this is always a no-op success —
-    the master IS the source, nothing to gate."""
-    if not ctx()['is_franchise'] or wholesale_cost <= 0:
+async def reserve_owner_master_balance(owner_id: int, amount: float) -> bool:
+    if amount <= 0:
         return True
-    result = await franchise_wallets_col.update_one(
-        {"franchise_id": ctx()['franchise_id'], "balance": {"$gte": wholesale_cost}},
-        {"$inc": {"balance": -wholesale_cost}}
+    result = await users_col._col.update_one(
+        {"user_id": owner_id, "franchise_id": "master", "balance": {"$gte": amount}},
+        {"$inc": {"balance": -amount}}
     )
     return result.modified_count > 0
+
+async def refund_owner_master_balance(owner_id: int, amount: float):
+    if amount <= 0:
+        return
+    await users_col._col.update_one(
+        {"user_id": owner_id, "franchise_id": "master"},
+        {"$inc": {"balance": amount}},
+        upsert=True
+    )
+
+async def reserve_franchise_wallet(wholesale_cost: float) -> bool:
+    """Atomically deduct wholesale_cost from THIS clone owner's own master-bot
+    balance. On the master bot itself this is always a no-op success — the
+    master IS the source, nothing to gate."""
+    if not ctx()['is_franchise'] or wholesale_cost <= 0:
+        return True
+    owner_id = ctx()['owner_id']
+    if not owner_id:
+        return False
+    return await reserve_owner_master_balance(owner_id, wholesale_cost)
 
 async def refund_franchise_wallet(amount: float):
     if not ctx()['is_franchise'] or amount <= 0:
         return
-    await franchise_wallets_col.update_one(
-        {"franchise_id": ctx()['franchise_id']},
-        {"$inc": {"balance": amount}},
-        upsert=True
-    )
+    owner_id = ctx()['owner_id']
+    if owner_id:
+        await refund_owner_master_balance(owner_id, amount)
 
 async def notify_franchise_low_balance(attempted_cost: float):
     """Alert the franchise owner privately — never expose wholesale mechanics to
@@ -440,17 +457,18 @@ async def notify_franchise_low_balance(attempted_cost: float):
     if not ctx()['is_franchise'] or not ctx()['owner_id']:
         return
     try:
-        bal = await get_franchise_wallet_balance(ctx()['franchise_id'])
+        bal = await get_owner_master_balance(ctx()['owner_id'])
         await ctx()['client'].send_message(
             ctx()['owner_id'],
-            f"🔴 **Low Wallet Balance!**\n\n"
+            f"🔴 **Low Balance!**\n\n"
             f"A customer just tried to buy something costing ₹{attempted_cost} "
-            f"wholesale, but your franchise wallet balance is only ₹{bal}.\n\n"
+            f"wholesale, but your own balance (on the master bot) is only ₹{bal}.\n\n"
             f"The order was blocked and your customer's own balance was NOT charged. "
-            f"Please recharge your franchise wallet to keep selling."
+            f"Deposit into your account on the master bot to keep selling."
         )
     except Exception as e:
         logging.error(f"Could not notify franchise owner of low balance: {e}")
+
 
 async def get_account_markup() -> float:
     """Retail markup this instance applies on top of the wholesale account price.
@@ -1629,15 +1647,16 @@ async def callback_handler(event):
             if not (ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
-            bal = await get_franchise_wallet_balance(ctx()['franchise_id'])
+            bal = await get_owner_master_balance(ctx()['owner_id'])
             low_warn = "\n\n⚠️ **Balance is low** — top up soon to avoid interrupted sales." if bal < 50 else ""
             await event.edit(
                 f"🏢 **My Franchise Wallet**\n\n"
                 f"🆔 Franchise ID: `{ctx()['franchise_id']}`\n"
                 f"💰 Current Balance: ₹{bal}\n\n"
-                f"This is the prepaid credit your bot draws from for every account "
-                f"and SMM order your customers buy — it's charged at wholesale "
-                f"price. Contact the platform owner to top it up.{low_warn}",
+                f"This IS your own personal balance on the master bot — same money, "
+                f"one place. Every account/SMM order your customers buy here draws "
+                f"from it at wholesale price. Deposit into your own account on the "
+                f"master bot to top it up.{low_warn}",
                 buttons=[[Button.inline("🔙 Back", b"main", style="primary")]]
             )
             await event.answer()
@@ -2308,7 +2327,7 @@ async def callback_handler(event):
             btns = [
                 [Button.inline("🤖 Clone Bot (New Franchise)", b"admin_clone_bot", style="success")],
                 [Button.inline("📋 List Clones/Wallets", b"admin_franchise_list", style="primary")],
-                [Button.inline("💰 Add Wallet Credit", b"admin_franchise_credit", style="success")],
+                [Button.inline("💰 Add Owner Balance", b"admin_franchise_credit", style="success")],
                 [Button.inline("🗑️ Remove a Clone", b"admin_remove_clone_list", style="danger")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
@@ -2446,19 +2465,15 @@ async def callback_handler(event):
             if not await is_admin(user_id) or ctx()['is_franchise']:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
-            wallets = await franchise_wallets_col.find({}).sort("balance", -1).to_list(length=50)
             clones = await bot_clones_col.find({}).to_list(length=50)
-            clone_map = {c["franchise_id"]: c for c in clones}
-            if not wallets:
-                txt = "🏢 **Franchise Wallets**\n\nNo franchises yet. Use \"🤖 Clone Bot\" to provision one."
+            if not clones:
+                txt = "🏢 **Franchise Clones**\n\nNo franchises yet. Use \"🤖 Clone Bot\" to provision one."
             else:
                 lines = []
-                for w in wallets:
-                    fid = w['franchise_id']
-                    c = clone_map.get(fid)
-                    label = f"@{c['bot_username']} ({c['display_name']})" if c else fid
-                    lines.append(f"• `{fid}` — {label} — ₹{w.get('balance', 0)}")
-                txt = "🏢 **Franchise Wallets**\n\n" + "\n".join(lines)
+                for c in clones:
+                    bal = await get_owner_master_balance(c["owner_id"])
+                    lines.append(f"• @{c['bot_username']} ({c['display_name']}) — owner `{c['owner_id']}` — ₹{bal}")
+                txt = "🏢 **Franchise Clones**\n\n" + "\n".join(lines)
             await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"admin_cat_franchise", style="primary")]])
             await event.answer()
             return
@@ -3788,14 +3803,18 @@ async def handle_message(event):
         step = state.get("step")
         if step == "franchise_id":
             fid = event.message.text.strip()
-            if not fid:
-                await event.respond("❌ Invalid Franchise ID.",
+            clone = await bot_clones_col.find_one({"franchise_id": fid})
+            if not clone:
+                await event.respond("❌ No clone with that Franchise ID. Check 'List Clones/Wallets' and try again.",
                                      buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]])
                 return
             state["franchise_id"] = fid
+            state["owner_id"] = clone["owner_id"]
             state["step"] = "amount"
             await event.respond(
-                f"💰 Send the amount (₹) to add to franchise `{fid}`'s wallet:",
+                f"💰 Send the amount (₹) to add to @{clone['bot_username']}'s owner "
+                f"(`{clone['owner_id']}`) balance — this is their own master-bot balance, "
+                f"which their franchise draws from:",
                 buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
             )
             return
@@ -3809,19 +3828,16 @@ async def handle_message(event):
                                      buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]])
                 return
             fid = state["franchise_id"]
-            await franchise_wallets_col.update_one(
-                {"franchise_id": fid},
-                {"$inc": {"balance": amt}, "$set": {"updated_at": now_ist()}},
-                upsert=True
-            )
-            new_bal = await get_franchise_wallet_balance(fid)
+            owner_id = state["owner_id"]
+            await refund_owner_master_balance(owner_id, amt)  # plain credit, not a "refund" — just reuses the same $inc helper
+            new_bal = await get_owner_master_balance(owner_id)
             await event.respond(
-                f"✅ Added ₹{amt} to franchise `{fid}`.\n💰 New wallet balance: ₹{new_bal}",
+                f"✅ Added ₹{amt} to owner `{owner_id}`'s balance.\n💰 New balance: ₹{new_bal}",
                 buttons=[[Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]]
             )
             await log_event(
-                f"🏢 **Franchise Wallet Credited**\n"
-                f"🆔 Franchise: `{fid}`\n"
+                f"🏢 **Franchise Owner Balance Credited**\n"
+                f"🆔 Franchise: `{fid}` | Owner: `{owner_id}`\n"
                 f"💰 Added: ₹{amt} | New Balance: ₹{new_bal}\n"
                 f"👤 By Admin: `{user_id}`\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
@@ -3887,11 +3903,6 @@ async def handle_message(event):
                 "created_at": now_ist(),
                 "created_by": user_id,
             })
-            await franchise_wallets_col.update_one(
-                {"franchise_id": fid},
-                {"$setOnInsert": {"balance": 0, "created_at": now_ist()}},
-                upsert=True
-            )
 
             try:
                 await launch_clone(token, fid, owner_id, display_name)
@@ -3903,7 +3914,7 @@ async def handle_message(event):
             requester_is_admin = await is_admin(user_id)
             if requester_is_admin:
                 completion_buttons = [
-                    [Button.inline("💰 Add Wallet Credit", f"admin_franchise_credit".encode(), style="success")],
+                    [Button.inline("💰 Add Owner Balance", f"admin_franchise_credit".encode(), style="success")],
                     [Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]
                 ]
                 wallet_note = "💰 Wallet: ₹0 (add credit next)"
