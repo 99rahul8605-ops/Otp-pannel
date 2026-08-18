@@ -73,6 +73,36 @@ FRANCHISE_OWNER_ID = os.getenv("FRANCHISE_OWNER_ID", "").strip()
 FRANCHISE_OWNER_ID = int(FRANCHISE_OWNER_ID) if FRANCHISE_OWNER_ID.isdigit() else None
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "OTP Shop Bot").strip()
 
+# ---------- MULTI-BOT CONTEXT (master + live in-process clones) ----------
+# The master process can run several Telegram bot clients at once (the master
+# bot itself, plus every cloned franchise bot) — each needs its OWN admin
+# list, franchise id, display name, and DB scope. Since a single event handler
+# function is shared across all clients, we resolve "which bot fired this
+# event" via a contextvar set at the top of every handler, instead of relying
+# on module-level constants (which only make sense for a single bot/process).
+import contextvars
+current_ctx: contextvars.ContextVar = contextvars.ContextVar("current_ctx", default=None)
+client_contexts: dict = {}   # TelegramClient -> context dict
+clone_clients: dict = {}     # franchise_id -> TelegramClient (live, in-process)
+
+def master_ctx() -> dict:
+    return {
+        "scope_id": "master", "is_franchise": False, "franchise_id": "",
+        "owner_id": FRANCHISE_OWNER_ID, "display_name": BOT_DISPLAY_NAME,
+        "admin_ids": ADMIN_IDS, "client": bot,
+    }
+
+def ctx() -> dict:
+    """Context for whichever bot (master or a clone) is currently handling
+    a request. Falls back to the master's own config if unset."""
+    c = current_ctx.get()
+    return c if c is not None else master_ctx()
+
+def set_ctx_from_event(event):
+    c = client_contexts.get(event.client)
+    current_ctx.set(c if c is not None else master_ctx())
+    return ctx()
+
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -98,19 +128,27 @@ db = mongo_client['otp_bot']
 # money or personal data (balance, deposits, withdrawals, order history,
 # per-tenant settings like markup/referral %/min-withdrawal) must NEVER leak
 # between franchises, even though they all share one MongoDB.
+# Unique tenant key for THIS running instance's OWN traffic (used before any
+# event context exists, e.g. at startup). Once handlers are running, the
+# ACTIVE scope is resolved per-event via ctx()['scope_id'] below — this lets
+# one process safely serve the master bot AND many live franchise clones at
+# once without their data ever mixing.
 SCOPE_ID = FRANCHISE_ID if IS_FRANCHISE else "master"
 
 class ScopedCollection:
     """Thin wrapper around a Motor collection that transparently tags every
-    document with franchise_id on write and filters by it on read, so a
-    single shared MongoDB safely serves multiple isolated bot instances."""
-    def __init__(self, collection, scope_id):
+    document with franchise_id on write and filters by it on read, resolving
+    the CURRENT bot's scope per-call (via ctx()) — so a single shared MongoDB
+    safely serves the master bot plus any number of live in-process clones."""
+    def __init__(self, collection):
         self._col = collection
-        self._scope_id = scope_id
+
+    def _current_scope(self):
+        return ctx()['scope_id']
 
     def _scope(self, filt):
         filt = dict(filt) if filt else {}
-        filt["franchise_id"] = self._scope_id
+        filt["franchise_id"] = self._current_scope()
         return filt
 
     async def find_one(self, filt=None, *args, **kwargs):
@@ -124,13 +162,13 @@ class ScopedCollection:
 
     async def insert_one(self, doc, *args, **kwargs):
         doc = dict(doc)
-        doc.setdefault("franchise_id", self._scope_id)
+        doc.setdefault("franchise_id", self._current_scope())
         return await self._col.insert_one(doc, *args, **kwargs)
 
     async def update_one(self, filt, update, *args, **kwargs):
         update = dict(update)
         set_stage = dict(update.get("$set", {}))
-        set_stage.setdefault("franchise_id", self._scope_id)
+        set_stage.setdefault("franchise_id", self._current_scope())
         update["$set"] = set_stage
         return await self._col.update_one(self._scope(filt), update, *args, **kwargs)
 
@@ -138,18 +176,18 @@ class ScopedCollection:
         return await self._col.delete_one(self._scope(filt), *args, **kwargs)
 
     def aggregate(self, pipeline, *args, **kwargs):
-        return self._col.aggregate([{"$match": {"franchise_id": self._scope_id}}] + list(pipeline), *args, **kwargs)
+        return self._col.aggregate([{"$match": {"franchise_id": self._current_scope()}}] + list(pipeline), *args, **kwargs)
 
     def distinct(self, key, filt=None, *args, **kwargs):
         return self._col.distinct(key, self._scope(filt), *args, **kwargs)
 
 accounts_col = db['accounts']  # shared wholesale stock pool — intentionally NOT scoped
-users_col = ScopedCollection(db['users'], SCOPE_ID)
-orders_col = ScopedCollection(db['orders'], SCOPE_ID)
-deposits_col = ScopedCollection(db['deposits'], SCOPE_ID)
-settings_col = ScopedCollection(db['settings'], SCOPE_ID)
-withdrawals_col = ScopedCollection(db['withdrawals'], SCOPE_ID)
-smm_orders_col = ScopedCollection(db['smm_orders'], SCOPE_ID)
+users_col = ScopedCollection(db['users'])
+orders_col = ScopedCollection(db['orders'])
+deposits_col = ScopedCollection(db['deposits'])
+settings_col = ScopedCollection(db['settings'])
+withdrawals_col = ScopedCollection(db['withdrawals'])
+smm_orders_col = ScopedCollection(db['smm_orders'])
 franchise_wallets_col = db['franchise_wallets']  # master-only, intentionally NOT scoped
 bot_clones_col = db['bot_clones']                # master-only, intentionally NOT scoped
 
@@ -158,19 +196,55 @@ import hashlib
 session_name = "bot_session_" + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:8]
 bot = TelegramClient(session_name, API_ID, API_HASH)
 
+async def launch_clone(token: str, franchise_id: str, owner_id: int, display_name: str):
+    """Spin up a fully live TelegramClient for a franchise clone IN THIS SAME
+    PROCESS — no separate server/deployment needed. It gets the exact same
+    handlers as the master bot; every event it receives is scoped to this
+    clone's own data/admins/wallet via client_contexts + ctx()."""
+    if franchise_id in clone_clients:
+        return clone_clients[franchise_id]  # already running, don't double-launch
+
+    clone_session = "clone_session_" + hashlib.md5(token.encode()).hexdigest()[:8]
+    client = TelegramClient(clone_session, API_ID, API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.sign_in(bot_token=token)
+
+    client_contexts[client] = {
+        "scope_id": franchise_id, "is_franchise": True, "franchise_id": franchise_id,
+        "owner_id": owner_id, "display_name": display_name,
+        "admin_ids": [owner_id], "client": client,
+    }
+    clone_clients[franchise_id] = client
+
+    client.add_event_handler(broadcast_cmd, events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
+    client.add_event_handler(broadcast_callback, events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
+    client.add_event_handler(callback_handler, events.CallbackQuery)
+    client.add_event_handler(handle_message, events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
+    client.add_event_handler(start_cmd, events.NewMessage(pattern='/start'))
+
+    logging.info(f"🤖 Clone launched live: franchise_id={franchise_id} owner={owner_id}")
+    return client
+
+async def stop_clone(franchise_id: str):
+    client = clone_clients.pop(franchise_id, None)
+    if client:
+        client_contexts.pop(client, None)
+        await client.disconnect()
+
 # ---------- STATE MACHINE ----------
 user_states = {}
 pending_otp_requests = {}
 
 # ---------- Bot Username Cache ----------
-bot_username = None
+_bot_username_cache: dict = {}
 
 async def get_bot_username():
-    global bot_username
-    if bot_username is None:
-        me = await bot.get_me()
-        bot_username = me.username
-    return bot_username
+    client = ctx()['client']
+    if client not in _bot_username_cache:
+        me = await client.get_me()
+        _bot_username_cache[client] = me.username
+    return _bot_username_cache[client]
 
 # ---------- SETTINGS HELPERS ----------
 async def get_support_link():
@@ -216,14 +290,15 @@ async def remove_dynamic_admin(uid: int):
         )
 
 async def is_admin(user_id: int) -> bool:
-    if user_id in ADMIN_IDS:
+    if user_id in ctx()['admin_ids']:
         return True
     return user_id in await get_dynamic_admin_ids()
 
 async def get_all_admin_ids() -> list:
-    """Founding (.env) admins + dynamically added ones, deduped — use this for
+    """Founding admins for the CURRENT bot (.env ADMIN_IDS for master, just the
+    owner for a clone) + dynamically added ones, deduped — use this for
     notification loops so newly-added admins get alerts too."""
-    return list(set(ADMIN_IDS) | set(await get_dynamic_admin_ids()))
+    return list(set(ctx()['admin_ids']) | set(await get_dynamic_admin_ids()))
 
 async def get_min_withdrawal():
     setting = await settings_col.find_one({"key": "min_withdrawal"})
@@ -292,7 +367,7 @@ async def set_referral_bonus_max(value: float):
 async def get_display_name(user_id: int) -> str:
     """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
     try:
-        entity = await bot.get_entity(user_id)
+        entity = await ctx()['client'].get_entity(user_id)
         name = entity.first_name or "Unknown"
         if entity.username:
             return f"{name} (@{entity.username})"
@@ -314,21 +389,21 @@ async def get_franchise_wallet_balance(franchise_id: str) -> float:
 
 async def reserve_franchise_wallet(wholesale_cost: float) -> bool:
     """Atomically deduct wholesale_cost from THIS instance's franchise wallet.
-    On the master bot (no FRANCHISE_ID) this is always a no-op success —
+    On the master bot (no ctx()['franchise_id']) this is always a no-op success —
     the master IS the source, nothing to gate."""
-    if not IS_FRANCHISE or wholesale_cost <= 0:
+    if not ctx()['is_franchise'] or wholesale_cost <= 0:
         return True
     result = await franchise_wallets_col.update_one(
-        {"franchise_id": FRANCHISE_ID, "balance": {"$gte": wholesale_cost}},
+        {"franchise_id": ctx()['franchise_id'], "balance": {"$gte": wholesale_cost}},
         {"$inc": {"balance": -wholesale_cost}}
     )
     return result.modified_count > 0
 
 async def refund_franchise_wallet(amount: float):
-    if not IS_FRANCHISE or amount <= 0:
+    if not ctx()['is_franchise'] or amount <= 0:
         return
     await franchise_wallets_col.update_one(
-        {"franchise_id": FRANCHISE_ID},
+        {"franchise_id": ctx()['franchise_id']},
         {"$inc": {"balance": amount}},
         upsert=True
     )
@@ -336,12 +411,12 @@ async def refund_franchise_wallet(amount: float):
 async def notify_franchise_low_balance(attempted_cost: float):
     """Alert the franchise owner privately — never expose wholesale mechanics to
     the end customer, who just sees a generic 'unavailable' message."""
-    if not IS_FRANCHISE or not FRANCHISE_OWNER_ID:
+    if not ctx()['is_franchise'] or not ctx()['owner_id']:
         return
     try:
-        bal = await get_franchise_wallet_balance(FRANCHISE_ID)
-        await bot.send_message(
-            FRANCHISE_OWNER_ID,
+        bal = await get_franchise_wallet_balance(ctx()['franchise_id'])
+        await ctx()['client'].send_message(
+            ctx()['owner_id'],
             f"🔴 **Low Wallet Balance!**\n\n"
             f"A customer just tried to buy something costing ₹{attempted_cost} "
             f"wholesale, but your franchise wallet balance is only ₹{bal}.\n\n"
@@ -623,8 +698,8 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
     if parsed is None:
         return False
     try:
-        entity = await bot.get_entity(parsed)
-        await bot.get_permissions(entity, user_id)
+        entity = await ctx()['client'].get_entity(parsed)
+        await ctx()['client'].get_permissions(entity, user_id)
         return True
     except UserNotParticipantError:
         return False
@@ -652,7 +727,7 @@ async def send_join_message(event):
         title = raw_id
         try:
             parsed = parse_chat_id(raw_id)
-            entity = await bot.get_entity(parsed)
+            entity = await ctx()['client'].get_entity(parsed)
             title = getattr(entity, 'title', raw_id)
         except Exception as e:
             logging.warning(f"Could not get title for {raw_id}: {e}")
@@ -690,7 +765,7 @@ async def show_welcome_menu(event, user_id):
     username = await get_bot_username()
     ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
     welcome_msg = (
-        f"👋 **Welcome to the {BOT_DISPLAY_NAME}!**\n\n"
+        f"👋 **Welcome to the {ctx()['display_name']}!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
         "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
@@ -705,9 +780,9 @@ async def show_welcome_menu(event, user_id):
     if await is_admin(user_id):
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
-    if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
+    if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
-    if not IS_FRANCHISE:
+    if not ctx()['is_franchise']:
         buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
 
     support_link = await get_support_link()
@@ -734,14 +809,14 @@ async def send_main_menu(event):
     if await is_admin(user_id):
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
     buttons.append(row3)
-    if IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID:
+    if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
-    if not IS_FRANCHISE:
+    if not ctx()['is_franchise']:
         buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
     support_link = await get_support_link()
     if support_link:
         buttons.append([Button.url("📞 Support", support_link, style="primary")])
-    msg = f"🌟 **{BOT_DISPLAY_NAME} — Main Menu**"
+    msg = f"🌟 **{ctx()['display_name']} — Main Menu**"
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(msg, buttons=buttons)
     else:
@@ -750,6 +825,7 @@ async def send_main_menu(event):
 # ---------- BROADCAST COMMAND ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
+    set_ctx_from_event(event)
     user_id = event.sender_id
     if not await is_admin(user_id):
         await event.respond("❌ Unauthorized.")
@@ -840,6 +916,7 @@ async def broadcast_cmd(event):
 
 @bot.on(events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
 async def broadcast_callback(event):
+    set_ctx_from_event(event)
     user_id = event.sender_id
     if not await is_admin(user_id):
         await event.answer("❌ Unauthorized.", alert=True)
@@ -875,10 +952,10 @@ async def broadcast_callback(event):
     if pin_logs and LOGS_CHANNEL_ID:
         try:
             if is_forward:
-                pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
+                pin_msg = await ctx()['client'].forward_messages(LOGS_CHANNEL_ID, replied)
             else:
-                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
-            await bot.pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
+                pin_msg = await ctx()['client'].send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
+            await ctx()['client'].pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
             admin_bc_name = await get_display_name(user_id)
             await log_event(
                 f"📌 **Broadcast Pinned**\n"
@@ -899,8 +976,8 @@ async def broadcast_callback(event):
 
         async def send_one(uid):
             if is_forward:
-                return await bot.forward_messages(uid, replied)
-            return await bot.send_message(uid, msg_text, parse_mode="markdown")
+                return await ctx()['client'].forward_messages(uid, replied)
+            return await ctx()['client'].send_message(uid, msg_text, parse_mode="markdown")
 
         results = await asyncio.gather(*(send_one(uid) for uid in batch), return_exceptions=True)
 
@@ -913,7 +990,7 @@ async def broadcast_callback(event):
 
             if pin_dm:
                 try:
-                    await bot.pin_message(uid, res, notify=False)
+                    await ctx()['client'].pin_message(uid, res, notify=False)
                     pin_success += 1
                 except Exception as e:
                     pin_failed += 1
@@ -1272,6 +1349,7 @@ async def show_all_withdrawals(event, user_id):
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     try:
+        set_ctx_from_event(event)
         data = event.data.decode("utf-8")
         user_id = event.sender_id
         logging.info(f"Callback received: {data} from user {user_id}")
@@ -1530,14 +1608,14 @@ async def callback_handler(event):
 
         # ---------- REFERRAL INFO ----------
         if data == "my_franchise_wallet":
-            if not (IS_FRANCHISE and FRANCHISE_OWNER_ID and user_id == FRANCHISE_OWNER_ID):
+            if not (ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
-            bal = await get_franchise_wallet_balance(FRANCHISE_ID)
+            bal = await get_franchise_wallet_balance(ctx()['franchise_id'])
             low_warn = "\n\n⚠️ **Balance is low** — top up soon to avoid interrupted sales." if bal < 50 else ""
             await event.edit(
                 f"🏢 **My Franchise Wallet**\n\n"
-                f"🆔 Franchise ID: `{FRANCHISE_ID}`\n"
+                f"🆔 Franchise ID: `{ctx()['franchise_id']}`\n"
                 f"💰 Current Balance: ₹{bal}\n\n"
                 f"This is the prepaid credit your bot draws from for every account "
                 f"and SMM order your customers buy — it's charged at wholesale "
@@ -1725,7 +1803,7 @@ async def callback_handler(event):
                         await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
                         for admin in await get_all_admin_ids():
                             try:
-                                await bot.send_message(admin,
+                                await ctx()['client'].send_message(admin,
                                     f"⚠️ **Inactive Session Detected!**\n"
                                     f"📱 Phone: `{phone}`\n"
                                     f"🌍 Country: {country}\n"
@@ -1810,16 +1888,16 @@ async def callback_handler(event):
 
             # Admin notification
             try:
-                buyer_entity = await bot.get_entity(user_id)
+                buyer_entity = await ctx()['client'].get_entity(user_id)
                 buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
             except:
                 buyer_name = str(user_id)
             updated_user = await users_col.find_one({"user_id": user_id})
             new_balance = updated_user["balance"] if updated_user else 0
-            wallet_line = f"\nWholesale Cost: ₹{price} (franchise wallet)" if IS_FRANCHISE else ""
+            wallet_line = f"\nWholesale Cost: ₹{price} (franchise wallet)" if ctx()['is_franchise'] else ""
             for admin in await get_all_admin_ids():
                 try:
-                    await bot.send_message(admin,
+                    await ctx()['client'].send_message(admin,
                         f"🛒 **New Purchase**\n"
                         f"Buyer: `{user_id}` - {buyer_name}\n"
                         f"Phone: `{phone}`\n"
@@ -1834,7 +1912,7 @@ async def callback_handler(event):
                 f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
                 f"📱 Phone: `{phone}`\n"
                 f"🌍 Country: {country}\n"
-                f"💰 Price: ₹{retail_price}" + (f" (wholesale ₹{price})" if IS_FRANCHISE else "") + "\n"
+                f"💰 Price: ₹{retail_price}" + (f" (wholesale ₹{price})" if ctx()['is_franchise'] else "") + "\n"
                 f"👛 Balance After: ₹{new_balance}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
@@ -1885,7 +1963,7 @@ async def callback_handler(event):
                 if key in pending_otp_requests:
                     del pending_otp_requests[key]
                     try:
-                        await bot.send_message(user_id, "⏰ No OTP received. Try again.")
+                        await ctx()['client'].send_message(user_id, "⏰ No OTP received. Try again.")
                     except:
                         pass
             asyncio.create_task(clear_pending())
@@ -2151,7 +2229,7 @@ async def callback_handler(event):
             smm_buyer_name = await get_display_name(user_id)
             updated_user = await users_col.find_one({"user_id": user_id})
             new_bal = updated_user["balance"] if updated_user else 0
-            wallet_note = f" (wholesale ₹{wholesale_cost})" if IS_FRANCHISE else ""
+            wallet_note = f" (wholesale ₹{wholesale_cost})" if ctx()['is_franchise'] else ""
             await log_event(
                 f"🚀 **New SMM Order**\n"
                 f"👤 User: {smm_buyer_name} (`{user_id}`)\n"
@@ -2192,7 +2270,7 @@ async def callback_handler(event):
                 [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="success")],
                 [Button.inline("⚙️ Bot Settings", b"admin_cat_settings", style="primary")],
             ]
-            if not IS_FRANCHISE:
+            if not ctx()['is_franchise']:
                 btns.append([Button.inline("🏢 Franchises", b"admin_cat_franchise", style="success")])
             btns.append([Button.inline("🔙 Back", b"main", style="primary")])
             await event.edit("⚙️ **Admin Panel**\n\nChoose a category:", buttons=btns)
@@ -2200,7 +2278,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_franchise":
-            if not await is_admin(user_id) or IS_FRANCHISE:
+            if not await is_admin(user_id) or ctx()['is_franchise']:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2221,7 +2299,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_clone_bot":
-            if not await is_admin(user_id) or IS_FRANCHISE:
+            if not await is_admin(user_id) or ctx()['is_franchise']:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "clone_bot", "step": "token"}
@@ -2237,7 +2315,7 @@ async def callback_handler(event):
             return
 
         if data == "self_clone_bot":
-            if IS_FRANCHISE:
+            if ctx()['is_franchise']:
                 await event.answer("❌ Cloning is only available from the main bot.", alert=True)
                 return
             user_states[user_id] = {"action": "clone_bot", "step": "token"}
@@ -2255,7 +2333,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_franchise_list":
-            if not await is_admin(user_id) or IS_FRANCHISE:
+            if not await is_admin(user_id) or ctx()['is_franchise']:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             wallets = await franchise_wallets_col.find({}).sort("balance", -1).to_list(length=50)
@@ -2276,7 +2354,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_franchise_credit":
-            if not await is_admin(user_id) or IS_FRANCHISE:
+            if not await is_admin(user_id) or ctx()['is_franchise']:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "franchise_credit", "step": "franchise_id"}
@@ -2314,7 +2392,7 @@ async def callback_handler(event):
                 "\n\nOn a **franchise** bot: this is your retail markup on top of the "
                 "wholesale price the master sets — e.g. `1.2` charges your customers 20% "
                 "more than what your franchise wallet is billed."
-                if IS_FRANCHISE else
+                if ctx()['is_franchise'] else
                 "\n\nOn the **master** bot this normally stays `1.0` (no markup) since "
                 "`price` already IS the retail/wholesale price."
             )
@@ -2576,7 +2654,7 @@ async def callback_handler(event):
                         {"$set": {"referral_bonus_paid": True}}
                     )
                     try:
-                        await bot.send_message(
+                        await ctx()['client'].send_message(
                             referrer_id,
                             f"🎉 **Referral Bonus Earned!**\n\n"
                             f"Your referral made their first deposit of ₹{amount}.\n"
@@ -2614,7 +2692,7 @@ async def callback_handler(event):
             except Exception as e:
                 logging.error(f"Could not edit approve message: {e}")
             try:
-                await bot.send_message(
+                await ctx()['client'].send_message(
                     user_id_dep,
                     f"✅ **Deposit Approved!**\n💰 ₹{amount} added to your balance."
                 )
@@ -2644,7 +2722,7 @@ async def callback_handler(event):
             except Exception as e:
                 logging.error(f"Could not edit reject message: {e}")
             try:
-                await bot.send_message(
+                await ctx()['client'].send_message(
                     deposit["user_id"],
                     f"❌ **Deposit Rejected.**\nIf you believe this is a mistake, please contact support."
                 )
@@ -2750,7 +2828,7 @@ async def callback_handler(event):
                     {"$set": {"status": "approved", "processed_at": now_ist()}}
                 )
                 try:
-                    await bot.send_message(withdrawal["user_id"], f"✅ Withdrawal of ₹{withdrawal['amount']} approved.")
+                    await ctx()['client'].send_message(withdrawal["user_id"], f"✅ Withdrawal of ₹{withdrawal['amount']} approved.")
                 except:
                     pass
                 await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
@@ -2766,7 +2844,7 @@ async def callback_handler(event):
                     {"$set": {"status": "rejected", "processed_at": now_ist()}}
                 )
                 try:
-                    await bot.send_message(
+                    await ctx()['client'].send_message(
                         withdrawal["user_id"],
                         f"❌ Withdrawal of ₹{withdrawal['amount']} rejected. "
                         f"The amount has been refunded to your withdrawable balance."
@@ -3205,7 +3283,7 @@ async def process_deposit_step(event):
             f"Scan QR or use UPI: `{UPI_ID}`\n\n"
             "Send screenshot after payment."
         )
-        await bot.send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
+        await ctx()['client'].send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
         state["step"] = "screenshot"
     elif step == "screenshot":
         if not event.message.photo:
@@ -3227,7 +3305,7 @@ async def process_deposit_step(event):
         photo_io.name = "payment_proof.jpg"
         for admin in await get_all_admin_ids():
             try:
-                await bot.send_file(admin, photo_io,
+                await ctx()['client'].send_file(admin, photo_io,
                     caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`",
                     buttons=[
                         [Button.inline("✅ Approve", f"approve_{dep_id}", style="success"),
@@ -3255,6 +3333,7 @@ async def process_deposit_step(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
+    set_ctx_from_event(event)
     user_id = event.sender_id
     if not await is_user_member(user_id):
         await send_join_message(event)
@@ -3357,7 +3436,7 @@ async def handle_message(event):
             w_id = result.inserted_id
             for admin in await get_all_admin_ids():
                 try:
-                    await bot.send_message(admin,
+                    await ctx()['client'].send_message(admin,
                         f"🔔 **Withdrawal Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nUPI: `{upi}`",
                         buttons=[
                             [Button.inline("✅ Approve", f"wapprove_{w_id}", style="success"),
@@ -3547,7 +3626,7 @@ async def handle_message(event):
                 buttons=[[Button.inline("🔙 Manage Admins", b"admin_manage_admins", style="primary")]]
             )
             try:
-                await bot.send_message(new_admin_id, "🎉 You've been made an admin of this bot!")
+                await ctx()['client'].send_message(new_admin_id, "🎉 You've been made an admin of this bot!")
             except Exception:
                 pass
             await log_event(
@@ -3586,6 +3665,7 @@ async def handle_message(event):
                 "bot_username": bot_username,
                 "owner_id": owner_id,
                 "display_name": display_name,
+                "bot_token": token,  # needed to auto-relaunch this clone if the process restarts
                 "created_at": now_ist(),
                 "created_by": user_id,
             })
@@ -3594,6 +3674,13 @@ async def handle_message(event):
                 {"$setOnInsert": {"balance": 0, "created_at": now_ist()}},
                 upsert=True
             )
+
+            try:
+                await launch_clone(token, fid, owner_id, display_name)
+                launch_note = f"🟢 **@{bot_username} is LIVE right now** — try messaging it!"
+            except Exception as e:
+                logging.error(f"Failed to launch clone {fid}: {e}")
+                launch_note = f"⚠️ Saved, but couldn't start it live just now ({e}). It'll retry on next restart."
 
             env_content = build_clone_env(token, fid, owner_id, display_name)
             env_file = io.BytesIO(env_content.encode())
@@ -3612,18 +3699,19 @@ async def handle_message(event):
                 contact = f" or contact support: {support_link}" if support_link else ""
                 wallet_note = f"💰 Wallet: ₹0 — message the bot owner to top it up{contact}"
 
-            await bot.send_file(
+            await ctx()['client'].send_file(
                 event.chat_id, env_file,
                 caption=(
                     f"✅ **Clone Ready!**\n\n"
+                    f"{launch_note}\n\n"
                     f"🤖 Bot: @{bot_username}\n"
                     f"👤 Owner/Admin: `{owner_id}` (you)\n"
                     f"🆔 Franchise ID: `{fid}`\n"
                     f"{wallet_note}\n\n"
-                    f"Put this `.env` next to a copy of this bot's code on a server "
-                    f"and run it — @{bot_username} will come online as its own fully "
-                    f"admin-owned bot, with you as its admin automatically. "
-                    f"⚠️ This file has your bot token — keep it private."
+                    f"This `.env` is just a backup/reference (e.g. if you ever want to "
+                    f"run it standalone on your own server instead) — you don't need it "
+                    f"right now since @{bot_username} is already running. "
+                    f"⚠️ It has your bot token — keep it private."
                 ),
                 buttons=completion_buttons
             )
@@ -3634,8 +3722,9 @@ async def handle_message(event):
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             user_states.pop(user_id, None)
+            return
 
-
+    elif action == "smm_search":
         step = state.get("step")
         if step == "query":
             query = event.message.text.strip()
@@ -3740,6 +3829,7 @@ async def handle_message(event):
 # ---------- /start ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
+    set_ctx_from_event(event)
     user_id = event.sender_id
     args = event.message.text.split()
     referrer_id = None
@@ -3800,10 +3890,36 @@ async def main():
         logging.error(f"❌ Sign-in error: {e}")
         sys.exit(1)
 
+    client_contexts[bot] = master_ctx()
+
     global acc_mgr
     acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, await get_all_admin_ids())
     await acc_mgr.load_all()
+
+    # Bring every previously-created clone back online, live, in THIS SAME
+    # process — so a restart doesn't take any franchise bot offline.
+    if not IS_FRANCHISE:
+        launched = 0
+        async for clone in bot_clones_col.find({}):
+            token = clone.get("bot_token")
+            fid = clone.get("franchise_id")
+            if not token:
+                logging.warning(f"Clone '{fid}' has no stored token (created before "
+                                 f"auto-launch support) — skipping. Re-run Clone Bot to fix.")
+                continue
+            try:
+                await launch_clone(token, fid, clone["owner_id"], clone["display_name"])
+                launched += 1
+            except Exception as e:
+                logging.error(f"❌ Failed to launch clone '{fid}': {e}")
+        if launched:
+            logging.info(f"🤖 Launched {launched} clone bot(s) live alongside the master bot.")
+
     logging.info("🚀 Bot started successfully...")
+
+    # Keep the process alive for as long as the master OR any clone is
+    # connected — new clones added later (via the live 'Clone Bot' flow)
+    # start processing events immediately upon connect, no extra wiring needed.
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
