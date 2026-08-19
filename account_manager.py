@@ -92,6 +92,18 @@ class AccountManager:
                 buyer_id = buyer_doc["buyer_id"] if buyer_doc else None
 
                 if buyer_id:
+                    key = (buyer_id, phone)
+                    is_first_otp = not buyer_doc.get("first_otp_sent", False)
+
+                    # First OTP after purchase delivers automatically. Every
+                    # OTP after that only goes out if the buyer explicitly
+                    # clicked "Request New OTP" — otherwise it's silently
+                    # dropped (still consumed from Telegram, just not forwarded).
+                    if not is_first_otp and key not in self.pending_requests:
+                        logging.info(f"Suppressed unrequested OTP for {buyer_id} / {phone} "
+                                     f"(no pending request on file).")
+                        return
+
                     msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
                     twofa_password = buyer_doc.get("twofa_password")
                     if twofa_password:
@@ -101,7 +113,7 @@ class AccountManager:
                     # 🔥 Both buttons: Request New OTP & Logout from Bot
                     buttons = [[
                         Button.inline("🔄 Request New OTP", f"resend_{phone}"),
-                        Button.inline("📱 Manage Sessions", f"sessions_{phone}")
+                        Button.inline("📱 Manage Sessions", f"open_sessions_{phone}")
                     ]]
 
                     sold_via = buyer_doc.get("sold_via_franchise_id", "master")
@@ -111,7 +123,12 @@ class AccountManager:
                     except Exception as e:
                         logging.error(f"Failed to send OTP to {buyer_id} via {sold_via}: {e}")
 
-                    key = (buyer_id, phone)
+                    if is_first_otp:
+                        await self.accounts_col.update_one(
+                            {"_id": buyer_doc["_id"]},
+                            {"$set": {"first_otp_sent": True}}
+                        )
+
                     if key in self.pending_requests:
                         del self.pending_requests[key]
                         logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")

@@ -376,6 +376,21 @@ async def get_referral_bonus_percent() -> float:
         return float(setting.get("value", REFERRAL_BONUS_PERCENT))
     return REFERRAL_BONUS_PERCENT
 
+async def is_referral_enabled() -> bool:
+    """Referral program is OFF by default on franchise clones (owner can turn
+    it on themselves) and ON by default on the master bot."""
+    setting = await settings_col.find_one({"key": "referral_enabled"})
+    if setting is not None:
+        return bool(setting.get("value", True))
+    return not ctx()['is_franchise']
+
+async def set_referral_enabled(value: bool):
+    await settings_col.update_one(
+        {"key": "referral_enabled"},
+        {"$set": {"value": value, "updated_at": now_ist()}},
+        upsert=True
+    )
+
 async def get_referral_bonus_max() -> float:
     setting = await settings_col.find_one({"key": "referral_bonus_max"})
     if setting:
@@ -409,11 +424,25 @@ async def get_display_name(user_id: int) -> str:
         return str(user_id)
 
 async def log_event(text):
+    c = ctx()
+    if c['is_franchise']:
+        owner_name = await get_display_name(c['owner_id']) if c['owner_id'] else "Unknown"
+        text = f"🏢 **Franchise: {c['display_name']}** (Owner: {owner_name}, `{c['owner_id']}`)\n\n" + text
+
     if LOGS_CHANNEL_ID:
         try:
             await bot.send_message(LOGS_CHANNEL_ID, text, parse_mode="markdown")
         except Exception as e:
             logging.error(f"Failed to send log to channel: {e}")
+
+    # Every clone transaction also gets DM'd straight to the master admins —
+    # so the platform owner hears about it even with no logs channel set up.
+    if c['is_franchise']:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, text, parse_mode="markdown")
+            except Exception as e:
+                logging.error(f"Failed to DM master admin {admin_id} about franchise event: {e}")
 
 # ---------- FRANCHISE WALLET ----------
 # Linked directly to the owner's own MASTER-bot personal balance — there is no
@@ -807,10 +836,13 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
-    row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
+    row3 = []
+    if await is_referral_enabled():
+        row3.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
     if await is_admin(user_id):
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
-    buttons.append(row3)
+    if row3:
+        buttons.append(row3)
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
     if not ctx()['is_franchise']:
@@ -830,20 +862,19 @@ async def show_welcome_menu(event, user_id):
         await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN MENU ----------
-async def send_main_menu(event):
-    user_id = event.sender_id
-    if not await is_user_member(user_id):
-        await send_join_message(event)
-        return
+async def _build_main_menu(user_id):
     buttons = [
         [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
         [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
-    row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
+    row3 = []
+    if await is_referral_enabled():
+        row3.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
     if await is_admin(user_id):
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
-    buttons.append(row3)
+    if row3:
+        buttons.append(row3)
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
     if not ctx()['is_franchise']:
@@ -856,10 +887,29 @@ async def send_main_menu(event):
     if support_link:
         buttons.append([Button.url("📞 Support", support_link, style="primary")])
     msg = f"🌟 **{ctx()['display_name']} — Main Menu**"
+    return msg, buttons
+
+async def send_main_menu(event):
+    user_id = event.sender_id
+    if not await is_user_member(user_id):
+        await send_join_message(event)
+        return
+    msg, buttons = await _build_main_menu(user_id)
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(msg, buttons=buttons)
     else:
         await event.respond(msg, buttons=buttons)
+
+async def send_main_menu_new(event):
+    """Always sends the main menu as a BRAND NEW message — never edits the
+    current one. Used from places like the OTP/session views, so those
+    messages (and their own buttons) are left completely untouched."""
+    user_id = event.sender_id
+    if not await is_user_member(user_id):
+        await send_join_message(event)
+        return
+    msg, buttons = await _build_main_menu(user_id)
+    await ctx()['client'].send_message(event.chat_id, msg, buttons=buttons)
 
 # ---------- BROADCAST COMMAND ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
@@ -1425,7 +1475,7 @@ async def callback_handler(event):
                     "admin_account_markup", "my_franchise_wallet", "admin_clone_bot",
                     "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot",
                     "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name",
-                    "remove_my_clone", "admin_remove_clone_list"):
+                    "remove_my_clone", "admin_remove_clone_list", "goto_main_new", "admin_toggle_referral"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -1550,8 +1600,21 @@ async def callback_handler(event):
                     )])
 
             buttons.append([Button.inline("🔄 Refresh", f"sessions_{phone}", style="primary")])
+            buttons.append([Button.inline("🏠 Main Menu", b"goto_main_new", style="success")])
             buttons.append([Button.inline("🔙 Close", b"close_sessions", style="primary")])
             return "\n".join(lines), buttons
+
+        if data == "goto_main_new":
+            await send_main_menu_new(event)
+            await event.answer()
+            return
+
+        if data.startswith("open_sessions_"):
+            phone = data[len("open_sessions_"):]
+            text, buttons = await render_sessions(phone)
+            await ctx()['client'].send_message(event.chat_id, text, buttons=buttons)
+            await event.answer()
+            return
 
         if data.startswith("sessions_"):
             phone = data[len("sessions_"):]
@@ -1671,6 +1734,9 @@ async def callback_handler(event):
             return
 
         if data == "referral_info":
+            if not await is_referral_enabled():
+                await event.answer("❌ Referral program is not available here.", alert=True)
+                return
             username = await get_bot_username()
             ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
             invited_count = await users_col.count_documents({"referred_by": user_id})
@@ -1834,7 +1900,7 @@ async def callback_handler(event):
                     {"_id": acc["_id"], "status": "available"},
                     {"$set": {
                         "status": "sold", "buyer_id": user_id, "sold_at": now_ist(),
-                        "sold_via_franchise_id": ctx()['scope_id'],
+                        "sold_via_franchise_id": ctx()['scope_id'], "first_otp_sent": False,
                     }}
                 )
                 if updated is None:
@@ -2626,19 +2692,49 @@ async def callback_handler(event):
                 return
             cur_percent = await get_referral_bonus_percent()
             cur_max = await get_referral_bonus_max()
+            enabled = await is_referral_enabled()
             btns = [
+                [Button.inline("🔴 Turn OFF" if enabled else "🟢 Turn ON", b"admin_toggle_referral", style="danger" if enabled else "success")],
                 [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
                 [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
                 [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
             ]
             await event.edit(
                 f"🎁 **Referral Bonus Settings**\n\n"
+                f"Status: {'🟢 ON' if enabled else '🔴 OFF'} "
+                + ("(default OFF for clones — turn on if you want it)\n\n" if ctx()['is_franchise'] else "\n\n") +
                 f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
                 f"Example: A ₹100 deposit currently pays a "
                 f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
                 buttons=btns
             )
             await event.answer()
+            return
+
+        if data == "admin_toggle_referral":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            new_state = not await is_referral_enabled()
+            await set_referral_enabled(new_state)
+            await event.answer(f"Referral program turned {'ON' if new_state else 'OFF'}.")
+            # Re-render the settings screen with the updated state
+            cur_percent = await get_referral_bonus_percent()
+            cur_max = await get_referral_bonus_max()
+            btns = [
+                [Button.inline("🔴 Turn OFF" if new_state else "🟢 Turn ON", b"admin_toggle_referral", style="danger" if new_state else "success")],
+                [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
+                [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
+                [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
+            ]
+            await event.edit(
+                f"🎁 **Referral Bonus Settings**\n\n"
+                f"Status: {'🟢 ON' if new_state else '🔴 OFF'}\n\n"
+                f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
+                f"Example: A ₹100 deposit currently pays a "
+                f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
+                buttons=btns
+            )
             return
 
         if data == "admin_set_ref_percent":
@@ -2846,7 +2942,7 @@ async def callback_handler(event):
             referrer_id = user_doc.get("referred_by") if user_doc else None
             bonus_already_paid = user_doc.get("referral_bonus_paid", False) if user_doc else False
 
-            if referrer_id and not bonus_already_paid:
+            if referrer_id and not bonus_already_paid and await is_referral_enabled():
                 ref_percent = await get_referral_bonus_percent()
                 ref_max = await get_referral_bonus_max()
                 bonus = round(min(amount * (ref_percent / 100), ref_max), 2)
