@@ -412,6 +412,16 @@ async def set_referral_bonus_max(value: float):
     )
 
 # ---------- LOGS CHANNEL HELPER ----------
+def mask_phone(phone: str) -> str:
+    """Show only the first 2 and last 2 digits — e.g. 919876543210 -> 91********10.
+    Used so franchise owners can't extract full account credentials to use
+    outside the bot, while the master (who actually controls the stock) still
+    sees everything in full via log_event."""
+    phone = str(phone)
+    if len(phone) <= 4:
+        return "*" * len(phone)
+    return phone[:2] + "*" * (len(phone) - 4) + phone[-2:]
+
 async def get_display_name(user_id: int) -> str:
     """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
     try:
@@ -1268,8 +1278,9 @@ async def show_all_transactions(event, user_id, type_filter="all", page=0):
             for item in combined:
                 date_str = item["date"].strftime('%d/%m/%Y %H:%M')
                 if item["type"] == "Purchase":
+                    display_phone = mask_phone(item['phone']) if ctx()['is_franchise'] and item['phone'] != "N/A" else item['phone']
                     lines.append(
-                        f"🛒 User {item['user_id']} | {item['phone']} ({item['country']}) | -₹{item['amount']} | {date_str}"
+                        f"🛒 User {item['user_id']} | {display_phone} ({item['country']}) | -₹{item['amount']} | {date_str}"
                     )
                 else:
                     lines.append(
@@ -2009,12 +2020,13 @@ async def callback_handler(event):
             updated_user = await users_col.find_one({"user_id": user_id})
             new_balance = updated_user["balance"] if updated_user else 0
             wallet_line = f"\nWholesale Cost: ₹{price} (franchise wallet)" if ctx()['is_franchise'] else ""
+            admin_phone = mask_phone(phone) if ctx()['is_franchise'] else phone
             for admin in await get_all_admin_ids():
                 try:
                     await ctx()['client'].send_message(admin,
                         f"🛒 **New Purchase**\n"
                         f"Buyer: `{user_id}` - {buyer_name}\n"
-                        f"Phone: `{phone}`\n"
+                        f"Phone: `{admin_phone}`\n"
                         f"Country: {country}\n"
                         f"Price: ₹{retail_price}{wallet_line}\n"
                         f"Balance After: ₹{new_balance}"
