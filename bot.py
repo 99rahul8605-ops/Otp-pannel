@@ -231,6 +231,14 @@ async def stop_clone(franchise_id: str):
         client_contexts.pop(client, None)
         await client.disconnect()
 
+def get_client_for_scope(scope_id: str):
+    """Resolve the right TelegramClient (master or a specific clone) for a given
+    scope_id — used so OTP delivery goes out via the SAME bot a customer
+    actually bought their account through, not always the master bot."""
+    if not scope_id or scope_id == "master":
+        return bot
+    return clone_clients.get(scope_id, bot)  # fall back to master if that clone isn't live
+
 # ---------- STATE MACHINE ----------
 user_states = {}
 pending_otp_requests = {}
@@ -1824,7 +1832,10 @@ async def callback_handler(event):
             for acc in accounts:
                 updated = await accounts_col.find_one_and_update(
                     {"_id": acc["_id"], "status": "available"},
-                    {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": now_ist()}}
+                    {"$set": {
+                        "status": "sold", "buyer_id": user_id, "sold_at": now_ist(),
+                        "sold_via_franchise_id": ctx()['scope_id'],
+                    }}
                 )
                 if updated is None:
                     continue
@@ -4118,7 +4129,8 @@ async def main():
     client_contexts[bot] = master_ctx()
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, await get_all_admin_ids())
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests,
+                              await get_all_admin_ids(), client_resolver=get_client_for_scope)
     await acc_mgr.load_all()
 
     # Bring every previously-created clone back online, live, in THIS SAME

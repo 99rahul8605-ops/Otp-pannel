@@ -6,7 +6,7 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None):
+    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None, client_resolver=None):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
@@ -14,6 +14,18 @@ class AccountManager:
         self.clients = {}
         self.pending_requests = pending_requests
         self.admin_ids = admin_ids or []
+        # Optional callable: scope_id (str, "master" or a franchise_id) -> TelegramClient.
+        # Lets OTPs be delivered via the SAME bot the customer actually bought
+        # the account through, instead of always the master bot.
+        self.client_resolver = client_resolver
+
+    def _resolve_client(self, scope_id):
+        if self.client_resolver:
+            try:
+                return self.client_resolver(scope_id)
+            except Exception:
+                pass
+        return self.bot
 
     async def add_client(self, phone, session_str):
         if phone in self.clients:
@@ -92,10 +104,12 @@ class AccountManager:
                         Button.inline("📱 Manage Sessions", f"sessions_{phone}")
                     ]]
 
+                    sold_via = buyer_doc.get("sold_via_franchise_id", "master")
+                    deliver_client = self._resolve_client(sold_via)
                     try:
-                        await self.bot.send_message(buyer_id, msg, buttons=buttons)
+                        await deliver_client.send_message(buyer_id, msg, buttons=buttons)
                     except Exception as e:
-                        logging.error(f"Failed to send OTP to {buyer_id}: {e}")
+                        logging.error(f"Failed to send OTP to {buyer_id} via {sold_via}: {e}")
 
                     key = (buyer_id, phone)
                     if key in self.pending_requests:
