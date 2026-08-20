@@ -832,8 +832,6 @@ async def send_join_message(event):
 
 # ---------- WELCOME / MAIN MENU ----------
 async def show_welcome_menu(event, user_id):
-    username = await get_bot_username()
-    ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
     welcome_msg = (
         f"👋 **Welcome to the {ctx()['display_name']}!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
@@ -4262,10 +4260,14 @@ async def main():
 
     logging.info("🚀 Bot started successfully...")
 
-    # Keep the process alive for as long as the master OR any clone is
-    # connected — new clones added later (via the live 'Clone Bot' flow)
-    # start processing events immediately upon connect, no extra wiring needed.
-    await bot.run_until_disconnected()
+    # Block forever rather than exiting when just the master's connection has
+    # a hiccup — Telethon auto-reconnects individual clients on transient
+    # network issues, so one client's blip shouldn't take every clone down
+    # with it. Only an external stop (Ctrl+C, systemd, etc.) ends the process.
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
 
 if __name__ == '__main__':
     asyncio.run(main())
