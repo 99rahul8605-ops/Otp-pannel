@@ -112,6 +112,24 @@ elif FORCE_JOIN_SINGLE:
 else:
     RAW_CHAT_IDS = []
 
+async def get_force_join_channels() -> list:
+    """Per-bot required-join channels. Clones share this process's env vars
+    with the master, so without this override every clone would silently
+    enforce the MASTER's force-join channels on its own customers."""
+    setting = await settings_col.find_one({"key": "force_join_channels"})
+    if setting is not None:
+        return setting.get("value", [])
+    if not ctx()['is_franchise']:
+        return RAW_CHAT_IDS
+    return []
+
+async def set_force_join_channels(channels: list):
+    await settings_col.update_one(
+        {"key": "force_join_channels"},
+        {"$set": {"value": channels, "updated_at": now_ist()}},
+        upsert=True
+    )
+
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS")
 
@@ -791,9 +809,10 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
         return False
 
 async def is_user_member(user_id: int) -> bool:
-    if not RAW_CHAT_IDS:
+    channels = await get_force_join_channels()
+    if not channels:
         return True
-    for raw_id in RAW_CHAT_IDS:
+    for raw_id in channels:
         if not await is_user_member_of(raw_id, user_id):
             return False
     return True
@@ -801,7 +820,7 @@ async def is_user_member(user_id: int) -> bool:
 async def send_join_message(event):
     is_callback = isinstance(event, events.CallbackQuery.Event)
     buttons = []
-    for raw_id in RAW_CHAT_IDS:
+    for raw_id in await get_force_join_channels():
         if await is_user_member_of(raw_id, event.sender_id):
             continue
         title = raw_id
@@ -817,7 +836,7 @@ async def send_join_message(event):
         else:
             invite_link = None
             try:
-                result = await bot(functions.messages.ExportChatInviteRequest(
+                result = await ctx()['client'](functions.messages.ExportChatInviteRequest(
                     peer=entity,
                     expire_date=None,
                     usage_limit=0
@@ -1494,7 +1513,8 @@ async def callback_handler(event):
                     "admin_account_markup", "my_franchise_wallet", "admin_clone_bot",
                     "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot",
                     "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name",
-                    "remove_my_clone", "admin_remove_clone_list", "goto_main_new", "admin_toggle_referral"):
+                    "remove_my_clone", "admin_remove_clone_list", "goto_main_new", "admin_toggle_referral",
+                    "admin_force_join", "admin_set_force_join", "admin_clear_force_join"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
@@ -2800,11 +2820,61 @@ async def callback_handler(event):
                 return
             btns = [
                 [Button.inline("📞 Set Support Link", b"admin_support", style="primary")],
+                [Button.inline("📢 Force-Join Channels", b"admin_force_join", style="primary")],
                 [Button.inline("👤 Manage Admins", b"admin_manage_admins", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("⚙️ **Bot Settings**", buttons=btns)
             await event.answer()
+            return
+
+        if data == "admin_force_join":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            channels = await get_force_join_channels()
+            cur = ", ".join(channels) if channels else "None set"
+            btns = [
+                [Button.inline("✏️ Set Channels", b"admin_set_force_join", style="primary")],
+                [Button.inline("🗑️ Clear (disable)", b"admin_clear_force_join", style="danger")],
+                [Button.inline("🔙 Back", b"admin_cat_settings", style="primary")],
+            ]
+            await event.edit(
+                f"📢 **Force-Join Channels**\n\n"
+                f"Current: `{cur}`\n\n"
+                f"Users must join all of these before they can use this bot. "
+                f"This is independent from the master bot's own channels.",
+                buttons=btns
+            )
+            await event.answer()
+            return
+
+        if data == "admin_set_force_join":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "set_force_join", "step": "await_value"}
+            await event.edit(
+                "📢 Send the channels (comma-separated), e.g. `@mychannel, @mygroup` "
+                "or numeric chat IDs like `-1001234567890`:",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_force_join", style="danger")]]
+            )
+            await event.answer()
+            return
+
+        if data == "admin_clear_force_join":
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            await set_force_join_channels([])
+            await event.answer("✅ Force-join disabled.")
+            await event.edit(
+                "📢 **Force-Join Channels**\n\nCurrent: `None set`",
+                buttons=[
+                    [Button.inline("✏️ Set Channels", b"admin_set_force_join", style="primary")],
+                    [Button.inline("🔙 Back", b"admin_cat_settings", style="primary")],
+                ]
+            )
             return
 
         if data == "admin_manage_admins":
@@ -3799,6 +3869,17 @@ async def handle_message(event):
             else:
                 await set_support_link(link)
                 await event.respond(f"✅ Updated to `{link}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+            user_states.pop(user_id, None)
+
+    elif action == "set_force_join":
+        step = state.get("step")
+        if step == "await_value":
+            raw = event.message.text.strip()
+            channels = [c.strip() for c in raw.split(",") if c.strip()]
+            await set_force_join_channels(channels)
+            shown = ", ".join(channels) if channels else "None"
+            await event.respond(f"✅ Force-join channels set to: `{shown}`",
+                                 buttons=[[Button.inline("🔙 Bot Settings", b"admin_force_join", style="primary")]])
             user_states.pop(user_id, None)
 
     elif action == "set_upi_id":
