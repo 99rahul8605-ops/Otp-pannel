@@ -258,7 +258,9 @@ async def get_support_link():
     setting = await settings_col.find_one({"key": "support_link"})
     if setting:
         return setting.get("value")
-    return os.getenv("SUPPORT_LINK", "").strip() or None
+    if not ctx()['is_franchise']:
+        return os.getenv("SUPPORT_LINK", "").strip() or None
+    return None
 
 async def set_support_link(link: str):
     await settings_col.update_one(
@@ -271,7 +273,13 @@ async def get_upi_id() -> str:
     setting = await settings_col.find_one({"key": "upi_id"})
     if setting:
         return setting.get("value", "")
-    return os.getenv("UPI_ID", "").strip()
+    # Only the master bot may fall back to the .env value — clones share this
+    # same process's environment variables, so without this guard a brand
+    # new clone would silently inherit the MASTER's UPI ID until its owner
+    # explicitly sets their own.
+    if not ctx()['is_franchise']:
+        return os.getenv("UPI_ID", "").strip()
+    return ""
 
 async def set_upi_id(value: str):
     await settings_col.update_one(
@@ -284,7 +292,9 @@ async def get_payee_name() -> str:
     setting = await settings_col.find_one({"key": "payee_name"})
     if setting:
         return setting.get("value", "")
-    return os.getenv("PAYEE_NAME", "").strip()
+    if not ctx()['is_franchise']:
+        return os.getenv("PAYEE_NAME", "").strip()
+    return ""
 
 async def set_payee_name(value: str):
     await settings_col.update_one(
