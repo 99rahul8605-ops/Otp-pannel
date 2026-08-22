@@ -3683,7 +3683,7 @@ async def process_deposit_step(event):
             f"💳 **Deposit ₹{amount}**\n"
             f"🔑 **Txn ID:** `{txn_id}`\n\n"
             f"📌 **Mention this Txn ID in payment note.**\n\n"
-            f"Scan QR or use UPI: `{upi_id}`\n\n"
+            f"Scan the QR code to pay.\n\n"
             "Send screenshot after payment."
         )
         await ctx()['client'].send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
