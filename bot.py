@@ -4259,6 +4259,95 @@ async def handle_message(event):
         await send_main_menu(event)
 
 
+# ---------- /info ----------
+@bot.on(events.NewMessage(pattern=r'^/info(?:$|\s)'))
+async def info_cmd(event):
+    set_ctx_from_event(event)
+    user_id = event.sender_id
+    if not await is_admin(user_id):
+        await event.respond("❌ Unauthorized.")
+        return
+
+    args = event.message.text.split()
+    if len(args) < 2:
+        await event.respond("⚠️ Usage: `/info <user_id>`", parse_mode='markdown')
+        return
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        await event.respond("❌ Invalid user ID.")
+        return
+
+    user = await users_col.find_one({"user_id": target_id})
+    if not user:
+        await event.respond(f"❌ No record found for user `{target_id}`.", parse_mode='markdown')
+        return
+
+    display_name = await get_display_name(target_id)
+    balance = user.get("balance", 0)
+    withdrawable = user.get("withdrawable_balance", 0)
+    joined_at = user.get("joined_at")
+    joined_str = joined_at.strftime('%d/%m/%Y %H:%M') if joined_at else "N/A"
+    referred_by = user.get("referred_by")
+
+    deposits = await deposits_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
+    withdrawals = await withdrawals_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
+    orders = await orders_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
+    smm_orders = await smm_orders_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
+
+    approved_deposits = [d for d in deposits if d.get("status") == "approved"]
+    pending_deposits = [d for d in deposits if d.get("status") == "pending"]
+    approved_withdrawals = [w for w in withdrawals if w.get("status") == "approved"]
+    pending_withdrawals = [w for w in withdrawals if w.get("status") == "pending"]
+
+    total_deposited = sum(d.get("amount", 0) for d in approved_deposits)
+    total_withdrawn = sum(w.get("amount", 0) for w in approved_withdrawals)
+    total_purchases = sum(o.get("amount", 0) for o in orders)
+    total_smm = sum(s.get("charge", 0) for s in smm_orders)
+
+    text = (
+        f"👤 **User Info**\n"
+        f"Name: {display_name}\n"
+        f"ID: `{target_id}`\n"
+        f"Joined: {joined_str}\n"
+    )
+    if referred_by:
+        text += f"Referred by: `{referred_by}`\n"
+    text += "\n"
+    text += (
+        f"💰 **Balance:** ₹{balance}\n"
+        f"💸 **Withdrawable:** ₹{withdrawable}\n\n"
+        f"📥 **Total Deposited:** ₹{total_deposited} ({len(approved_deposits)} approved, {len(pending_deposits)} pending)\n"
+        f"📤 **Total Withdrawn:** ₹{total_withdrawn} ({len(approved_withdrawals)} approved, {len(pending_withdrawals)} pending)\n"
+        f"🛒 **Total Purchases:** ₹{total_purchases} ({len(orders)} orders)\n"
+        f"🚀 **Total SMM Spend:** ₹{total_smm} ({len(smm_orders)} orders)\n"
+    )
+
+    combined = []
+    for d in deposits:
+        status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(d.get("status"), "❓")
+        combined.append((d["created_at"], f"{status_emoji} Deposit +₹{d.get('amount', 0)} (Txn: `{d.get('txn_id', 'N/A')}`)"))
+    for w in withdrawals:
+        status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(w.get("status"), "❓")
+        combined.append((w["created_at"], f"{status_emoji} Withdraw -₹{w.get('amount', 0)} (UPI: `{w.get('upi_id', 'N/A')}`)"))
+    for o in orders:
+        combined.append((o["created_at"], f"🛒 Purchase -₹{o.get('amount', 0)} ({o.get('phone', 'N/A')}, {o.get('country', 'N/A')})"))
+    for s in smm_orders:
+        combined.append((s["created_at"], f"📦 SMM -₹{s.get('charge', 0)} ({s.get('service_name', 'N/A')})"))
+
+    combined.sort(key=lambda x: x[0], reverse=True)
+    combined = combined[:25]
+
+    if combined:
+        lines = [f"{dt.strftime('%d/%m/%Y %H:%M')} — {line}" for dt, line in combined]
+        text += "\n📜 **Recent Transactions (latest 25):**\n" + "\n".join(lines)
+    else:
+        text += "\n📜 No transactions yet."
+
+    for chunk_start in range(0, len(text), 4000):
+        await event.respond(text[chunk_start:chunk_start + 4000], parse_mode='markdown')
+
+
 # ---------- /start ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
