@@ -206,6 +206,7 @@ deposits_col = ScopedCollection(db['deposits'])
 settings_col = ScopedCollection(db['settings'])
 withdrawals_col = ScopedCollection(db['withdrawals'])
 smm_orders_col = ScopedCollection(db['smm_orders'])
+balance_adjustments_col = ScopedCollection(db['balance_adjustments'])
 bot_clones_col = db['bot_clones']                # master-only, intentionally NOT scoped
 
 # ---------- BOT INSTANCE ----------
@@ -3767,12 +3768,14 @@ async def handle_message(event):
                 return
             state["uid"] = uid
             state["step"] = "await_amount"
-            await event.respond("💵 Send amount to add:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
+            await event.respond("💵 Send amount to add (send a negative number, e.g. -50, to deduct):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
         elif step == "await_amount":
             try:
                 amt = float(event.message.text.strip())
+                if amt == 0:
+                    raise ValueError
             except:
-                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
+                await event.respond("❌ Invalid amount. Send a positive number to add, or a negative number (e.g. -50) to deduct.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
                 return
             uid = state["uid"]
             await users_col.update_one(
@@ -3780,7 +3783,16 @@ async def handle_message(event):
                 {"$inc": {"balance": amt}, "$setOnInsert": {"joined_at": now_ist()}},
                 upsert=True
             )
-            await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+            await balance_adjustments_col.insert_one({
+                "user_id": uid,
+                "amount": amt,
+                "admin_id": user_id,
+                "created_at": now_ist()
+            })
+            if amt >= 0:
+                await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+            else:
+                await event.respond(f"✅ Deducted ₹{abs(amt)} from user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
@@ -4294,6 +4306,7 @@ async def info_cmd(event):
     withdrawals = await withdrawals_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
     orders = await orders_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
     smm_orders = await smm_orders_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
+    adjustments = await balance_adjustments_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
 
     approved_deposits = [d for d in deposits if d.get("status") == "approved"]
     pending_deposits = [d for d in deposits if d.get("status") == "pending"]
@@ -4304,6 +4317,8 @@ async def info_cmd(event):
     total_withdrawn = sum(w.get("amount", 0) for w in approved_withdrawals)
     total_purchases = sum(o.get("amount", 0) for o in orders)
     total_smm = sum(s.get("charge", 0) for s in smm_orders)
+    total_added_manual = sum(a.get("amount", 0) for a in adjustments if a.get("amount", 0) > 0)
+    total_deducted_manual = sum(-a.get("amount", 0) for a in adjustments if a.get("amount", 0) < 0)
 
     text = (
         f"👤 **User Info**\n"
@@ -4321,6 +4336,7 @@ async def info_cmd(event):
         f"📤 **Total Withdrawn:** ₹{total_withdrawn} ({len(approved_withdrawals)} approved, {len(pending_withdrawals)} pending)\n"
         f"🛒 **Total Purchases:** ₹{total_purchases} ({len(orders)} orders)\n"
         f"🚀 **Total SMM Spend:** ₹{total_smm} ({len(smm_orders)} orders)\n"
+        f"➕ **Manually Added:** ₹{total_added_manual} | **Manually Deducted:** ₹{total_deducted_manual} ({len(adjustments)} adjustments)\n"
     )
 
     combined = []
@@ -4334,6 +4350,12 @@ async def info_cmd(event):
         combined.append((o["created_at"], f"🛒 Purchase -₹{o.get('amount', 0)} ({o.get('phone', 'N/A')}, {o.get('country', 'N/A')})"))
     for s in smm_orders:
         combined.append((s["created_at"], f"📦 SMM -₹{s.get('charge', 0)} ({s.get('service_name', 'N/A')})"))
+    for a in adjustments:
+        amt = a.get("amount", 0)
+        if amt >= 0:
+            combined.append((a["created_at"], f"➕ Manual Add +₹{amt} (by admin `{a.get('admin_id', 'N/A')}`)"))
+        else:
+            combined.append((a["created_at"], f"➖ Manual Deduct -₹{abs(amt)} (by admin `{a.get('admin_id', 'N/A')}`)"))
 
     combined.sort(key=lambda x: x[0], reverse=True)
     combined = combined[:25]
