@@ -2035,7 +2035,7 @@ async def callback_handler(event):
                 success_text,
                 buttons=[
                     [Button.inline("🔄 Request New OTP", f"resend_{phone}", style="primary")],
-                    [Button.inline("🔙 Main Menu", b"main", style="primary")]
+                    [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]
                 ]
             )
             user_states.pop(user_id, None)
@@ -3751,11 +3751,11 @@ async def process_deposit_step(event):
             f"Scan the QR code to pay.\n\n"
             "Send screenshot after payment."
         )
-        await ctx()['client'].send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
+        await ctx()['client'].send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
         state["step"] = "screenshot"
     elif step == "screenshot":
         if not event.message.photo:
-            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
+            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
             return
         amount = state["amount"]
         txn_id = state.get("txn_id", "N/A")
@@ -3785,7 +3785,7 @@ async def process_deposit_step(event):
             except:
                 pass
         await deposits_col.update_one({"_id": dep_id}, {"$set": {"admin_msg_refs": admin_msg_refs}})
-        await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"main", style="primary")]])
+        await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]])
         user_states.pop(user_id, None)
         # Note: no log_event here on purpose — logging happens once the deposit
         # is actually APPROVED, not just requested (see the approve_ handler).
@@ -3920,7 +3920,10 @@ async def handle_message(event):
                     )
                 except:
                     pass
-            await event.respond(f"✅ Withdrawal of ₹{amount} submitted.", buttons=[[Button.inline("🔙 Referral Info", b"referral_info", style="primary")]])
+            await event.respond(
+                f"✅ **Withdrawal Submitted**\n💰 Amount: ₹{amount}\n🏦 UPI: `{upi}`",
+                buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]]
+            )
             wd_name = await get_display_name(user_id)
             await log_event(
                 f"💸 **Withdrawal Request**\n"
