@@ -2134,6 +2134,23 @@ async def callback_handler(event):
 
         # ---------- DEPOSIT ----------
         if data == "deposit":
+            pending_dep = await deposits_col.find_one({"user_id": user_id, "status": "pending"})
+            if pending_dep:
+                date_str = pending_dep["created_at"].strftime('%d/%m/%Y %H:%M')
+                await event.edit(
+                    f"⏳ **You already have a pending deposit**\n\n"
+                    f"💰 Amount: ₹{pending_dep['amount']}\n"
+                    f"🔑 Txn ID: `{pending_dep['txn_id']}`\n"
+                    f"🕐 Submitted: {date_str}\n\n"
+                    f"Please wait for it to be approved or rejected. If you made a "
+                    f"mistake and want to submit a new one instead, cancel this first.",
+                    buttons=[
+                        [Button.inline("❌ Cancel This Deposit", f"cancel_my_deposit_{pending_dep['_id']}".encode(), style="danger")],
+                        [Button.inline("🔙 Back", b"main", style="primary")],
+                    ]
+                )
+                await event.answer()
+                return
             if not await get_upi_id():
                 msg = "❌ Deposits aren't set up yet — the bot owner needs to set a UPI ID first."
                 if await is_admin(user_id):
@@ -2146,6 +2163,31 @@ async def callback_handler(event):
                 buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
             )
             await event.answer()
+            return
+
+        if data.startswith("cancel_my_deposit_"):
+            dep_id = data[len("cancel_my_deposit_"):]
+            dep = await deposits_col.find_one({"_id": ObjectId(dep_id)})
+            if not dep or dep["user_id"] != user_id:
+                await event.answer("❌ Not found.", alert=True)
+                return
+            if dep["status"] != "pending":
+                await event.answer("Already processed — can't cancel now.", alert=True)
+                return
+            await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "cancelled_by_user"}})
+            await event.edit(
+                "✅ **Deposit cancelled.** You can now submit a new one.",
+                buttons=[[Button.inline("💳 New Deposit", b"deposit", style="success")],
+                         [Button.inline("🔙 Main Menu", b"main", style="primary")]]
+            )
+            await event.answer()
+            cancel_name = await get_display_name(user_id)
+            await log_event(
+                f"🚫 **Deposit Cancelled by User**\n"
+                f"👤 User: {cancel_name} (`{user_id}`)\n"
+                f"💰 Amount: ₹{dep['amount']} | Txn ID: `{dep['txn_id']}`\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
             return
 
         # ---------- ORDERS ----------
