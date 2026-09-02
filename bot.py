@@ -2175,6 +2175,19 @@ async def callback_handler(event):
                 await event.answer("Already processed — can't cancel now.", alert=True)
                 return
             await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "cancelled_by_user"}})
+
+            # Disable the Approve/Reject buttons on every admin's copy of this
+            # request so nobody can act on it after the fact.
+            for ref in dep.get("admin_msg_refs", []):
+                try:
+                    await ctx()['client'].edit_message(
+                        ref["admin_id"], ref["message_id"],
+                        f"🚫 **Deposit Cancelled by User**\nUser: `{user_id}`\nAmount: ₹{dep['amount']}\nTxn ID: `{dep['txn_id']}`",
+                        buttons=None
+                    )
+                except Exception as e:
+                    logging.error(f"Could not disable admin deposit message: {e}")
+
             await event.edit(
                 "✅ **Deposit cancelled.** You can now submit a new one.",
                 buttons=[[Button.inline("💳 New Deposit", b"deposit", style="success")],
@@ -3134,6 +3147,15 @@ async def callback_handler(event):
                 )
             except Exception:
                 pass
+            dep_name = await get_display_name(user_id_dep)
+            await log_event(
+                f"💳 **Deposit Approved**\n"
+                f"👤 User: {dep_name} (`{user_id_dep}`)\n"
+                f"💰 Amount: ₹{amount}\n"
+                f"🧾 Txn ID: `{deposit['txn_id']}`\n"
+                f"👤 Approved by: {admin_name} (`{user_id}`)\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
             await event.answer("✅ Approved")
             return
         if data.startswith("reject_"):
@@ -3749,28 +3771,24 @@ async def process_deposit_step(event):
         photo_bytes = await event.message.download_media(file=bytes)
         photo_io = io.BytesIO(photo_bytes)
         photo_io.name = "payment_proof.jpg"
+        admin_msg_refs = []
         for admin in await get_all_admin_ids():
             try:
-                await ctx()['client'].send_file(admin, photo_io,
+                sent = await ctx()['client'].send_file(admin, photo_io,
                     caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`",
                     buttons=[
                         [Button.inline("✅ Approve", f"approve_{dep_id}", style="success"),
                          Button.inline("❌ Reject", f"reject_{dep_id}", style="danger")]
                     ])
+                admin_msg_refs.append({"admin_id": admin, "message_id": sent.id})
                 photo_io.seek(0)
             except:
                 pass
+        await deposits_col.update_one({"_id": dep_id}, {"$set": {"admin_msg_refs": admin_msg_refs}})
         await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"main", style="primary")]])
         user_states.pop(user_id, None)
-        dep_name = await get_display_name(user_id)
-        await log_event(
-            f"💳 **Deposit Request**\n"
-            f"👤 User: {dep_name} (`{user_id}`)\n"
-            f"💰 Amount: ₹{amount}\n"
-            f"🧾 Txn ID: `{txn_id}`\n"
-            f"🆔 Deposit ID: `{dep_id}`\n"
-            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-        )
+        # Note: no log_event here on purpose — logging happens once the deposit
+        # is actually APPROVED, not just requested (see the approve_ handler).
 
 
 # ============================================================
