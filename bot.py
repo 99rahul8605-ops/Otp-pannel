@@ -467,7 +467,7 @@ async def razorpay_create_payment_link(amount: float, dep_id, user_id: int, scop
         return None
 
     # Razorpay requires expire_by to be at least 15 minutes in the future.
-    expiry_seconds = max(900, RAZORPAY_QR_EXPIRY_SECONDS)
+    expiry_seconds = max(1200, RAZORPAY_QR_EXPIRY_SECONDS)
     payload = {
         "amount": int(round(amount * 100)),
         "currency": "INR",
