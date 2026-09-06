@@ -426,7 +426,7 @@ async def razorpay_create_qr(amount: float, dep_id, user_id: int, scope_id: str)
     }
     try:
         async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(f"{RAZORPAY_API_BASE}/qr_codes", json=payload,
+            async with s.post(f"{RAZORPAY_API_BASE}/payments/qr_codes", json=payload,
                                timeout=aiohttp.ClientTimeout(total=15)) as r:
                 body = await r.json()
                 if r.status not in (200, 201):
@@ -448,7 +448,7 @@ async def razorpay_close_qr(qr_id: str):
         return
     try:
         async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(f"{RAZORPAY_API_BASE}/qr_codes/{qr_id}/close",
+            async with s.post(f"{RAZORPAY_API_BASE}/payments/qr_codes/{qr_id}/close",
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status not in (200, 201):
                     logging.warning(f"Razorpay QR close failed [{r.status}] for {qr_id}: {await r.text()}")
@@ -4255,15 +4255,10 @@ async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float
 
     minutes = max(15, max(900, RAZORPAY_QR_EXPIRY_SECONDS) // 60)
     msg = (
-        f"💳 **Deposit ₹{amount}**
-
-"
-        f"Tap **Pay ₹{amount}** below to open Razorpay's secure payment page.
-"
+        f"💳 **Deposit ₹{amount}**\n\n"
+        f"Tap **Pay ₹{amount}** below to open Razorpay's secure payment page.\n"
         f"✅ After Razorpay confirms the payment, your balance will be credited "
-        f"automatically.
-
-"
+        f"automatically.\n\n"
         f"⏳ Link expires in ~{minutes} min."
     )
     buttons = [
@@ -4276,15 +4271,10 @@ async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float
         try:
             sent = await ctx()["client"].send_message(
                 admin,
-                f"🔔 **New Deposit (Razorpay Payment Link)**
-"
-                f"User: `{user_id}`
-"
-                f"Amount: ₹{amount}
-"
-                f"Payment Link ID: `{payment_link_id}`
-
-"
+                f"🔔 **New Deposit (Razorpay Payment Link)**\n"
+                f"User: `{user_id}`\n"
+                f"Amount: ₹{amount}\n"
+                f"Payment Link ID: `{payment_link_id}`\n\n"
                 f"This auto-approves when Razorpay sends `payment_link.paid`."
             )
             await deposits_col.update_one(
