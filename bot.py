@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 import io
 import tempfile
@@ -29,8 +28,6 @@ from telethon.errors import (
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
-import hmac
-from aiohttp import web
 from bson import ObjectId
 from account_manager import AccountManager
 
@@ -42,27 +39,12 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017").strip()
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-UPI_ID = os.getenv("UPI_ID", "").strip()
-PAYEE_NAME = os.getenv("PAYEE_NAME", "").strip()
+UPI_ID = os.getenv("UPI_ID", "example@upi").strip()
+PAYEE_NAME = os.getenv("PAYEE_NAME", "OTPShop").strip()
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50").strip())
 REFERRAL_BONUS_PERCENT = float(os.getenv("REFERRAL_BONUS_PERCENT", "10").strip())
 REFERRAL_BONUS_MAX = float(os.getenv("REFERRAL_BONUS_MAX", "5").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
-
-# ---------- RAZORPAY (auto-approved UPI QR deposits) ----------
-# Optional. If a Razorpay Key ID + Key Secret are configured (via .env for the
-# master, or via Admin Panel → Finance & Transactions for any bot/franchise),
-# deposits switch from "static QR + manual screenshot" to a per-transaction
-# dynamic UPI QR generated through Razorpay's QR Code API. Razorpay notifies
-# us the instant it's paid (webhook), so the deposit is credited automatically
-# with no admin action needed. Falls back to the old manual flow if unset.
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
-RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
-RAZORPAY_API_BASE = "https://api.razorpay.com/v1"
-RAZORPAY_QR_EXPIRY_SECONDS = int(os.getenv("RAZORPAY_QR_EXPIRY_SECONDS", "900").strip())
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip()
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080").strip())
 
 SMM_API_URL = os.getenv("SMM_API_URL", "").strip()
 SMM_API_KEY = os.getenv("SMM_API_KEY", "").strip()
@@ -79,47 +61,6 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
-# ---------- FRANCHISE MODE ----------
-# Leave FRANCHISE_ID empty to run this bot as the MASTER (source of stock/SMM API,
-# owns the shared MongoDB, no wallet gating). Set FRANCHISE_ID on a franchise
-# partner's deployment (same MongoDB, same codebase) — every purchase in that
-# instance will then draw down from a prepaid wallet the master controls.
-FRANCHISE_ID = os.getenv("FRANCHISE_ID", "").strip()
-IS_FRANCHISE = bool(FRANCHISE_ID)
-FRANCHISE_OWNER_ID = os.getenv("FRANCHISE_OWNER_ID", "").strip()
-FRANCHISE_OWNER_ID = int(FRANCHISE_OWNER_ID) if FRANCHISE_OWNER_ID.isdigit() else None
-BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "OTP Shop Bot").strip()
-
-# ---------- MULTI-BOT CONTEXT (master + live in-process clones) ----------
-# The master process can run several Telegram bot clients at once (the master
-# bot itself, plus every cloned franchise bot) — each needs its OWN admin
-# list, franchise id, display name, and DB scope. Since a single event handler
-# function is shared across all clients, we resolve "which bot fired this
-# event" via a contextvar set at the top of every handler, instead of relying
-# on module-level constants (which only make sense for a single bot/process).
-import contextvars
-current_ctx: contextvars.ContextVar = contextvars.ContextVar("current_ctx", default=None)
-client_contexts: dict = {}   # TelegramClient -> context dict
-clone_clients: dict = {}     # franchise_id -> TelegramClient (live, in-process)
-
-def master_ctx() -> dict:
-    return {
-        "scope_id": "master", "is_franchise": False, "franchise_id": "",
-        "owner_id": FRANCHISE_OWNER_ID, "display_name": BOT_DISPLAY_NAME,
-        "admin_ids": ADMIN_IDS, "client": bot,
-    }
-
-def ctx() -> dict:
-    """Context for whichever bot (master or a clone) is currently handling
-    a request. Falls back to the master's own config if unset."""
-    c = current_ctx.get()
-    return c if c is not None else master_ctx()
-
-def set_ctx_from_event(event):
-    c = client_contexts.get(event.client)
-    current_ctx.set(c if c is not None else master_ctx())
-    return ctx()
-
 FORCE_JOIN_SINGLE = os.getenv("FORCE_JOIN_CHAT_ID", "").strip()
 FORCE_JOIN_LIST_RAW = os.getenv("FORCE_JOIN_CHAT_IDS", "").strip()
 if FORCE_JOIN_LIST_RAW:
@@ -129,24 +70,6 @@ elif FORCE_JOIN_SINGLE:
 else:
     RAW_CHAT_IDS = []
 
-async def get_force_join_channels() -> list:
-    """Per-bot required-join channels. Clones share this process's env vars
-    with the master, so without this override every clone would silently
-    enforce the MASTER's force-join channels on its own customers."""
-    setting = await settings_col.find_one({"key": "force_join_channels"})
-    if setting is not None:
-        return setting.get("value", [])
-    if not ctx()['is_franchise']:
-        return RAW_CHAT_IDS
-    return []
-
-async def set_force_join_channels(channels: list):
-    await settings_col.update_one(
-        {"key": "force_join_channels"},
-        {"$set": {"value": channels, "updated_at": now_ist()}},
-        upsert=True
-    )
-
 if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS]):
     raise ValueError("❌ .env file incomplete! Check API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS")
 
@@ -155,148 +78,39 @@ logging.basicConfig(level=logging.INFO)
 # ---------- MongoDB Setup ----------
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client['otp_bot']
-
-# Unique tenant key for THIS running instance — every franchise clone gets its
-# own scope, the master bot's scope is "master". Shared stock (accounts_col)
-# and master-only management collections (bot_clones_col)
-# stay unscoped/global on purpose — everything else that holds a customer's
-# money or personal data (balance, deposits, withdrawals, order history,
-# per-tenant settings like markup/referral %/min-withdrawal) must NEVER leak
-# between franchises, even though they all share one MongoDB.
-# Unique tenant key for THIS running instance's OWN traffic (used before any
-# event context exists, e.g. at startup). Once handlers are running, the
-# ACTIVE scope is resolved per-event via ctx()['scope_id'] below — this lets
-# one process safely serve the master bot AND many live franchise clones at
-# once without their data ever mixing.
-SCOPE_ID = FRANCHISE_ID if IS_FRANCHISE else "master"
-
-class ScopedCollection:
-    """Thin wrapper around a Motor collection that transparently tags every
-    document with franchise_id on write and filters by it on read, resolving
-    the CURRENT bot's scope per-call (via ctx()) — so a single shared MongoDB
-    safely serves the master bot plus any number of live in-process clones."""
-    def __init__(self, collection):
-        self._col = collection
-
-    def _current_scope(self):
-        return ctx()['scope_id']
-
-    def _scope(self, filt):
-        filt = dict(filt) if filt else {}
-        filt["franchise_id"] = self._current_scope()
-        return filt
-
-    async def find_one(self, filt=None, *args, **kwargs):
-        return await self._col.find_one(self._scope(filt), *args, **kwargs)
-
-    def find(self, filt=None, *args, **kwargs):
-        return self._col.find(self._scope(filt), *args, **kwargs)
-
-    async def count_documents(self, filt=None, *args, **kwargs):
-        return await self._col.count_documents(self._scope(filt), *args, **kwargs)
-
-    async def insert_one(self, doc, *args, **kwargs):
-        doc = dict(doc)
-        doc.setdefault("franchise_id", self._current_scope())
-        return await self._col.insert_one(doc, *args, **kwargs)
-
-    async def update_one(self, filt, update, *args, **kwargs):
-        update = dict(update)
-        set_stage = dict(update.get("$set", {}))
-        set_stage.setdefault("franchise_id", self._current_scope())
-        update["$set"] = set_stage
-        return await self._col.update_one(self._scope(filt), update, *args, **kwargs)
-
-    async def delete_one(self, filt, *args, **kwargs):
-        return await self._col.delete_one(self._scope(filt), *args, **kwargs)
-
-    def aggregate(self, pipeline, *args, **kwargs):
-        return self._col.aggregate([{"$match": {"franchise_id": self._current_scope()}}] + list(pipeline), *args, **kwargs)
-
-    def distinct(self, key, filt=None, *args, **kwargs):
-        return self._col.distinct(key, self._scope(filt), *args, **kwargs)
-
-accounts_col = db['accounts']  # shared wholesale stock pool — intentionally NOT scoped
-users_col = ScopedCollection(db['users'])
-orders_col = ScopedCollection(db['orders'])
-deposits_col = ScopedCollection(db['deposits'])
-settings_col = ScopedCollection(db['settings'])
-withdrawals_col = ScopedCollection(db['withdrawals'])
-smm_orders_col = ScopedCollection(db['smm_orders'])
-balance_adjustments_col = ScopedCollection(db['balance_adjustments'])
-bot_clones_col = db['bot_clones']                # master-only, intentionally NOT scoped
+accounts_col = db['accounts']
+users_col = db['users']
+orders_col = db['orders']
+deposits_col = db['deposits']
+settings_col = db['settings']
+withdrawals_col = db['withdrawals']
+smm_orders_col = db['smm_orders']
 
 # ---------- BOT INSTANCE ----------
 import hashlib
 session_name = "bot_session_" + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:8]
 bot = TelegramClient(session_name, API_ID, API_HASH)
 
-async def launch_clone(token: str, franchise_id: str, owner_id: int, display_name: str):
-    """Spin up a fully live TelegramClient for a franchise clone IN THIS SAME
-    PROCESS — no separate server/deployment needed. It gets the exact same
-    handlers as the master bot; every event it receives is scoped to this
-    clone's own data/admins/wallet via client_contexts + ctx()."""
-    if franchise_id in clone_clients:
-        return clone_clients[franchise_id]  # already running, don't double-launch
-
-    clone_session = "clone_session_" + hashlib.md5(token.encode()).hexdigest()[:8]
-    client = TelegramClient(clone_session, API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        await client.sign_in(bot_token=token)
-
-    client_contexts[client] = {
-        "scope_id": franchise_id, "is_franchise": True, "franchise_id": franchise_id,
-        "owner_id": owner_id, "display_name": display_name,
-        "admin_ids": [owner_id], "client": client,
-    }
-    clone_clients[franchise_id] = client
-
-    client.add_event_handler(broadcast_cmd, events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
-    client.add_event_handler(broadcast_callback, events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
-    client.add_event_handler(callback_handler, events.CallbackQuery)
-    client.add_event_handler(handle_message, events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
-    client.add_event_handler(start_cmd, events.NewMessage(pattern='/start'))
-
-    logging.info(f"🤖 Clone launched live: franchise_id={franchise_id} owner={owner_id}")
-    return client
-
-async def stop_clone(franchise_id: str):
-    client = clone_clients.pop(franchise_id, None)
-    if client:
-        client_contexts.pop(client, None)
-        await client.disconnect()
-
-def get_client_for_scope(scope_id: str):
-    """Resolve the right TelegramClient (master or a specific clone) for a given
-    scope_id — used so OTP delivery goes out via the SAME bot a customer
-    actually bought their account through, not always the master bot."""
-    if not scope_id or scope_id == "master":
-        return bot
-    return clone_clients.get(scope_id, bot)  # fall back to master if that clone isn't live
-
 # ---------- STATE MACHINE ----------
 user_states = {}
 pending_otp_requests = {}
 
 # ---------- Bot Username Cache ----------
-_bot_username_cache: dict = {}
+bot_username = None
 
 async def get_bot_username():
-    client = ctx()['client']
-    if client not in _bot_username_cache:
-        me = await client.get_me()
-        _bot_username_cache[client] = me.username
-    return _bot_username_cache[client]
+    global bot_username
+    if bot_username is None:
+        me = await bot.get_me()
+        bot_username = me.username
+    return bot_username
 
 # ---------- SETTINGS HELPERS ----------
 async def get_support_link():
     setting = await settings_col.find_one({"key": "support_link"})
     if setting:
         return setting.get("value")
-    if not ctx()['is_franchise']:
-        return os.getenv("SUPPORT_LINK", "").strip() or None
-    return None
+    return os.getenv("SUPPORT_LINK", "").strip() or None
 
 async def set_support_link(link: str):
     await settings_col.update_one(
@@ -304,266 +118,6 @@ async def set_support_link(link: str):
         {"$set": {"value": link, "updated_at": now_ist()}},
         upsert=True
     )
-
-async def get_upi_id() -> str:
-    setting = await settings_col.find_one({"key": "upi_id"})
-    if setting:
-        return setting.get("value", "")
-    # Only the master bot may fall back to the .env value — clones share this
-    # same process's environment variables, so without this guard a brand
-    # new clone would silently inherit the MASTER's UPI ID until its owner
-    # explicitly sets their own.
-    if not ctx()['is_franchise']:
-        return os.getenv("UPI_ID", "").strip()
-    return ""
-
-async def set_upi_id(value: str):
-    await settings_col.update_one(
-        {"key": "upi_id"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
-async def get_payee_name() -> str:
-    setting = await settings_col.find_one({"key": "payee_name"})
-    if setting:
-        return setting.get("value", "")
-    if not ctx()['is_franchise']:
-        return os.getenv("PAYEE_NAME", "").strip()
-    return ""
-
-async def set_payee_name(value: str):
-    await settings_col.update_one(
-        {"key": "payee_name"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
-# ---------- RAZORPAY CONFIG (per-scope, same fallback pattern as UPI ID) ----------
-async def get_razorpay_key_id() -> str:
-    setting = await settings_col.find_one({"key": "razorpay_key_id"})
-    if setting:
-        return setting.get("value", "")
-    if not ctx()['is_franchise']:
-        return RAZORPAY_KEY_ID
-    return ""
-
-async def set_razorpay_key_id(value: str):
-    await settings_col.update_one(
-        {"key": "razorpay_key_id"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
-async def get_razorpay_key_secret() -> str:
-    setting = await settings_col.find_one({"key": "razorpay_key_secret"})
-    if setting:
-        return setting.get("value", "")
-    if not ctx()['is_franchise']:
-        return RAZORPAY_KEY_SECRET
-    return ""
-
-async def set_razorpay_key_secret(value: str):
-    await settings_col.update_one(
-        {"key": "razorpay_key_secret"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
-async def get_razorpay_webhook_secret() -> str:
-    setting = await settings_col.find_one({"key": "razorpay_webhook_secret"})
-    if setting:
-        return setting.get("value", "")
-    if not ctx()['is_franchise']:
-        return RAZORPAY_WEBHOOK_SECRET
-    return ""
-
-async def set_razorpay_webhook_secret(value: str):
-    await settings_col.update_one(
-        {"key": "razorpay_webhook_secret"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
-async def get_razorpay_webhook_secret_for_scope(scope_id: str) -> str:
-    """Same lookup as get_razorpay_webhook_secret(), but usable OUTSIDE any
-    event handler (no ctx() available) — the webhook HTTP request carries the
-    scope in its URL instead, so we query settings directly by franchise_id."""
-    setting = await db['settings'].find_one({"key": "razorpay_webhook_secret", "franchise_id": scope_id})
-    if setting:
-        return setting.get("value", "")
-    if scope_id == "master":
-        return RAZORPAY_WEBHOOK_SECRET
-    return ""
-
-def find_ctx_by_scope(scope_id: str) -> dict:
-    """Resolve the full per-bot context (client, admin_ids, etc.) for a given
-    scope_id from OUTSIDE an event handler — used by the Razorpay webhook."""
-    if not scope_id or scope_id == "master":
-        return master_ctx()
-    for c in client_contexts.values():
-        if c.get("scope_id") == scope_id:
-            return c
-    return master_ctx()
-
-async def razorpay_create_qr(amount: float, dep_id, user_id: int, scope_id: str) -> dict:
-    """Create a single-use, fixed-amount Razorpay UPI QR code for one deposit.
-    Returns the parsed JSON response (has 'id', 'image_url', 'short_url') or
-    None if Razorpay isn't configured / the request failed."""
-    key_id = await get_razorpay_key_id()
-    key_secret = await get_razorpay_key_secret()
-    if not key_id or not key_secret:
-        return None
-    payload = {
-        "type": "upi_qr",
-        "name": f"Deposit {dep_id}",
-        "usage": "single_use",
-        "fixed_amount": True,
-        "payment_amount": int(round(amount * 100)),
-        "description": "Wallet top-up",
-        "close_by": int(time.time()) + RAZORPAY_QR_EXPIRY_SECONDS,
-        "notes": {"deposit_id": str(dep_id), "user_id": str(user_id), "scope_id": scope_id},
-    }
-    try:
-        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(f"{RAZORPAY_API_BASE}/payments/qr_codes", json=payload,
-                               timeout=aiohttp.ClientTimeout(total=15)) as r:
-                body = await r.json()
-                if r.status not in (200, 201):
-                    logging.error(f"Razorpay QR create failed [{r.status}]: {body}")
-                    return None
-                return body
-    except Exception as e:
-        logging.error(f"Razorpay QR create error: {e}")
-        return None
-
-async def razorpay_close_qr(qr_id: str):
-    """Best-effort close of a QR code once it's been paid/cancelled, so it
-    can't be reused or paid a second time."""
-    if not qr_id:
-        return
-    key_id = await get_razorpay_key_id()
-    key_secret = await get_razorpay_key_secret()
-    if not key_id or not key_secret:
-        return
-    try:
-        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(f"{RAZORPAY_API_BASE}/payments/qr_codes/{qr_id}/close",
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status not in (200, 201):
-                    logging.warning(f"Razorpay QR close failed [{r.status}] for {qr_id}: {await r.text()}")
-    except Exception as e:
-        logging.warning(f"Razorpay QR close error for {qr_id}: {e}")
-
-
-async def razorpay_create_payment_link(amount: float, dep_id, user_id: int, scope_id: str) -> dict:
-    """Create a standard Razorpay Payment Link.
-    This works with Razorpay Test API keys; unlike a UPI-specific Payment Link,
-    it does not pass the `upi_link` parameter (which Razorpay does not support
-    in Test Mode)."""
-    key_id = await get_razorpay_key_id()
-    key_secret = await get_razorpay_key_secret()
-    if not key_id or not key_secret:
-        return None
-
-    # Razorpay requires expire_by to be at least 15 minutes in the future.
-    expiry_seconds = max(1200, RAZORPAY_QR_EXPIRY_SECONDS)
-    payload = {
-        "amount": int(round(amount * 100)),
-        "currency": "INR",
-        "accept_partial": False,
-        "expire_by": int(time.time()) + expiry_seconds,
-        "reference_id": f"dep_{dep_id}",
-        "description": f"Wallet top-up for user {user_id}",
-        "notes": {
-            "deposit_id": str(dep_id),
-            "user_id": str(user_id),
-            "scope_id": scope_id,
-        },
-        "notify": {"sms": False, "email": False},
-        "reminder_enable": False,
-    }
-
-    try:
-        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(
-                f"{RAZORPAY_API_BASE}/payment_links",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                body = await r.json(content_type=None)
-                if r.status not in (200, 201):
-                    logging.error(f"Razorpay Payment Link create failed [{r.status}]: {body}")
-                    return None
-                return body
-    except Exception as e:
-        logging.error(f"Razorpay Payment Link create error: {e}")
-        return None
-
-
-async def razorpay_cancel_payment_link(payment_link_id: str):
-    """Best-effort cancellation of an unpaid Razorpay Payment Link."""
-    if not payment_link_id:
-        return
-    key_id = await get_razorpay_key_id()
-    key_secret = await get_razorpay_key_secret()
-    if not key_id or not key_secret:
-        return
-
-    try:
-        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(
-                f"{RAZORPAY_API_BASE}/payment_links/{payment_link_id}/cancel",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                if r.status not in (200, 201):
-                    logging.warning(
-                        f"Razorpay Payment Link cancel failed [{r.status}] "
-                        f"for {payment_link_id}: {await r.text()}"
-                    )
-    except Exception as e:
-        logging.warning(f"Razorpay Payment Link cancel error for {payment_link_id}: {e}")
-
-
-# ---------- DYNAMIC ADMINS ----------
-# ADMIN_IDS from .env are permanent "founding" admins (can't be removed here).
-# Anyone else can be added/removed live, from inside the bot, no .env edit or
-# restart needed. Stored in settings_col, which is franchise-scoped — so each
-# franchise clone manages its own admin list independently of the master's.
-async def get_dynamic_admin_ids() -> list:
-    setting = await settings_col.find_one({"key": "dynamic_admins"})
-    return setting.get("value", []) if setting else []
-
-async def add_dynamic_admin(uid: int):
-    ids = await get_dynamic_admin_ids()
-    if uid not in ids:
-        ids.append(uid)
-        await settings_col.update_one(
-            {"key": "dynamic_admins"},
-            {"$set": {"value": ids, "updated_at": now_ist()}},
-            upsert=True
-        )
-
-async def remove_dynamic_admin(uid: int):
-    ids = await get_dynamic_admin_ids()
-    if uid in ids:
-        ids.remove(uid)
-        await settings_col.update_one(
-            {"key": "dynamic_admins"},
-            {"$set": {"value": ids, "updated_at": now_ist()}},
-            upsert=True
-        )
-
-async def is_admin(user_id: int) -> bool:
-    if user_id in ctx()['admin_ids']:
-        return True
-    return user_id in await get_dynamic_admin_ids()
-
-async def get_all_admin_ids() -> list:
-    """Founding admins for the CURRENT bot (.env ADMIN_IDS for master, just the
-    owner for a clone) + dynamically added ones, deduped — use this for
-    notification loops so newly-added admins get alerts too."""
-    return list(set(ctx()['admin_ids']) | set(await get_dynamic_admin_ids()))
 
 async def get_min_withdrawal():
     setting = await settings_col.find_one({"key": "min_withdrawal"})
@@ -608,21 +162,6 @@ async def get_referral_bonus_percent() -> float:
         return float(setting.get("value", REFERRAL_BONUS_PERCENT))
     return REFERRAL_BONUS_PERCENT
 
-async def is_referral_enabled() -> bool:
-    """Referral program is OFF by default on franchise clones (owner can turn
-    it on themselves) and ON by default on the master bot."""
-    setting = await settings_col.find_one({"key": "referral_enabled"})
-    if setting is not None:
-        return bool(setting.get("value", True))
-    return not ctx()['is_franchise']
-
-async def set_referral_enabled(value: bool):
-    await settings_col.update_one(
-        {"key": "referral_enabled"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
 async def get_referral_bonus_max() -> float:
     setting = await settings_col.find_one({"key": "referral_bonus_max"})
     if setting:
@@ -644,20 +183,10 @@ async def set_referral_bonus_max(value: float):
     )
 
 # ---------- LOGS CHANNEL HELPER ----------
-def mask_phone(phone: str) -> str:
-    """Show only the first 2 and last 2 digits — e.g. 919876543210 -> 91********10.
-    Used so franchise owners can't extract full account credentials to use
-    outside the bot, while the master (who actually controls the stock) still
-    sees everything in full via log_event."""
-    phone = str(phone)
-    if len(phone) <= 4:
-        return "*" * len(phone)
-    return phone[:2] + "*" * (len(phone) - 4) + phone[-2:]
-
 async def get_display_name(user_id: int) -> str:
     """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
     try:
-        entity = await ctx()['client'].get_entity(user_id)
+        entity = await bot.get_entity(user_id)
         name = entity.first_name or "Unknown"
         if entity.username:
             return f"{name} (@{entity.username})"
@@ -666,125 +195,11 @@ async def get_display_name(user_id: int) -> str:
         return str(user_id)
 
 async def log_event(text):
-    c = ctx()
-    if c['is_franchise']:
-        owner_name = await get_display_name(c['owner_id']) if c['owner_id'] else "Unknown"
-        text = f"🏢 **Franchise: {c['display_name']}** (Owner: {owner_name}, `{c['owner_id']}`)\n\n" + text
-
     if LOGS_CHANNEL_ID:
         try:
             await bot.send_message(LOGS_CHANNEL_ID, text, parse_mode="markdown")
         except Exception as e:
             logging.error(f"Failed to send log to channel: {e}")
-
-    # Every clone transaction also gets DM'd straight to the master admins —
-    # so the platform owner hears about it even with no logs channel set up.
-    if c['is_franchise']:
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, text, parse_mode="markdown")
-            except Exception as e:
-                logging.error(f"Failed to DM master admin {admin_id} about franchise event: {e}")
-
-# ---------- FRANCHISE WALLET ----------
-# Linked directly to the owner's own MASTER-bot personal balance — there is no
-# separate wallet pool anymore. Whatever the owner has in their own account on
-# the master bot IS what their franchise draws from, always in sync.
-async def get_owner_master_balance(owner_id: int) -> float:
-    doc = await users_col._col.find_one({"user_id": owner_id, "franchise_id": "master"})
-    return doc.get("balance", 0) if doc else 0
-
-async def reserve_owner_master_balance(owner_id: int, amount: float) -> bool:
-    if amount <= 0:
-        return True
-    result = await users_col._col.update_one(
-        {"user_id": owner_id, "franchise_id": "master", "balance": {"$gte": amount}},
-        {"$inc": {"balance": -amount}}
-    )
-    return result.modified_count > 0
-
-async def refund_owner_master_balance(owner_id: int, amount: float):
-    if amount <= 0:
-        return
-    await users_col._col.update_one(
-        {"user_id": owner_id, "franchise_id": "master"},
-        {"$inc": {"balance": amount}},
-        upsert=True
-    )
-
-async def reserve_franchise_wallet(wholesale_cost: float) -> bool:
-    """Atomically deduct wholesale_cost from THIS clone owner's own master-bot
-    balance. On the master bot itself this is always a no-op success — the
-    master IS the source, nothing to gate."""
-    if not ctx()['is_franchise'] or wholesale_cost <= 0:
-        return True
-    owner_id = ctx()['owner_id']
-    if not owner_id:
-        return False
-    return await reserve_owner_master_balance(owner_id, wholesale_cost)
-
-async def refund_franchise_wallet(amount: float):
-    if not ctx()['is_franchise'] or amount <= 0:
-        return
-    owner_id = ctx()['owner_id']
-    if owner_id:
-        await refund_owner_master_balance(owner_id, amount)
-
-async def notify_franchise_low_balance(attempted_cost: float):
-    """Alert the franchise owner privately — never expose wholesale mechanics to
-    the end customer, who just sees a generic 'unavailable' message."""
-    if not ctx()['is_franchise'] or not ctx()['owner_id']:
-        return
-    try:
-        bal = await get_owner_master_balance(ctx()['owner_id'])
-        await ctx()['client'].send_message(
-            ctx()['owner_id'],
-            f"🔴 **Low Balance!**\n\n"
-            f"A customer just tried to buy something costing ₹{attempted_cost} "
-            f"wholesale, but your own balance (on the master bot) is only ₹{bal}.\n\n"
-            f"The order was blocked and your customer's own balance was NOT charged. "
-            f"Deposit into your account on the master bot to keep selling."
-        )
-    except Exception as e:
-        logging.error(f"Could not notify franchise owner of low balance: {e}")
-
-
-async def get_account_markup() -> float:
-    """Retail markup this instance applies on top of the wholesale account price.
-    On the master bot this defaults to 1.0 (no markup — price IS the retail price).
-    A franchise sets its own via the admin panel."""
-    setting = await settings_col.find_one({"key": "account_markup"})
-    if setting:
-        return float(setting.get("value", 1.0))
-    return 1.0
-
-async def set_account_markup(value: float):
-    await settings_col.update_one(
-        {"key": "account_markup"},
-        {"$set": {"value": value, "updated_at": now_ist()}},
-        upsert=True
-    )
-
-# ---------- CLONE PROVISIONING ----------
-async def get_user_clone(user_id: int):
-    """Return the bot_clones_col doc this user already owns, if any — used to
-    enforce one clone per user, and to power the 'Remove My Clone' flow."""
-    return await bot_clones_col.find_one({"owner_id": user_id})
-
-async def validate_bot_token(token: str):
-    """Ping Telegram's Bot API to confirm a token is real and get its @username + display name."""
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://api.telegram.org/bot{token}/getMe",
-                              timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-        if data.get("ok"):
-            res = data["result"]
-            return True, {"username": res.get("username", "unknown"), "display_name": res.get("first_name", "My Bot")}
-        return False, data.get("description", "Invalid token")
-    except Exception as e:
-        return False, str(e)
-
 
 # ---------- HELPER ----------
 async def get_existing_countries():
@@ -1000,8 +415,8 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
     if parsed is None:
         return False
     try:
-        entity = await ctx()['client'].get_entity(parsed)
-        await ctx()['client'].get_permissions(entity, user_id)
+        entity = await bot.get_entity(parsed)
+        await bot.get_permissions(entity, user_id)
         return True
     except UserNotParticipantError:
         return False
@@ -1013,10 +428,9 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
         return False
 
 async def is_user_member(user_id: int) -> bool:
-    channels = await get_force_join_channels()
-    if not channels:
+    if not RAW_CHAT_IDS:
         return True
-    for raw_id in channels:
+    for raw_id in RAW_CHAT_IDS:
         if not await is_user_member_of(raw_id, user_id):
             return False
     return True
@@ -1024,13 +438,13 @@ async def is_user_member(user_id: int) -> bool:
 async def send_join_message(event):
     is_callback = isinstance(event, events.CallbackQuery.Event)
     buttons = []
-    for raw_id in await get_force_join_channels():
+    for raw_id in RAW_CHAT_IDS:
         if await is_user_member_of(raw_id, event.sender_id):
             continue
         title = raw_id
         try:
             parsed = parse_chat_id(raw_id)
-            entity = await ctx()['client'].get_entity(parsed)
+            entity = await bot.get_entity(parsed)
             title = getattr(entity, 'title', raw_id)
         except Exception as e:
             logging.warning(f"Could not get title for {raw_id}: {e}")
@@ -1040,7 +454,7 @@ async def send_join_message(event):
         else:
             invite_link = None
             try:
-                result = await ctx()['client'](functions.messages.ExportChatInviteRequest(
+                result = await bot(functions.messages.ExportChatInviteRequest(
                     peer=entity,
                     expire_date=None,
                     usage_limit=0
@@ -1065,8 +479,10 @@ async def send_join_message(event):
 
 # ---------- WELCOME / MAIN MENU ----------
 async def show_welcome_menu(event, user_id):
+    username = await get_bot_username()
+    ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
     welcome_msg = (
-        f"👋 **Welcome to the {ctx()['display_name']}!**\n\n"
+        "👋 **Welcome to the OTP Shop Bot!**\n\n"
         "🔐 **Buy Telegram Accounts** – Get login OTP & 2FA password instantly.\n"
         "💳 **Deposit via UPI/QR** – Send payment screenshot for approval.\n"
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
@@ -1077,21 +493,10 @@ async def show_welcome_menu(event, user_id):
         [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
     ]
-    row3 = []
-    if await is_referral_enabled():
-        row3.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
-    if await is_admin(user_id):
+    row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
+    if user_id in ADMIN_IDS:
         row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
-    if row3:
-        buttons.append(row3)
-    if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
-        buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
-    if not ctx()['is_franchise']:
-        my_clone = await get_user_clone(user_id)
-        if my_clone:
-            buttons.append([Button.inline(f"🗑️ Remove My Clone (@{my_clone['bot_username']})", b"remove_my_clone", style="danger")])
-        else:
-            buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
+    buttons.append(row3)
 
     support_link = await get_support_link()
     if support_link:
@@ -1103,61 +508,34 @@ async def show_welcome_menu(event, user_id):
         await event.respond(welcome_msg, buttons=buttons)
 
 # ---------- MAIN MENU ----------
-async def _build_main_menu(user_id):
-    buttons = [
-        [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
-        [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
-        [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
-    ]
-    row3 = []
-    if await is_referral_enabled():
-        row3.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
-    if await is_admin(user_id):
-        row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
-    if row3:
-        buttons.append(row3)
-    if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
-        buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
-    if not ctx()['is_franchise']:
-        my_clone = await get_user_clone(user_id)
-        if my_clone:
-            buttons.append([Button.inline(f"🗑️ Remove My Clone (@{my_clone['bot_username']})", b"remove_my_clone", style="danger")])
-        else:
-            buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
-    support_link = await get_support_link()
-    if support_link:
-        buttons.append([Button.url("📞 Support", support_link, style="primary")])
-    msg = f"🌟 **{ctx()['display_name']} — Main Menu**"
-    return msg, buttons
-
 async def send_main_menu(event):
     user_id = event.sender_id
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
-    msg, buttons = await _build_main_menu(user_id)
+    buttons = [
+        [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
+        [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
+        [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
+    ]
+    row3 = [Button.inline("👥 Referral Program", b"referral_info", style="primary")]
+    if user_id in ADMIN_IDS:
+        row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
+    buttons.append(row3)
+    support_link = await get_support_link()
+    if support_link:
+        buttons.append([Button.url("📞 Support", support_link, style="primary")])
+    msg = "🌟 **OTP Bot Main Menu**"
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(msg, buttons=buttons)
     else:
         await event.respond(msg, buttons=buttons)
 
-async def send_main_menu_new(event):
-    """Always sends the main menu as a BRAND NEW message — never edits the
-    current one. Used from places like the OTP/session views, so those
-    messages (and their own buttons) are left completely untouched."""
-    user_id = event.sender_id
-    if not await is_user_member(user_id):
-        await send_join_message(event)
-        return
-    msg, buttons = await _build_main_menu(user_id)
-    await ctx()['client'].send_message(event.chat_id, msg, buttons=buttons)
-
 # ---------- BROADCAST COMMAND ----------
 @bot.on(events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
 async def broadcast_cmd(event):
-    set_ctx_from_event(event)
     user_id = event.sender_id
-    if not await is_admin(user_id):
+    if user_id not in ADMIN_IDS:
         await event.respond("❌ Unauthorized.")
         return
 
@@ -1246,9 +624,8 @@ async def broadcast_cmd(event):
 
 @bot.on(events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
 async def broadcast_callback(event):
-    set_ctx_from_event(event)
     user_id = event.sender_id
-    if not await is_admin(user_id):
+    if user_id not in ADMIN_IDS:
         await event.answer("❌ Unauthorized.", alert=True)
         return
 
@@ -1282,10 +659,10 @@ async def broadcast_callback(event):
     if pin_logs and LOGS_CHANNEL_ID:
         try:
             if is_forward:
-                pin_msg = await ctx()['client'].forward_messages(LOGS_CHANNEL_ID, replied)
+                pin_msg = await bot.forward_messages(LOGS_CHANNEL_ID, replied)
             else:
-                pin_msg = await ctx()['client'].send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
-            await ctx()['client'].pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
+                pin_msg = await bot.send_message(LOGS_CHANNEL_ID, msg_text, parse_mode="markdown")
+            await bot.pin_message(LOGS_CHANNEL_ID, pin_msg, notify=False)
             admin_bc_name = await get_display_name(user_id)
             await log_event(
                 f"📌 **Broadcast Pinned**\n"
@@ -1306,8 +683,8 @@ async def broadcast_callback(event):
 
         async def send_one(uid):
             if is_forward:
-                return await ctx()['client'].forward_messages(uid, replied)
-            return await ctx()['client'].send_message(uid, msg_text, parse_mode="markdown")
+                return await bot.forward_messages(uid, replied)
+            return await bot.send_message(uid, msg_text, parse_mode="markdown")
 
         results = await asyncio.gather(*(send_one(uid) for uid in batch), return_exceptions=True)
 
@@ -1320,7 +697,7 @@ async def broadcast_callback(event):
 
             if pin_dm:
                 try:
-                    await ctx()['client'].pin_message(uid, res, notify=False)
+                    await bot.pin_message(uid, res, notify=False)
                     pin_success += 1
                 except Exception as e:
                     pin_failed += 1
@@ -1509,9 +886,8 @@ async def show_all_transactions(event, user_id, type_filter="all", page=0):
             for item in combined:
                 date_str = item["date"].strftime('%d/%m/%Y %H:%M')
                 if item["type"] == "Purchase":
-                    display_phone = mask_phone(item['phone']) if ctx()['is_franchise'] and item['phone'] != "N/A" else item['phone']
                     lines.append(
-                        f"🛒 User {item['user_id']} | {display_phone} ({item['country']}) | -₹{item['amount']} | {date_str}"
+                        f"🛒 User {item['user_id']} | {item['phone']} ({item['country']}) | -₹{item['amount']} | {date_str}"
                     )
                 else:
                     lines.append(
@@ -1680,7 +1056,6 @@ async def show_all_withdrawals(event, user_id):
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     try:
-        set_ctx_from_event(event)
         data = event.data.decode("utf-8")
         user_id = event.sender_id
         logging.info(f"Callback received: {data} from user {user_id}")
@@ -1712,24 +1087,13 @@ async def callback_handler(event):
                     "smm_services", "smm_myorders", "admin_smm_markup", "smm_search",
                     "admin_smm_markup_default", "admin_smm_markup_member", "admin_smm_orders",
                     "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings",
-                    "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max",
-                    "admin_cat_franchise", "admin_franchise_list", "admin_franchise_credit",
-                    "admin_account_markup", "my_franchise_wallet", "admin_clone_bot",
-                    "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot",
-                    "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name",
-                    "admin_razorpay", "admin_edit_rzp_key_id", "admin_edit_rzp_key_secret",
-                    "admin_edit_rzp_webhook_secret", "admin_rzp_disable",
-                    "remove_my_clone", "admin_remove_clone_list", "goto_main_new", "admin_toggle_referral",
-                    "admin_force_join", "admin_set_force_join", "admin_clear_force_join"):
+                    "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max"):
             user_states.pop(user_id, None)
 
         # ---------- ADMIN ACCOUNTS (filter + pagination) ----------
         if data.startswith("admin_accounts"):
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
-                return
-            if ctx()['is_franchise']:
-                await event.answer("❌ Stock is managed by the platform owner only.", alert=True)
                 return
 
             if data == "admin_accounts":
@@ -1747,7 +1111,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN TRANSACTIONS (type filter + pagination) ----------
         if data.startswith("admin_transactions"):
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
 
@@ -1766,7 +1130,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN SMM ORDERS (record/logs view) ----------
         if data.startswith("admin_smm_orders"):
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             if data == "admin_smm_orders":
@@ -1783,7 +1147,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN WITHDRAWALS (simple) ----------
         if data == "admin_withdrawals":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             await show_all_withdrawals(event, user_id)
@@ -1845,21 +1209,8 @@ async def callback_handler(event):
                     )])
 
             buttons.append([Button.inline("🔄 Refresh", f"sessions_{phone}", style="primary")])
-            buttons.append([Button.inline("🏠 Main Menu", b"goto_main_new", style="success")])
             buttons.append([Button.inline("🔙 Close", b"close_sessions", style="primary")])
             return "\n".join(lines), buttons
-
-        if data == "goto_main_new":
-            await send_main_menu_new(event)
-            await event.answer()
-            return
-
-        if data.startswith("open_sessions_"):
-            phone = data[len("open_sessions_"):]
-            text, buttons = await render_sessions(phone)
-            await ctx()['client'].send_message(event.chat_id, text, buttons=buttons)
-            await event.answer()
-            return
 
         if data.startswith("sessions_"):
             phone = data[len("sessions_"):]
@@ -1959,29 +1310,7 @@ async def callback_handler(event):
             return
 
         # ---------- REFERRAL INFO ----------
-        if data == "my_franchise_wallet":
-            if not (ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            bal = await get_owner_master_balance(ctx()['owner_id'])
-            low_warn = "\n\n⚠️ **Balance is low** — top up soon to avoid interrupted sales." if bal < 50 else ""
-            await event.edit(
-                f"🏢 **My Franchise Wallet**\n\n"
-                f"🆔 Franchise ID: `{ctx()['franchise_id']}`\n"
-                f"💰 Current Balance: ₹{bal}\n\n"
-                f"This IS your own personal balance on the master bot — same money, "
-                f"one place. Every account/SMM order your customers buy here draws "
-                f"from it at wholesale price. Deposit into your own account on the "
-                f"master bot to top it up.{low_warn}",
-                buttons=[[Button.inline("🔙 Back", b"main", style="primary")]]
-            )
-            await event.answer()
-            return
-
         if data == "referral_info":
-            if not await is_referral_enabled():
-                await event.answer("❌ Referral program is not available here.", alert=True)
-                return
             username = await get_bot_username()
             ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
             invited_count = await users_col.count_documents({"referred_by": user_id})
@@ -2074,13 +1403,11 @@ async def callback_handler(event):
                 {"$sort": {"_id": 1}}
             ]
             agg = await accounts_col.aggregate(pipeline).to_list(length=None)
-            acct_markup = await get_account_markup()
             btns = []
             for item in agg:
                 price = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
                 count = item["count"]
-                retail = round(price * acct_markup, 2)
-                btns.append([Button.inline(f"₹{retail} ({count} available)", f"price_{country}_{price}", style="primary")])
+                btns.append([Button.inline(f"₹{price} ({count} available)", f"price_{country}_{price}", style="primary")])
             btns.append([Button.inline("🔙 Back", b"buy", style="primary")])
             await event.edit(
                 f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
@@ -2092,21 +1419,16 @@ async def callback_handler(event):
         if data.startswith("price_"):
             parts = data.split("_", 2)
             country = parts[1]
-            price = float(parts[2])  # wholesale price (matches accounts_col.price)
-            acct_markup = await get_account_markup()
-            retail_price = round(price * acct_markup, 2)
+            price = float(parts[2])
             stock = await accounts_col.count_documents({"country": country, "status": "available", "price": price})
-            user_states[user_id] = {
-                "action": "awaiting_confirmation", "country": country,
-                "price": price, "retail_price": retail_price
-            }
+            user_states[user_id] = {"action": "awaiting_confirmation", "country": country, "price": price}
             confirm_text = (
                 "👋 Dear customer, after you agree to the terms and click the confirm button, "
                 "the number will be reserved for you.\n\n"
                 "💰 The amount will only be deducted from your account when you successfully receive the login codes.\n\n"
                 "⚠️ Please note that cancellation is not available in this server because OTP Delivery is guaranteed!\n\n"
                 f"🌏 Country: {country} 🇮🇳\n"
-                f"💰 Price: ₹{retail_price}\n"
+                f"💰 Price: ₹{price}\n"
                 f"📦 Stock: {stock}"
             )
             buttons = [
@@ -2124,12 +1446,11 @@ async def callback_handler(event):
                 await event.answer("Session expired. Please start again.", alert=True)
                 return
             country = state["country"]
-            price = state["price"]  # wholesale price (what the franchise wallet pays)
-            retail_price = state.get("retail_price", price)  # what the end-user pays
+            price = state["price"]
 
             user = await users_col.find_one({"user_id": user_id})
             balance = user["balance"] if user else 0
-            if balance < retail_price:
+            if balance < price:
                 await event.answer("❌ Insufficient balance!", alert=True)
                 return
 
@@ -2143,10 +1464,7 @@ async def callback_handler(event):
             for acc in accounts:
                 updated = await accounts_col.find_one_and_update(
                     {"_id": acc["_id"], "status": "available"},
-                    {"$set": {
-                        "status": "sold", "buyer_id": user_id, "sold_at": now_ist(),
-                        "sold_via_franchise_id": ctx()['scope_id'], "first_otp_sent": False,
-                    }}
+                    {"$set": {"status": "sold", "buyer_id": user_id, "sold_at": now_ist()}}
                 )
                 if updated is None:
                     continue
@@ -2160,9 +1478,9 @@ async def callback_handler(event):
                         error_msg = str(e)[:150]
                         logging.warning(f"Session invalid for {phone}: {e}")
                         await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
-                        for admin in await get_all_admin_ids():
+                        for admin in ADMIN_IDS:
                             try:
-                                await ctx()['client'].send_message(admin,
+                                await bot.send_message(admin,
                                     f"⚠️ **Inactive Session Detected!**\n"
                                     f"📱 Phone: `{phone}`\n"
                                     f"🌍 Country: {country}\n"
@@ -2188,33 +1506,19 @@ async def callback_handler(event):
             phone = acc["phone"]
             twofa_password = acc.get("twofa_password")
 
-            # Franchise wallet gate: on a franchise deployment, this must succeed
-            # BEFORE the end-user is charged — protects the master's wholesale stock
-            # from being sold on credit. No-op (always True) on the master bot itself.
-            if not await reserve_franchise_wallet(price):
-                await accounts_col.update_one(
-                    {"_id": acc["_id"]},
-                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
-                )
-                await notify_franchise_low_balance(price)
-                await event.answer("⚠️ Service temporarily unavailable. Please try again shortly.", alert=True)
-                return
-
             old_withdrawable = user.get('withdrawable_balance', 0) if user else 0
-            new_withdrawable = max(0, old_withdrawable - retail_price)
+            new_withdrawable = max(0, old_withdrawable - price)
             deduct_result = await users_col.update_one(
-                {"user_id": user_id, "balance": {"$gte": retail_price}},
-                {"$inc": {"balance": -retail_price}, "$set": {"withdrawable_balance": new_withdrawable}}
+                {"user_id": user_id, "balance": {"$gte": price}},
+                {"$inc": {"balance": -price}, "$set": {"withdrawable_balance": new_withdrawable}}
             )
             if deduct_result.modified_count == 0:
                 # Balance was insufficient at the moment of deduction (e.g. spent
-                # elsewhere concurrently) — release the reserved account back to stock
-                # and refund the franchise wallet since the sale didn't complete.
+                # elsewhere concurrently) — release the reserved account back to stock.
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
                 )
-                await refund_franchise_wallet(price)
                 await event.answer("❌ Insufficient balance! Please deposit and try again.", alert=True)
                 return
 
@@ -2223,8 +1527,7 @@ async def callback_handler(event):
                 "account_id": str(acc["_id"]),
                 "phone": phone,
                 "country": country,
-                "amount": retail_price,
-                "wholesale_amount": price,
+                "amount": price,
                 "status": "completed",
                 "created_at": now_ist()
             })
@@ -2240,29 +1543,27 @@ async def callback_handler(event):
                 success_text,
                 buttons=[
                     [Button.inline("🔄 Request New OTP", f"resend_{phone}", style="primary")],
-                    [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]
+                    [Button.inline("🔙 Main Menu", b"main", style="primary")]
                 ]
             )
             user_states.pop(user_id, None)
 
             # Admin notification
             try:
-                buyer_entity = await ctx()['client'].get_entity(user_id)
+                buyer_entity = await bot.get_entity(user_id)
                 buyer_name = buyer_entity.first_name or buyer_entity.username or str(user_id)
             except:
                 buyer_name = str(user_id)
             updated_user = await users_col.find_one({"user_id": user_id})
             new_balance = updated_user["balance"] if updated_user else 0
-            wallet_line = f"\nWholesale Cost: ₹{price} (franchise wallet)" if ctx()['is_franchise'] else ""
-            admin_phone = mask_phone(phone) if ctx()['is_franchise'] else phone
-            for admin in await get_all_admin_ids():
+            for admin in ADMIN_IDS:
                 try:
-                    await ctx()['client'].send_message(admin,
+                    await bot.send_message(admin,
                         f"🛒 **New Purchase**\n"
                         f"Buyer: `{user_id}` - {buyer_name}\n"
-                        f"Phone: `{admin_phone}`\n"
+                        f"Phone: `{phone}`\n"
                         f"Country: {country}\n"
-                        f"Price: ₹{retail_price}{wallet_line}\n"
+                        f"Price: ₹{price}\n"
                         f"Balance After: ₹{new_balance}"
                     )
                 except:
@@ -2272,7 +1573,7 @@ async def callback_handler(event):
                 f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
                 f"📱 Phone: `{phone}`\n"
                 f"🌍 Country: {country}\n"
-                f"💰 Price: ₹{retail_price}" + (f" (wholesale ₹{price})" if ctx()['is_franchise'] else "") + "\n"
+                f"💰 Price: ₹{price}\n"
                 f"👛 Balance After: ₹{new_balance}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
@@ -2323,7 +1624,7 @@ async def callback_handler(event):
                 if key in pending_otp_requests:
                     del pending_otp_requests[key]
                     try:
-                        await ctx()['client'].send_message(user_id, "⏰ No OTP received. Try again.")
+                        await bot.send_message(user_id, "⏰ No OTP received. Try again.")
                     except:
                         pass
             asyncio.create_task(clear_pending())
@@ -2339,84 +1640,12 @@ async def callback_handler(event):
 
         # ---------- DEPOSIT ----------
         if data == "deposit":
-            pending_dep = await deposits_col.find_one({"user_id": user_id, "status": {"$in": ["pending", "pending_auto"]}})
-            if pending_dep:
-                date_str = pending_dep["created_at"].strftime('%d/%m/%Y %H:%M')
-                await event.edit(
-                    f"⏳ **You already have a pending deposit**\n\n"
-                    f"💰 Amount: ₹{pending_dep['amount']}\n"
-                    f"🔑 Txn ID: `{pending_dep.get('txn_id', 'N/A')}`\n"
-                    f"🕐 Submitted: {date_str}\n\n"
-                    f"Please wait for it to be approved. If you made a "
-                    f"mistake and want to submit a new one instead, cancel this first.",
-                    buttons=[
-                        [Button.inline("❌ Cancel This Deposit", f"cancel_my_deposit_{pending_dep['_id']}".encode(), style="danger")],
-                        [Button.inline("🔙 Back", b"main", style="primary")],
-                    ]
-                )
-                await event.answer()
-                return
-            razorpay_ready = bool(await get_razorpay_key_id()) and bool(await get_razorpay_key_secret())
-            if not razorpay_ready and not await get_upi_id():
-                msg = "❌ Deposits aren't set up yet — the bot owner needs to set a UPI ID first."
-                if await is_admin(user_id):
-                    msg += "\n\nGo to Admin Panel → Finance & Transactions → Set UPI ID."
-                await event.answer(msg, alert=True)
-                return
             user_states[user_id] = {"action": "deposit", "step": "amount"}
             await event.edit(
                 f"💵 Enter amount (min ₹{MIN_DEPOSIT}):",
                 buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
             )
             await event.answer()
-            return
-
-        if data.startswith("cancel_my_deposit_"):
-            dep_id = data[len("cancel_my_deposit_"):]
-            dep = await deposits_col.find_one({"_id": ObjectId(dep_id)})
-            if not dep or dep["user_id"] != user_id:
-                await event.answer("❌ Not found.", alert=True)
-                return
-            if dep["status"] not in ("pending", "pending_auto"):
-                await event.answer("Already processed — can't cancel now.", alert=True)
-                return
-            result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "pending_auto"]}},
-                {"$set": {"status": "cancelled_by_user"}}
-            )
-            if result.modified_count == 0:
-                await event.answer("Already processed — can't cancel now.", alert=True)
-                return
-            if dep.get("qr_code_id"):
-                await razorpay_close_qr(dep["qr_code_id"])
-            if dep.get("payment_link_id"):
-                await razorpay_cancel_payment_link(dep["payment_link_id"])
-
-            # Disable the Approve/Reject buttons on every admin's copy of this
-            # request so nobody can act on it after the fact.
-            for ref in dep.get("admin_msg_refs", []):
-                try:
-                    await ctx()['client'].edit_message(
-                        ref["admin_id"], ref["message_id"],
-                        f"🚫 **Deposit Cancelled by User**\nUser: `{user_id}`\nAmount: ₹{dep['amount']}\nTxn ID: `{dep.get('txn_id', 'N/A')}`",
-                        buttons=None
-                    )
-                except Exception as e:
-                    logging.error(f"Could not disable admin deposit message: {e}")
-
-            await event.edit(
-                "✅ **Deposit cancelled.** You can now submit a new one.",
-                buttons=[[Button.inline("💳 New Deposit", b"deposit", style="success")],
-                         [Button.inline("🔙 Main Menu", b"main", style="primary")]]
-            )
-            await event.answer()
-            cancel_name = await get_display_name(user_id)
-            await log_event(
-                f"🚫 **Deposit Cancelled by User**\n"
-                f"👤 User: {cancel_name} (`{user_id}`)\n"
-                f"💰 Amount: ₹{dep['amount']} | Txn ID: `{dep.get('txn_id', 'N/A')}`\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-            )
             return
 
         # ---------- ORDERS ----------
@@ -2569,7 +1798,6 @@ async def callback_handler(event):
             link = state["link"]
             quantity = state["quantity"]
             charge = state["charge"]
-            wholesale_cost = state.get("wholesale_cost", charge)
 
             # Atomically reserve the charge FIRST — prevents both double-spend
             # (e.g. fast double-tap) and placing a paid order without payment.
@@ -2579,18 +1807,6 @@ async def callback_handler(event):
             )
             if deduct_result.modified_count == 0:
                 await event.answer("❌ Insufficient balance.", alert=True)
-                user_states.pop(user_id, None)
-                return
-
-            # Franchise wallet gate: must succeed BEFORE the (irreversible) panel
-            # API call. No-op on the master bot itself.
-            if not await reserve_franchise_wallet(wholesale_cost):
-                await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
-                await notify_franchise_low_balance(wholesale_cost)
-                await event.edit("⚠️ Service temporarily unavailable. Please try again shortly.\n\n"
-                                  f"💰 Your ₹{charge} has not been charged.",
-                                  buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
-                await event.answer()
                 user_states.pop(user_id, None)
                 return
 
@@ -2607,7 +1823,6 @@ async def callback_handler(event):
             except Exception as e:
                 # Refund since the order was never placed.
                 await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
-                await refund_franchise_wallet(wholesale_cost)
                 await event.edit(f"❌ Order failed: {e}\n\n💰 Your ₹{charge} has been refunded.",
                                   buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
@@ -2627,7 +1842,6 @@ async def callback_handler(event):
                 err = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown error"
                 # Refund since the panel did not accept the order.
                 await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
-                await refund_franchise_wallet(wholesale_cost)
                 await event.edit(f"❌ SMM panel rejected the order: {err}\n\n💰 Your ₹{charge} has been refunded.",
                                   buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 await event.answer()
@@ -2651,7 +1865,6 @@ async def callback_handler(event):
                 "link": link,
                 "quantity": quantity,
                 "charge": charge,
-                "wholesale_cost": wholesale_cost,
                 "smm_order_id": result["order"],
                 "status": "pending",
                 "created_at": now_ist(),
@@ -2661,7 +1874,6 @@ async def callback_handler(event):
             smm_buyer_name = await get_display_name(user_id)
             updated_user = await users_col.find_one({"user_id": user_id})
             new_bal = updated_user["balance"] if updated_user else 0
-            wallet_note = f" (wholesale ₹{wholesale_cost})" if ctx()['is_franchise'] else ""
             await log_event(
                 f"🚀 **New SMM Order**\n"
                 f"👤 User: {smm_buyer_name} (`{user_id}`)\n"
@@ -2670,7 +1882,7 @@ async def callback_handler(event):
                 f"🗂️ Category: {service.get('category', 'Other')}\n"
                 f"🔗 Link: {link}\n"
                 f"📊 Quantity: {quantity}\n"
-                f"💰 Charged: ₹{charge}{wallet_note} | 👛 Balance After: ₹{new_bal}\n"
+                f"💰 Charged: ₹{charge} | 👛 Balance After: ₹{new_bal}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             await event.edit(
@@ -2693,7 +1905,7 @@ async def callback_handler(event):
 
         # ---------- ADMIN PANEL ----------
         if data == "admin":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -2701,248 +1913,34 @@ async def callback_handler(event):
                 [Button.inline("💰 Finance & Transactions", b"admin_cat_finance", style="primary")],
                 [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="success")],
                 [Button.inline("⚙️ Bot Settings", b"admin_cat_settings", style="primary")],
+                [Button.inline("🔙 Back", b"main", style="primary")],
             ]
-            if not ctx()['is_franchise']:
-                btns.append([Button.inline("🏢 Franchises", b"admin_cat_franchise", style="success")])
-            btns.append([Button.inline("🔙 Back", b"main", style="primary")])
             await event.edit("⚙️ **Admin Panel**\n\nChoose a category:", buttons=btns)
             await event.answer()
             return
 
-        if data == "admin_cat_franchise":
-            if not await is_admin(user_id) or ctx()['is_franchise']:
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            btns = [
-                [Button.inline("🤖 Clone Bot (New Franchise)", b"admin_clone_bot", style="success")],
-                [Button.inline("📋 List Clones/Wallets", b"admin_franchise_list", style="primary")],
-                [Button.inline("💰 Add Owner Balance", b"admin_franchise_credit", style="success")],
-                [Button.inline("🗑️ Remove a Clone", b"admin_remove_clone_list", style="danger")],
-                [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
-            ]
-            await event.edit(
-                "🏢 **Franchise Management**\n\n"
-                "Each franchise partner's bot runs live in this same process — "
-                "one clone per user. Every sale on their bot draws down from the "
-                "wallet credit you top up here.",
-                buttons=btns
-            )
-            await event.answer()
-            return
-
-        if data == "admin_remove_clone_list":
-            if not await is_admin(user_id) or ctx()['is_franchise']:
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            clones = await bot_clones_col.find({}).to_list(length=50)
-            if not clones:
-                await event.answer("No clones to remove.", alert=True)
-                return
-            btns = [
-                [Button.inline(f"🗑️ @{c['bot_username']} (owner {c['owner_id']})",
-                                f"do_remove_clone_{c['franchise_id']}".encode(), style="danger")]
-                for c in clones
-            ]
-            btns.append([Button.inline("🔙 Back", b"admin_cat_franchise", style="primary")])
-            await event.edit("🗑️ **Select a clone to remove:**", buttons=btns)
-            await event.answer()
-            return
-
-
-        if data == "admin_clone_bot":
-            if not await is_admin(user_id) or ctx()['is_franchise']:
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            existing = await get_user_clone(user_id)
-            if existing:
-                await event.answer(
-                    f"❌ You already own a clone: @{existing['bot_username']}. "
-                    f"Remove it first if you want to create a new one.",
-                    alert=True
-                )
-                return
-            user_states[user_id] = {"action": "clone_bot", "step": "token"}
-            await event.edit(
-                "🤖 **Clone Bot**\n\n"
-                "Just send the **bot token** for the new bot "
-                "(get one from @BotFather → /newbot).\n\n"
-                "Everything else is automatic — the bot's name, a unique franchise ID, "
-                "and **you become that bot's admin/owner automatically.**",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "self_clone_bot":
-            if ctx()['is_franchise']:
-                await event.answer("❌ Cloning is only available from the main bot.", alert=True)
-                return
-            existing = await get_user_clone(user_id)
-            if existing:
-                await event.answer(
-                    f"❌ You already own a clone: @{existing['bot_username']}. "
-                    f"Remove it first (Main Menu → Remove My Clone) if you want to create a new one.",
-                    alert=True
-                )
-                return
-            user_states[user_id] = {"action": "clone_bot", "step": "token"}
-            await event.edit(
-                "🤖 **Clone This Bot — Run Your Own!**\n\n"
-                "Want your own version of this bot, fully under your control?\n\n"
-                "1️⃣ Message @BotFather → /newbot → get a bot token\n"
-                "2️⃣ Send that token here\n\n"
-                "That's it — your bot gets its own customers, its own settings, "
-                "and **you become its admin automatically.** Stock/services are "
-                "drawn from a prepaid wallet (top up anytime).\n\n"
-                "⚠️ One clone per user — remove it later if you ever want a fresh one.",
-                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "remove_my_clone":
-            if ctx()['is_franchise']:
-                await event.answer("❌ Not available here.", alert=True)
-                return
-            my_clone = await get_user_clone(user_id)
-            if not my_clone:
-                await event.answer("You don't own a clone.", alert=True)
-                return
-            await event.edit(
-                f"⚠️ **Remove your clone @{my_clone['bot_username']}?**\n\n"
-                f"This will take it offline immediately. Its data (customers, "
-                f"orders, wallet balance) is kept — recreating a clone with the "
-                f"same bot token later would pick it back up. Proceed?",
-                buttons=[
-                    [Button.inline("🗑️ Yes, Remove It", f"do_remove_clone_{my_clone['franchise_id']}".encode(), style="danger")],
-                    [Button.inline("❌ Cancel", b"main", style="primary")],
-                ]
-            )
-            await event.answer()
-            return
-
-        if data.startswith("do_remove_clone_"):
-            fid = data[len("do_remove_clone_"):]
-            clone = await bot_clones_col.find_one({"franchise_id": fid})
-            if not clone:
-                await event.answer("❌ Clone not found.", alert=True)
-                return
-            is_owner = (clone["owner_id"] == user_id)
-            is_master_admin = (not ctx()['is_franchise']) and await is_admin(user_id)
-            if not (is_owner or is_master_admin):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-
-            await stop_clone(fid)
-            await bot_clones_col.delete_one({"franchise_id": fid})
-            await log_event(
-                f"🗑️ **Clone Removed**\n"
-                f"🆔 Franchise: `{fid}` | @{clone['bot_username']}\n"
-                f"👤 Owner: `{clone['owner_id']}`\n"
-                f"👤 Removed by: `{user_id}`\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-            )
-            back_button = b"admin_cat_franchise" if is_master_admin and not is_owner else b"main"
-            await event.edit(
-                f"✅ @{clone['bot_username']} has been removed and taken offline.",
-                buttons=[[Button.inline("🔙 Back", back_button, style="primary")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_franchise_list":
-            if not await is_admin(user_id) or ctx()['is_franchise']:
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            clones = await bot_clones_col.find({}).to_list(length=50)
-            if not clones:
-                txt = "🏢 **Franchise Clones**\n\nNo franchises yet. Use \"🤖 Clone Bot\" to provision one."
-            else:
-                lines = []
-                for c in clones:
-                    bal = await get_owner_master_balance(c["owner_id"])
-                    lines.append(f"• @{c['bot_username']} ({c['display_name']}) — owner `{c['owner_id']}` — ₹{bal}")
-                txt = "🏢 **Franchise Clones**\n\n" + "\n".join(lines)
-            await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"admin_cat_franchise", style="primary")]])
-            await event.answer()
-            return
-
-        if data == "admin_franchise_credit":
-            if not await is_admin(user_id) or ctx()['is_franchise']:
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "franchise_credit", "step": "franchise_id"}
-            await event.edit(
-                "🏢 Send the **Franchise ID** to credit (this is the `FRANCHISE_ID` "
-                "value in that partner's `.env`):",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
-            )
-            await event.answer()
-            return
-
         if data == "admin_cat_accounts":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
-                return
-            if ctx()['is_franchise']:
-                # Franchise clones draw from the master's SHARED wholesale stock —
-                # they must never add to it or browse the raw pool, only set
-                # their own retail markup on top of it.
-                btns = [
-                    [Button.inline("📈 Set Account Markup", b"admin_account_markup", style="primary")],
-                    [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
-                ]
-                await event.edit(
-                    "📦 **Accounts & Stock**\n\n"
-                    "Stock is shared wholesale inventory managed by the platform "
-                    "owner — you can set your own resale markup on it below.",
-                    buttons=btns
-                )
-                await event.answer()
                 return
             btns = [
                 [Button.inline("➕ Add Account (OTP)", b"admin_add_otp", style="success")],
                 [Button.inline("📥 Add Account (Session)", b"admin_add_sess", style="success")],
                 [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock", style="success")],
                 [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
-                [Button.inline("📈 Set Account Markup", b"admin_account_markup", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("📦 **Accounts & Stock**", buttons=btns)
             await event.answer()
             return
 
-        if data == "admin_account_markup":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            cur = await get_account_markup()
-            user_states[user_id] = {"action": "set_account_markup", "step": "await_value"}
-            note = (
-                "\n\nOn a **franchise** bot: this is your retail markup on top of the "
-                "wholesale price the master sets — e.g. `1.2` charges your customers 20% "
-                "more than what your franchise wallet is billed."
-                if ctx()['is_franchise'] else
-                "\n\nOn the **master** bot this normally stays `1.0` (no markup) since "
-                "`price` already IS the retail/wholesale price."
-            )
-            await event.edit(
-                f"📈 Current account markup: **{cur}x**\n\n"
-                f"Send new multiplier (e.g. `1.2` for 20% markup, `1.0` for none):" + note,
-                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]]
-            )
-            await event.answer()
-            return
-
         if data == "admin_cat_finance":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
                 [Button.inline("💰 Add Balance", b"admin_addbal", style="success")],
                 [Button.inline("💲 Set Price", b"admin_setprice", style="primary")],
-                [Button.inline("🏦 Set UPI ID", b"admin_set_upi", style="primary")],
-                [Button.inline("⚡ Razorpay Auto-Approval", b"admin_razorpay", style="primary")],
                 [Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")],
                 [Button.inline("📜 Transaction History", b"admin_transactions", style="primary")],
                 [Button.inline("📜 Withdrawal History", b"admin_withdrawals", style="primary")],
@@ -2954,194 +1952,29 @@ async def callback_handler(event):
             await event.answer()
             return
 
-        if data == "admin_set_upi":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            cur_upi = await get_upi_id()
-            cur_name = await get_payee_name()
-            btns = [
-                [Button.inline("✏️ Edit UPI ID", b"admin_edit_upi_id", style="primary")],
-                [Button.inline("✏️ Edit Payee Name", b"admin_edit_payee_name", style="primary")],
-                [Button.inline("🔙 Back", b"admin_cat_finance", style="primary")],
-            ]
-            await event.edit(
-                f"🏦 **UPI Settings**\n\n"
-                f"Current UPI ID: `{cur_upi or 'Not set'}`\n"
-                f"Current Payee Name: `{cur_name or 'Not set'}`\n\n"
-                f"Deposits stay disabled for your customers until you set a UPI ID.",
-                buttons=btns
-            )
-            await event.answer()
-            return
-
-        if data == "admin_edit_upi_id":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_upi_id", "step": "await_value"}
-            await event.edit(
-                "🏦 Send your UPI ID (e.g. `yourname@upi`):",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_set_upi", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_edit_payee_name":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_payee_name", "step": "await_value"}
-            await event.edit(
-                "🏦 Send the payee/business name to show on the QR (e.g. `Rahul's OTP Store`):",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_set_upi", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_razorpay":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            key_id = await get_razorpay_key_id()
-            key_secret = await get_razorpay_key_secret()
-            webhook_secret = await get_razorpay_webhook_secret()
-            scope_id = ctx()['scope_id']
-            webhook_path = "/razorpay/webhook" if scope_id == "master" else f"/razorpay/webhook/{scope_id}"
-            masked_secret = (key_secret[:4] + "…") if key_secret else "Not set"
-            configured = bool(key_id and key_secret)
-            btns = [
-                [Button.inline("✏️ Edit Key ID", b"admin_edit_rzp_key_id", style="primary")],
-                [Button.inline("✏️ Edit Key Secret", b"admin_edit_rzp_key_secret", style="primary")],
-                [Button.inline("✏️ Edit Webhook Secret", b"admin_edit_rzp_webhook_secret", style="primary")],
-            ]
-            if configured:
-                btns.append([Button.inline("🔴 Disable (fall back to manual QR)", b"admin_rzp_disable", style="danger")])
-            btns.append([Button.inline("🔙 Back", b"admin_cat_finance", style="primary")])
-            await event.edit(
-                f"⚡ **Razorpay Auto-Approval**\n\n"
-                f"Status: {'🟢 Enabled — deposits auto-credit via UPI QR' if configured else '🔴 Disabled — using manual QR + screenshot approval'}\n"
-                f"Key ID: `{key_id or 'Not set'}`\n"
-                f"Key Secret: `{masked_secret}`\n"
-                f"Webhook Secret: `{'Set' if webhook_secret else 'Not set'}`\n\n"
-                f"**Setup:**\n"
-                f"1️⃣ Get your Key ID/Secret from Razorpay Dashboard → Settings → API Keys.\n"
-                f"2️⃣ Set both here — deposits switch to auto-credited UPI QR immediately.\n"
-                f"3️⃣ In Razorpay Dashboard → Webhooks, add a webhook pointing at:\n"
-                f"`https://YOUR_DOMAIN{webhook_path}`\n"
-                f"with the **qr_code.credited** event enabled, and set a secret.\n"
-                f"4️⃣ Paste that same secret here as the Webhook Secret.\n\n"
-                f"Your server must be reachable at that URL/port (`{WEBHOOK_HOST}:{WEBHOOK_PORT}` "
-                f"by default — put it behind a reverse proxy/domain with HTTPS, Razorpay requires it).",
-                buttons=btns
-            )
-            await event.answer()
-            return
-
-        if data == "admin_edit_rzp_key_id":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_rzp_key_id", "step": "await_value"}
-            await event.edit(
-                "🔑 Send your Razorpay **Key ID** (e.g. `rzp_live_xxxxxxxx`):",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_razorpay", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_edit_rzp_key_secret":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_rzp_key_secret", "step": "await_value"}
-            await event.edit(
-                "🔑 Send your Razorpay **Key Secret**.\n\n"
-                "⚠️ Delete this message from the chat after sending, for safety.",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_razorpay", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_edit_rzp_webhook_secret":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_rzp_webhook_secret", "step": "await_value"}
-            await event.edit(
-                "🔑 Send the **Webhook Secret** you set in the Razorpay Dashboard for this webhook.",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_razorpay", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_rzp_disable":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            await set_razorpay_key_id("")
-            await set_razorpay_key_secret("")
-            await event.edit(
-                "🔴 Razorpay auto-approval disabled. Deposits will fall back to the manual "
-                "UPI QR + screenshot + admin-approval flow.",
-                buttons=[[Button.inline("🔙 Back", b"admin_razorpay", style="primary")]]
-            )
-            await event.answer()
-            return
-
         if data == "admin_referral_settings":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             cur_percent = await get_referral_bonus_percent()
             cur_max = await get_referral_bonus_max()
-            enabled = await is_referral_enabled()
             btns = [
-                [Button.inline("🔴 Turn OFF" if enabled else "🟢 Turn ON", b"admin_toggle_referral", style="danger" if enabled else "success")],
                 [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
                 [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
                 [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
             ]
             await event.edit(
                 f"🎁 **Referral Bonus Settings**\n\n"
-                f"Status: {'🟢 ON' if enabled else '🔴 OFF'} "
-                + ("(default OFF for clones — turn on if you want it)\n\n" if ctx()['is_franchise'] else "\n\n") +
                 f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
                 f"Example: A ₹100 deposit currently pays a "
                 f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
                 buttons=btns
             )
             await event.answer()
-            return
-
-        if data == "admin_toggle_referral":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            new_state = not await is_referral_enabled()
-            await set_referral_enabled(new_state)
-            await event.answer(f"Referral program turned {'ON' if new_state else 'OFF'}.")
-            # Re-render the settings screen with the updated state
-            cur_percent = await get_referral_bonus_percent()
-            cur_max = await get_referral_bonus_max()
-            btns = [
-                [Button.inline("🔴 Turn OFF" if new_state else "🟢 Turn ON", b"admin_toggle_referral", style="danger" if new_state else "success")],
-                [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
-                [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
-                [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
-            ]
-            await event.edit(
-                f"🎁 **Referral Bonus Settings**\n\n"
-                f"Status: {'🟢 ON' if new_state else '🔴 OFF'}\n\n"
-                f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
-                f"Example: A ₹100 deposit currently pays a "
-                f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
-                buttons=btns
-            )
             return
 
         if data == "admin_set_ref_percent":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_ref_percent", "step": "await_value"}
@@ -3153,7 +1986,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_set_ref_max":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_ref_max", "step": "await_value"}
@@ -3165,7 +1998,7 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_smm":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
@@ -3178,147 +2011,19 @@ async def callback_handler(event):
             return
 
         if data == "admin_cat_settings":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             btns = [
                 [Button.inline("📞 Set Support Link", b"admin_support", style="primary")],
-                [Button.inline("📢 Force-Join Channels", b"admin_force_join", style="primary")],
-                [Button.inline("👤 Manage Admins", b"admin_manage_admins", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("⚙️ **Bot Settings**", buttons=btns)
             await event.answer()
             return
 
-        if data == "admin_force_join":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            channels = await get_force_join_channels()
-            cur = ", ".join(channels) if channels else "None set"
-            btns = [
-                [Button.inline("✏️ Set Channels", b"admin_set_force_join", style="primary")],
-                [Button.inline("🗑️ Clear (disable)", b"admin_clear_force_join", style="danger")],
-                [Button.inline("🔙 Back", b"admin_cat_settings", style="primary")],
-            ]
-            await event.edit(
-                f"📢 **Force-Join Channels**\n\n"
-                f"Current: `{cur}`\n\n"
-                f"Users must join all of these before they can use this bot. "
-                f"This is independent from the master bot's own channels.",
-                buttons=btns
-            )
-            await event.answer()
-            return
-
-        if data == "admin_set_force_join":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_force_join", "step": "await_value"}
-            await event.edit(
-                "📢 Send the channels (comma-separated), e.g. `@mychannel, @mygroup` "
-                "or numeric chat IDs like `-1001234567890`:",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_force_join", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_clear_force_join":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            await set_force_join_channels([])
-            await event.answer("✅ Force-join disabled.")
-            await event.edit(
-                "📢 **Force-Join Channels**\n\nCurrent: `None set`",
-                buttons=[
-                    [Button.inline("✏️ Set Channels", b"admin_set_force_join", style="primary")],
-                    [Button.inline("🔙 Back", b"admin_cat_settings", style="primary")],
-                ]
-            )
-            return
-
-        if data == "admin_manage_admins":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            dynamic_ids = await get_dynamic_admin_ids()
-            lines = ["👑 **Founding Admins** (from .env, permanent):"]
-            for aid in ADMIN_IDS:
-                name = await get_display_name(aid)
-                lines.append(f"• {name} — `{aid}`")
-            lines.append("\n👤 **Added Admins** (removable, no restart needed):")
-            if dynamic_ids:
-                for aid in dynamic_ids:
-                    name = await get_display_name(aid)
-                    lines.append(f"• {name} — `{aid}`")
-            else:
-                lines.append("_None yet._")
-            btns = [
-                [Button.inline("➕ Add Admin", b"admin_add_admin", style="success")],
-                [Button.inline("➖ Remove Admin", b"admin_remove_admin", style="danger")],
-                [Button.inline("🔙 Back", b"admin_cat_settings", style="primary")],
-            ]
-            await event.edit("\n".join(lines), buttons=btns)
-            await event.answer()
-            return
-
-        if data == "admin_add_admin":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "add_admin", "step": "await_id"}
-            await event.edit(
-                "➕ Send the **Telegram user ID** to make admin (ask them to message "
-                "@userinfobot to get their ID):",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_manage_admins", style="danger")]]
-            )
-            await event.answer()
-            return
-
-        if data == "admin_remove_admin":
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            dynamic_ids = await get_dynamic_admin_ids()
-            if not dynamic_ids:
-                await event.answer("No added admins to remove (founding admins can't be removed here).", alert=True)
-                return
-            btns = []
-            for aid in dynamic_ids:
-                name = await get_display_name(aid)
-                btns.append([Button.inline(f"❌ {name} ({aid})", f"do_remove_admin_{aid}", style="danger")])
-            btns.append([Button.inline("🔙 Back", b"admin_manage_admins", style="primary")])
-            await event.edit("➖ **Select an admin to remove:**", buttons=btns)
-            await event.answer()
-            return
-
-        if data.startswith("do_remove_admin_"):
-            if not await is_admin(user_id):
-                await event.answer("❌ Unauthorized", alert=True)
-                return
-            target_id = int(data[len("do_remove_admin_"):])
-            await remove_dynamic_admin(target_id)
-            await event.answer(f"✅ Removed admin {target_id}.", alert=True)
-            dynamic_ids = await get_dynamic_admin_ids()
-            btns = []
-            for aid in dynamic_ids:
-                name = await get_display_name(aid)
-                btns.append([Button.inline(f"❌ {name} ({aid})", f"do_remove_admin_{aid}", style="danger")])
-            btns.append([Button.inline("🔙 Back", b"admin_manage_admins", style="primary")])
-            await event.edit(
-                "➖ **Select an admin to remove:**" if dynamic_ids else "➖ No added admins left.",
-                buttons=btns if dynamic_ids else [[Button.inline("🔙 Back", b"admin_manage_admins", style="primary")]]
-            )
-            return
-
         # ---------- ADMIN ADD ACCOUNTS TO STOCK (BULK) ----------
         if data == "admin_add_stock":
-            if ctx()['is_franchise']:
-                await event.answer("❌ Stock is managed by the platform owner only.", alert=True)
-                return
             user_states[user_id] = {"action": "add_stock", "step": "await_bulk"}
             await event.edit(
                 "➕ **Add Accounts to Stock**\n\n"
@@ -3341,16 +2046,10 @@ async def callback_handler(event):
 
         # ---------- OTHER ADMIN HANDLERS ----------
         if data == "admin_add_otp":
-            if ctx()['is_franchise']:
-                await event.answer("❌ Stock is managed by the platform owner only.", alert=True)
-                return
             await start_add_phone_flow(event)
             await event.answer()
             return
         if data == "admin_add_sess":
-            if ctx()['is_franchise']:
-                await event.answer("❌ Stock is managed by the platform owner only.", alert=True)
-                return
             await start_add_session_flow(event)
             await event.answer()
             return
@@ -3360,7 +2059,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_deposits":
-            cursor = deposits_col.find({"status": {"$in": ["pending", "pending_auto"]}}).sort("created_at", 1)
+            cursor = deposits_col.find({"status": "pending"}).sort("created_at", 1)
             pending = await cursor.to_list(length=10)
             if not pending:
                 await event.answer("No pending deposits.", alert=True)
@@ -3368,49 +2067,101 @@ async def callback_handler(event):
             btns = []
             for dep in pending:
                 txn_id = dep.get('txn_id', 'N/A')
-                tag = "🅰️ " if dep.get("status") == "pending_auto" else ""
                 btns.append([
-                    Button.inline(f"✅ Approve {tag}₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}", style="success"),
+                    Button.inline(f"✅ Approve ₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}", style="success"),
                     Button.inline(f"❌ Reject", f"reject_{dep['_id']}", style="danger")
                 ])
             btns.append([Button.inline("🔙 Back", b"admin", style="primary")])
-            await event.edit("🕒 **Pending Deposits** (🅰️ = Razorpay auto-QR, still awaiting/overridable)", buttons=btns)
+            await event.edit("🕒 **Pending Deposits**", buttons=btns)
             await event.answer()
             return
         if data.startswith("approve_"):
             dep_id = data.split("_", 1)[1]
-            # Atomic: flips status only if it's still pending, so this can't
-            # double-credit a deposit the Razorpay webhook just auto-approved
-            # (or vice versa).
-            result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "pending_auto"]}},
-                {"$set": {"status": "approved", "approved_at": now_ist(), "approved_via": "admin_manual"}}
-            )
-            if result.modified_count == 0:
+            deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
+            if not deposit or deposit["status"] != "pending":
                 await event.answer("Already processed.", alert=True)
                 return
-            deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
-            admin_name = await get_display_name(user_id)
-            await finalize_deposit_credit(
-                deposit, approver_label=f"{admin_name} (`{user_id}`)",
-                admin_click_event=event, admin_user_id=user_id
+            user_id_dep = deposit["user_id"]
+            amount = deposit["amount"]
+            await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "approved"}})
+            await users_col.update_one(
+                {"user_id": user_id_dep},
+                {"$inc": {"balance": amount}},
+                upsert=True
             )
-            if deposit.get("qr_code_id"):
-                await razorpay_close_qr(deposit["qr_code_id"])
+            # ---------- Referral Bonus: 10% of referred user's FIRST deposit, capped ----------
+            user_doc = await users_col.find_one({"user_id": user_id_dep})
+            referrer_id = user_doc.get("referred_by") if user_doc else None
+            bonus_already_paid = user_doc.get("referral_bonus_paid", False) if user_doc else False
+
+            if referrer_id and not bonus_already_paid:
+                ref_percent = await get_referral_bonus_percent()
+                ref_max = await get_referral_bonus_max()
+                bonus = round(min(amount * (ref_percent / 100), ref_max), 2)
+                if bonus > 0:
+                    await users_col.update_one(
+                        {"user_id": referrer_id},
+                        {"$inc": {"balance": bonus, "withdrawable_balance": bonus, "referral_earnings": bonus}},
+                        upsert=True
+                    )
+                    await users_col.update_one(
+                        {"user_id": user_id_dep},
+                        {"$set": {"referral_bonus_paid": True}}
+                    )
+                    try:
+                        await bot.send_message(
+                            referrer_id,
+                            f"🎉 **Referral Bonus Earned!**\n\n"
+                            f"Your referral made their first deposit of ₹{amount}.\n"
+                            f"💰 You earned: ₹{bonus} ({ref_percent}% up to ₹{ref_max})"
+                        )
+                    except Exception:
+                        pass
+                    referrer_name = await get_display_name(referrer_id)
+                    await log_event(
+                        f"🎁 **Referral Bonus Paid**\n"
+                        f"👤 Referrer: {referrer_name} (`{referrer_id}`)\n"
+                        f"👤 Referred User: `{user_id_dep}` (first deposit ₹{amount})\n"
+                        f"💰 Bonus: ₹{bonus}\n"
+                        f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+                    )
+                else:
+                    # Still mark as paid so we don't re-check every future deposit
+                    await users_col.update_one(
+                        {"user_id": user_id_dep},
+                        {"$set": {"referral_bonus_paid": True}}
+                    )
+
+            admin_name = await get_display_name(user_id)
+            orig_msg = await event.get_message()
+            original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
+            new_caption = (
+                original_caption
+                + f"\n\n✅ **APPROVED** by {admin_name}\n"
+                + f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
+            try:
+                await event.edit(new_caption, buttons=None)
+            except MessageNotModifiedError:
+                pass
+            except Exception as e:
+                logging.error(f"Could not edit approve message: {e}")
+            try:
+                await bot.send_message(
+                    user_id_dep,
+                    f"✅ **Deposit Approved!**\n💰 ₹{amount} added to your balance."
+                )
+            except Exception:
+                pass
             await event.answer("✅ Approved")
             return
         if data.startswith("reject_"):
             dep_id = data.split("_", 1)[1]
-            result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "pending_auto"]}},
-                {"$set": {"status": "rejected"}}
-            )
-            if result.modified_count == 0:
+            deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
+            if not deposit or deposit["status"] != "pending":
                 await event.answer("Already processed.", alert=True)
                 return
-            deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
-            if deposit and deposit.get("qr_code_id"):
-                await razorpay_close_qr(deposit["qr_code_id"])
+            await deposits_col.update_one({"_id": ObjectId(dep_id)}, {"$set": {"status": "rejected"}})
             admin_name = await get_display_name(user_id)
             orig_msg = await event.get_message()
             original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
@@ -3426,7 +2177,7 @@ async def callback_handler(event):
             except Exception as e:
                 logging.error(f"Could not edit reject message: {e}")
             try:
-                await ctx()['client'].send_message(
+                await bot.send_message(
                     deposit["user_id"],
                     f"❌ **Deposit Rejected.**\nIf you believe this is a mistake, please contact support."
                 )
@@ -3435,7 +2186,7 @@ async def callback_handler(event):
             await event.answer("❌ Rejected")
             return
         if data == "admin_setprice":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_price", "step": "await_price"}
@@ -3443,7 +2194,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_support":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_support_link", "step": "await_link"}
@@ -3451,7 +2202,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_minwithdraw":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             user_states[user_id] = {"action": "set_min_withdraw", "step": "await_value"}
@@ -3459,7 +2210,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data == "admin_smm_markup":
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             default_m = await get_smm_markup("")
@@ -3478,7 +2229,7 @@ async def callback_handler(event):
             await event.answer()
             return
         if data in ("admin_smm_markup_default", "admin_smm_markup_member"):
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             is_member = data.endswith("_member")
@@ -3514,7 +2265,7 @@ async def callback_handler(event):
 
         # ---------- APPROVE / REJECT WITHDRAWAL ----------
         if data.startswith("wapprove_") or data.startswith("wreject_"):
-            if not await is_admin(user_id):
+            if user_id not in ADMIN_IDS:
                 await event.answer("❌ Unauthorized", alert=True)
                 return
             parts = data.split("_", 1)
@@ -3532,7 +2283,7 @@ async def callback_handler(event):
                     {"$set": {"status": "approved", "processed_at": now_ist()}}
                 )
                 try:
-                    await ctx()['client'].send_message(withdrawal["user_id"], f"✅ Withdrawal of ₹{withdrawal['amount']} approved.")
+                    await bot.send_message(withdrawal["user_id"], f"✅ Withdrawal of ₹{withdrawal['amount']} approved.")
                 except:
                     pass
                 await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
@@ -3548,7 +2299,7 @@ async def callback_handler(event):
                     {"$set": {"status": "rejected", "processed_at": now_ist()}}
                 )
                 try:
-                    await ctx()['client'].send_message(
+                    await bot.send_message(
                         withdrawal["user_id"],
                         f"❌ Withdrawal of ₹{withdrawal['amount']} rejected. "
                         f"The amount has been refunded to your withdrawable balance."
@@ -3956,338 +2707,6 @@ async def process_add_stock_step(event):
 #  7. DEPOSIT FLOW
 # ============================================================
 
-async def finalize_deposit_credit(deposit: dict, approver_label: str,
-                                   admin_click_event=None, admin_user_id=None):
-    """Shared crediting logic for an approved deposit — used by BOTH the
-    manual admin Approve button and the Razorpay auto-approval webhook, so
-    balance crediting, referral bonuses, user notification, and logging stay
-    in exactly one place regardless of which path approved it. Caller is
-    responsible for having already atomically flipped the deposit's status
-    to 'approved' (to prevent a double-credit race between the two paths)."""
-    user_id_dep = deposit["user_id"]
-    amount = deposit["amount"]
-
-    await users_col.update_one(
-        {"user_id": user_id_dep},
-        {"$inc": {"balance": amount}},
-        upsert=True
-    )
-
-    # ---------- Referral Bonus: % of referred user's FIRST deposit, capped ----------
-    user_doc = await users_col.find_one({"user_id": user_id_dep})
-    referrer_id = user_doc.get("referred_by") if user_doc else None
-    bonus_already_paid = user_doc.get("referral_bonus_paid", False) if user_doc else False
-
-    if referrer_id and not bonus_already_paid and await is_referral_enabled():
-        ref_percent = await get_referral_bonus_percent()
-        ref_max = await get_referral_bonus_max()
-        bonus = round(min(amount * (ref_percent / 100), ref_max), 2)
-        if bonus > 0:
-            await users_col.update_one(
-                {"user_id": referrer_id},
-                {"$inc": {"balance": bonus, "withdrawable_balance": bonus, "referral_earnings": bonus}},
-                upsert=True
-            )
-            await users_col.update_one(
-                {"user_id": user_id_dep},
-                {"$set": {"referral_bonus_paid": True}}
-            )
-            try:
-                await ctx()['client'].send_message(
-                    referrer_id,
-                    f"🎉 **Referral Bonus Earned!**\n\n"
-                    f"Your referral made their first deposit of ₹{amount}.\n"
-                    f"💰 You earned: ₹{bonus} ({ref_percent}% up to ₹{ref_max})"
-                )
-            except Exception:
-                pass
-            referrer_name = await get_display_name(referrer_id)
-            await log_event(
-                f"🎁 **Referral Bonus Paid**\n"
-                f"👤 Referrer: {referrer_name} (`{referrer_id}`)\n"
-                f"👤 Referred User: `{user_id_dep}` (first deposit ₹{amount})\n"
-                f"💰 Bonus: ₹{bonus}\n"
-                f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-            )
-        else:
-            # Still mark as paid so we don't re-check every future deposit
-            await users_col.update_one(
-                {"user_id": user_id_dep},
-                {"$set": {"referral_bonus_paid": True}}
-            )
-
-    if admin_click_event is not None:
-        orig_msg = await admin_click_event.get_message()
-        original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
-        new_caption = (
-            original_caption
-            + f"\n\n✅ **APPROVED** by {approver_label}\n"
-            + f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-        )
-        try:
-            await admin_click_event.edit(new_caption, buttons=None)
-        except MessageNotModifiedError:
-            pass
-        except Exception as e:
-            logging.error(f"Could not edit approve message: {e}")
-    else:
-        # Auto-approved (no button was clicked) — update every admin copy we
-        # notified when the deposit came in, so nobody sees a stale "pending".
-        for ref in deposit.get("admin_msg_refs", []):
-            try:
-                client = ctx()['client']
-                msg = await client.get_messages(ref["admin_id"], ids=ref["message_id"])
-                base_text = (msg.text or msg.message or "") if msg else ""
-                await client.edit_message(
-                    ref["admin_id"], ref["message_id"],
-                    base_text + f"\n\n✅ **AUTO-APPROVED** via {approver_label}\n"
-                                 f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-                )
-            except Exception:
-                pass
-
-    try:
-        await ctx()['client'].send_message(
-            user_id_dep,
-            f"✅ **Deposit Approved!**\n💰 ₹{amount} added to your balance."
-        )
-    except Exception:
-        pass
-
-    dep_name = await get_display_name(user_id_dep)
-    await log_event(
-        f"💳 **Deposit Approved**\n"
-        f"👤 User: {dep_name} (`{user_id_dep}`)\n"
-        f"💰 Amount: ₹{amount}\n"
-        f"🧾 Ref: `{deposit.get('txn_id') or deposit.get('qr_code_id') or 'N/A'}`\n"
-        f"👤 Approved by: {approver_label}\n"
-        f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-    )
-
-
-async def handle_razorpay_qr_credited(scope_id: str, qr_id: str, payment_id: str, amount_paise: int):
-    """Called from the Razorpay webhook once a 'qr_code.credited' event is
-    verified. Finds the matching pending deposit, atomically marks it
-    approved (guards against duplicate webhook retries crediting it twice
-    or racing a manual admin approval), then credits the wallet."""
-    if not qr_id:
-        return
-    dep = await db['deposits'].find_one({"qr_code_id": qr_id, "franchise_id": scope_id})
-    if not dep:
-        logging.warning(f"Razorpay webhook: no deposit found for qr_code_id={qr_id} scope={scope_id}")
-        return
-
-    expected_paise = int(round(dep.get("amount", 0) * 100))
-    if amount_paise and expected_paise and amount_paise != expected_paise:
-        # Shouldn't normally happen since the QR is created with fixed_amount,
-        # but log it loudly rather than silently crediting the wrong figure.
-        logging.warning(
-            f"Razorpay webhook: amount mismatch for deposit {dep['_id']} "
-            f"(expected {expected_paise} paise, got {amount_paise} paise) — crediting the expected amount."
-        )
-
-    result = await db['deposits'].update_one(
-        {"_id": dep["_id"], "status": {"$in": ["pending", "pending_auto"]}},
-        {"$set": {"status": "approved", "payment_id": payment_id, "approved_at": now_ist(),
-                   "approved_via": "razorpay_auto"}}
-    )
-    if result.modified_count == 0:
-        logging.info(f"Razorpay webhook: deposit {dep['_id']} already processed, skipping.")
-        return
-
-    current_ctx.set(find_ctx_by_scope(scope_id))
-    dep["status"] = "approved"
-    await finalize_deposit_credit(dep, approver_label="Razorpay (auto)")
-    await razorpay_close_qr(qr_id)
-
-
-
-async def handle_razorpay_payment_link_paid(
-    scope_id: str, payment_link_id: str, payment_id: str, amount_paise: int
-):
-    """Auto-credit a pending deposit when Razorpay sends payment_link.paid."""
-    if not payment_link_id:
-        return
-
-    dep = await db["deposits"].find_one({
-        "payment_link_id": payment_link_id,
-        "franchise_id": scope_id,
-    })
-    if not dep:
-        logging.warning(
-            f"Razorpay webhook: no deposit found for payment_link_id={payment_link_id} "
-            f"scope={scope_id}"
-        )
-        return
-
-    expected_paise = int(round(dep.get("amount", 0) * 100))
-    if amount_paise and expected_paise and amount_paise != expected_paise:
-        logging.error(
-            f"Razorpay Payment Link amount mismatch for deposit {dep['_id']}: "
-            f"expected {expected_paise}, got {amount_paise}. Deposit NOT credited."
-        )
-        return
-
-    result = await db["deposits"].update_one(
-        {"_id": dep["_id"], "status": {"$in": ["pending", "pending_auto"]}},
-        {"$set": {
-            "status": "approved",
-            "payment_id": payment_id,
-            "approved_at": now_ist(),
-            "approved_via": "razorpay_payment_link",
-        }},
-    )
-    if result.modified_count == 0:
-        logging.info(f"Razorpay webhook: deposit {dep['_id']} already processed, skipping.")
-        return
-
-    current_ctx.set(find_ctx_by_scope(scope_id))
-    dep["status"] = "approved"
-    dep["payment_id"] = payment_id
-    await finalize_deposit_credit(dep, approver_label="Razorpay Payment Link (auto)")
-
-
-
-async def razorpay_webhook_handler(request: web.Request) -> web.Response:
-    scope_id = request.match_info.get("scope_id", "master")
-    body = await request.read()
-    signature = request.headers.get("X-Razorpay-Signature", "")
-    secret = await get_razorpay_webhook_secret_for_scope(scope_id)
-    if not secret or not signature:
-        return web.Response(status=400, text="webhook not configured")
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature):
-        logging.warning(f"Razorpay webhook: signature mismatch for scope={scope_id}")
-        return web.Response(status=400, text="invalid signature")
-
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad json")
-
-    event_name = data.get("event")
-
-    if event_name == "payment_link.paid":
-        try:
-            pl_entity = data["payload"]["payment_link"]["entity"]
-            payment_entity = data["payload"]["payment"]["entity"]
-        except (KeyError, TypeError):
-            return web.Response(status=200, text="ignored")
-        try:
-            await handle_razorpay_payment_link_paid(
-                scope_id,
-                pl_entity.get("id"),
-                payment_entity.get("id"),
-                payment_entity.get("amount", 0),
-            )
-        except Exception as e:
-            logging.error(f"Razorpay Payment Link webhook processing error: {e}")
-
-    elif event_name == "qr_code.credited":
-        try:
-            qr_entity = data["payload"]["qr_code"]["entity"]
-            payment_entity = data["payload"]["payment"]["entity"]
-        except (KeyError, TypeError):
-            return web.Response(status=200, text="ignored")
-        try:
-            await handle_razorpay_qr_credited(
-                scope_id, qr_entity.get("id"), payment_entity.get("id"),
-                payment_entity.get("amount", 0)
-            )
-        except Exception as e:
-            logging.error(f"Razorpay QR webhook processing error: {e}")
-
-    return web.Response(status=200, text="ok")
-
-
-async def start_webhook_server():
-    """Runs alongside the Telethon client(s) in the same asyncio loop/process.
-    Route is scope-aware (/razorpay/webhook/<scope_id>) so the master bot and
-    every franchise clone can each register their own Razorpay webhook URL
-    (pointing at the same host:port) with their own secret."""
-    app = web.Application()
-    app.router.add_post("/razorpay/webhook/{scope_id}", razorpay_webhook_handler)
-    app.router.add_post("/razorpay/webhook", razorpay_webhook_handler)  # master shorthand
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
-    await site.start()
-    logging.info(f"🌐 Razorpay webhook listening on {WEBHOOK_HOST}:{WEBHOOK_PORT} "
-                 f"(paths: /razorpay/webhook/<scope_id>, /razorpay/webhook for master)")
-
-
-async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float):
-    """Create a Razorpay standard Payment Link and auto-credit via payment_link.paid."""
-    scope_id = ctx()["scope_id"]
-    result = await deposits_col.insert_one({
-        "user_id": user_id,
-        "amount": amount,
-        "status": "pending_auto",
-        "method": "razorpay_payment_link",
-        "created_at": now_ist(),
-    })
-    dep_id = result.inserted_id
-
-    payment_link = await razorpay_create_payment_link(amount, dep_id, user_id, scope_id)
-    if not payment_link or not payment_link.get("id") or not payment_link.get("short_url"):
-        await deposits_col.update_one(
-            {"_id": dep_id},
-            {"$set": {"status": "failed"}}
-        )
-        await event.respond(
-            "❌ Couldn't generate the Razorpay Payment Link right now. "
-            "Check the server log for the Razorpay API error.",
-            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]]
-        )
-        return
-
-    payment_link_id = payment_link["id"]
-    short_url = payment_link["short_url"]
-
-    await deposits_col.update_one(
-        {"_id": dep_id},
-        {"$set": {
-            "payment_link_id": payment_link_id,
-            "payment_link_url": short_url,
-            "txn_id": payment_link_id,
-        }}
-    )
-
-    minutes = max(15, max(900, RAZORPAY_QR_EXPIRY_SECONDS) // 60)
-    msg = (
-        f"💳 **Deposit ₹{amount}**\n\n"
-        f"Tap **Pay ₹{amount}** below to open Razorpay's secure payment page.\n"
-        f"✅ After Razorpay confirms the payment, your balance will be credited "
-        f"automatically.\n\n"
-        f"⏳ Link expires in ~{minutes} min."
-    )
-    buttons = [
-        [Button.url(f"💳 Pay ₹{amount}", short_url)],
-        [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
-    ]
-    await event.respond(msg, buttons=buttons)
-
-    for admin in await get_all_admin_ids():
-        try:
-            sent = await ctx()["client"].send_message(
-                admin,
-                f"🔔 **New Deposit (Razorpay Payment Link)**\n"
-                f"User: `{user_id}`\n"
-                f"Amount: ₹{amount}\n"
-                f"Payment Link ID: `{payment_link_id}`\n\n"
-                f"This auto-approves when Razorpay sends `payment_link.paid`."
-            )
-            await deposits_col.update_one(
-                {"_id": dep_id},
-                {"$push": {"admin_msg_refs": {
-                    "admin_id": admin,
-                    "message_id": sent.id,
-                }}}
-            )
-        except Exception:
-            pass
-
-
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -4303,29 +2722,10 @@ async def process_deposit_step(event):
             await event.respond(f"❌ Invalid. Min ₹{MIN_DEPOSIT}.", buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
             return
         state["amount"] = amount
-
-        razorpay_key_id = await get_razorpay_key_id()
-        razorpay_key_secret = await get_razorpay_key_secret()
-        if razorpay_key_id and razorpay_key_secret:
-            await start_razorpay_payment_link_deposit(event, user_id, amount)
-            user_states.pop(user_id, None)
-            return
-
-        # ---- Fallback: static UPI QR + manual screenshot + admin approval ----
         txn_id = f"DEP{datetime.now().strftime('%y%m%d%H%M')}{random.randint(1000,9999)}"
         state["txn_id"] = txn_id
 
-        upi_id = await get_upi_id()
-        payee_name = await get_payee_name()
-        if not upi_id:
-            msg = "❌ Deposits aren't set up yet — the bot owner needs to set a UPI ID first."
-            if await is_admin(user_id):
-                msg += "\n\nGo to Admin Panel → Finance & Transactions → Set UPI ID."
-            await event.respond(msg, buttons=[[Button.inline("🔙 Back", b"main", style="danger")]])
-            user_states.pop(user_id, None)
-            return
-
-        upi_string = f"upi://pay?pa={upi_id}&pn={payee_name}&am={amount}&tn={txn_id}"
+        upi_string = f"upi://pay?pa={UPI_ID}&pn={PAYEE_NAME}&am={amount}&tn={txn_id}"
         img = qrcode.make(upi_string)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -4335,14 +2735,14 @@ async def process_deposit_step(event):
             f"💳 **Deposit ₹{amount}**\n"
             f"🔑 **Txn ID:** `{txn_id}`\n\n"
             f"📌 **Mention this Txn ID in payment note.**\n\n"
-            f"Scan the QR code to pay.\n\n"
+            f"Scan QR or use UPI: `{UPI_ID}`\n\n"
             "Send screenshot after payment."
         )
-        await ctx()['client'].send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
+        await bot.send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
         state["step"] = "screenshot"
     elif step == "screenshot":
         if not event.message.photo:
-            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
+            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]])
             return
         amount = state["amount"]
         txn_id = state.get("txn_id", "N/A")
@@ -4358,24 +2758,28 @@ async def process_deposit_step(event):
         photo_bytes = await event.message.download_media(file=bytes)
         photo_io = io.BytesIO(photo_bytes)
         photo_io.name = "payment_proof.jpg"
-        admin_msg_refs = []
-        for admin in await get_all_admin_ids():
+        for admin in ADMIN_IDS:
             try:
-                sent = await ctx()['client'].send_file(admin, photo_io,
+                await bot.send_file(admin, photo_io,
                     caption=f"🔔 **New Deposit Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`",
                     buttons=[
                         [Button.inline("✅ Approve", f"approve_{dep_id}", style="success"),
                          Button.inline("❌ Reject", f"reject_{dep_id}", style="danger")]
                     ])
-                admin_msg_refs.append({"admin_id": admin, "message_id": sent.id})
                 photo_io.seek(0)
             except:
                 pass
-        await deposits_col.update_one({"_id": dep_id}, {"$set": {"admin_msg_refs": admin_msg_refs}})
-        await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]])
+        await event.respond(f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`", buttons=[[Button.inline("🔙 Main Menu", b"main", style="primary")]])
         user_states.pop(user_id, None)
-        # Note: no log_event here on purpose — logging happens once the deposit
-        # is actually APPROVED, not just requested (see the approve_ handler).
+        dep_name = await get_display_name(user_id)
+        await log_event(
+            f"💳 **Deposit Request**\n"
+            f"👤 User: {dep_name} (`{user_id}`)\n"
+            f"💰 Amount: ₹{amount}\n"
+            f"🧾 Txn ID: `{txn_id}`\n"
+            f"🆔 Deposit ID: `{dep_id}`\n"
+            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
 
 
 # ============================================================
@@ -4384,7 +2788,6 @@ async def process_deposit_step(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
 async def handle_message(event):
-    set_ctx_from_event(event)
     user_id = event.sender_id
     if not await is_user_member(user_id):
         await send_join_message(event)
@@ -4415,14 +2818,12 @@ async def handle_message(event):
                 return
             state["uid"] = uid
             state["step"] = "await_amount"
-            await event.respond("💵 Send amount to add (send a negative number, e.g. -50, to deduct):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
+            await event.respond("💵 Send amount to add:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
         elif step == "await_amount":
             try:
                 amt = float(event.message.text.strip())
-                if amt == 0:
-                    raise ValueError
             except:
-                await event.respond("❌ Invalid amount. Send a positive number to add, or a negative number (e.g. -50) to deduct.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
+                await event.respond("❌ Invalid amount.", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
                 return
             uid = state["uid"]
             await users_col.update_one(
@@ -4430,16 +2831,7 @@ async def handle_message(event):
                 {"$inc": {"balance": amt}, "$setOnInsert": {"joined_at": now_ist()}},
                 upsert=True
             )
-            await balance_adjustments_col.insert_one({
-                "user_id": uid,
-                "amount": amt,
-                "admin_id": user_id,
-                "created_at": now_ist()
-            })
-            if amt >= 0:
-                await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
-            else:
-                await event.respond(f"✅ Deducted ₹{abs(amt)} from user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+            await event.respond(f"✅ Added ₹{amt} to user `{uid}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
     elif action == "deposit":
         await process_deposit_step(event)
@@ -4496,9 +2888,9 @@ async def handle_message(event):
                 "created_at": now_ist()
             })
             w_id = result.inserted_id
-            for admin in await get_all_admin_ids():
+            for admin in ADMIN_IDS:
                 try:
-                    await ctx()['client'].send_message(admin,
+                    await bot.send_message(admin,
                         f"🔔 **Withdrawal Request**\nUser: `{user_id}`\nAmount: ₹{amount}\nUPI: `{upi}`",
                         buttons=[
                             [Button.inline("✅ Approve", f"wapprove_{w_id}", style="success"),
@@ -4507,10 +2899,7 @@ async def handle_message(event):
                     )
                 except:
                     pass
-            await event.respond(
-                f"✅ **Withdrawal Submitted**\n💰 Amount: ₹{amount}\n🏦 UPI: `{upi}`",
-                buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]]
-            )
+            await event.respond(f"✅ Withdrawal of ₹{amount} submitted.", buttons=[[Button.inline("🔙 Referral Info", b"referral_info", style="primary")]])
             wd_name = await get_display_name(user_id)
             await log_event(
                 f"💸 **Withdrawal Request**\n"
@@ -4532,91 +2921,6 @@ async def handle_message(event):
                 await set_support_link(link)
                 await event.respond(f"✅ Updated to `{link}`.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
-
-    elif action == "set_force_join":
-        step = state.get("step")
-        if step == "await_value":
-            raw = event.message.text.strip()
-            channels = [c.strip() for c in raw.split(",") if c.strip()]
-            await set_force_join_channels(channels)
-            shown = ", ".join(channels) if channels else "None"
-            await event.respond(f"✅ Force-join channels set to: `{shown}`",
-                                 buttons=[[Button.inline("🔙 Bot Settings", b"admin_force_join", style="primary")]])
-            user_states.pop(user_id, None)
-
-    elif action == "set_upi_id":
-        step = state.get("step")
-        if step == "await_value":
-            upi = event.message.text.strip()
-            if not upi or "@" not in upi:
-                await event.respond("❌ Invalid UPI ID — should look like `name@bank`. Try again:",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_set_upi", style="danger")]])
-                return
-            await set_upi_id(upi)
-            await event.respond(f"✅ UPI ID set to `{upi}`. Deposits are now enabled for your customers.",
-                                 buttons=[[Button.inline("🔙 UPI Settings", b"admin_set_upi", style="primary")]])
-            user_states.pop(user_id, None)
-
-    elif action == "set_payee_name":
-        step = state.get("step")
-        if step == "await_value":
-            name = event.message.text.strip()
-            if not name:
-                await event.respond("❌ Invalid name, try again:",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_set_upi", style="danger")]])
-                return
-            await set_payee_name(name)
-            await event.respond(f"✅ Payee name set to `{name}`.",
-                                 buttons=[[Button.inline("🔙 UPI Settings", b"admin_set_upi", style="primary")]])
-            user_states.pop(user_id, None)
-
-    elif action == "set_rzp_key_id":
-        step = state.get("step")
-        if step == "await_value":
-            value = event.message.text.strip()
-            if not value:
-                await event.respond("❌ Invalid Key ID, try again:",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_razorpay", style="danger")]])
-                return
-            await set_razorpay_key_id(value)
-            await event.respond(f"✅ Razorpay Key ID set to `{value}`.",
-                                 buttons=[[Button.inline("🔙 Razorpay Settings", b"admin_razorpay", style="primary")]])
-            user_states.pop(user_id, None)
-
-    elif action == "set_rzp_key_secret":
-        step = state.get("step")
-        if step == "await_value":
-            value = event.message.text.strip()
-            if not value:
-                await event.respond("❌ Invalid Key Secret, try again:",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_razorpay", style="danger")]])
-                return
-            await set_razorpay_key_secret(value)
-            try:
-                await event.message.delete()
-            except Exception:
-                pass
-            await event.respond("✅ Razorpay Key Secret saved.",
-                                 buttons=[[Button.inline("🔙 Razorpay Settings", b"admin_razorpay", style="primary")]])
-            user_states.pop(user_id, None)
-
-    elif action == "set_rzp_webhook_secret":
-        step = state.get("step")
-        if step == "await_value":
-            value = event.message.text.strip()
-            if not value:
-                await event.respond("❌ Invalid secret, try again:",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_razorpay", style="danger")]])
-                return
-            await set_razorpay_webhook_secret(value)
-            try:
-                await event.message.delete()
-            except Exception:
-                pass
-            await event.respond("✅ Razorpay Webhook Secret saved.",
-                                 buttons=[[Button.inline("🔙 Razorpay Settings", b"admin_razorpay", style="primary")]])
-            user_states.pop(user_id, None)
-
     elif action == "set_price":
         step = state.get("step")
         if step == "await_price":
@@ -4700,172 +3004,6 @@ async def handle_message(event):
                                  buttons=[[Button.inline("🔙 Referral Settings", b"admin_referral_settings", style="primary")]])
             user_states.pop(user_id, None)
 
-    elif action == "set_account_markup":
-        step = state.get("step")
-        if step == "await_value":
-            try:
-                val = float(event.message.text.strip())
-                if val <= 0:
-                    raise ValueError
-            except:
-                await event.respond("❌ Invalid multiplier. Send a number like `1.2`.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]])
-                return
-            await set_account_markup(val)
-            await event.respond(f"✅ Account markup set to {val}x.",
-                                 buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]])
-            user_states.pop(user_id, None)
-
-    elif action == "franchise_credit":
-        step = state.get("step")
-        if step == "franchise_id":
-            fid = event.message.text.strip()
-            clone = await bot_clones_col.find_one({"franchise_id": fid})
-            if not clone:
-                await event.respond("❌ No clone with that Franchise ID. Check 'List Clones/Wallets' and try again.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]])
-                return
-            state["franchise_id"] = fid
-            state["owner_id"] = clone["owner_id"]
-            state["step"] = "amount"
-            await event.respond(
-                f"💰 Send the amount (₹) to add to @{clone['bot_username']}'s owner "
-                f"(`{clone['owner_id']}`) balance — this is their own master-bot balance, "
-                f"which their franchise draws from:",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
-            )
-            return
-        if step == "amount":
-            try:
-                amt = float(event.message.text.strip())
-                if amt <= 0:
-                    raise ValueError
-            except:
-                await event.respond("❌ Invalid amount. Send a number like `500`.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]])
-                return
-            fid = state["franchise_id"]
-            owner_id = state["owner_id"]
-            await refund_owner_master_balance(owner_id, amt)  # plain credit, not a "refund" — just reuses the same $inc helper
-            new_bal = await get_owner_master_balance(owner_id)
-            await event.respond(
-                f"✅ Added ₹{amt} to owner `{owner_id}`'s balance.\n💰 New balance: ₹{new_bal}",
-                buttons=[[Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]]
-            )
-            await log_event(
-                f"🏢 **Franchise Owner Balance Credited**\n"
-                f"🆔 Franchise: `{fid}` | Owner: `{owner_id}`\n"
-                f"💰 Added: ₹{amt} | New Balance: ₹{new_bal}\n"
-                f"👤 By Admin: `{user_id}`\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-            )
-            user_states.pop(user_id, None)
-
-    elif action == "add_admin":
-        step = state.get("step")
-        if step == "await_id":
-            id_text = event.message.text.strip()
-            if not id_text.isdigit():
-                await event.respond("❌ Invalid ID. Send numbers only.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"admin_manage_admins", style="danger")]])
-                return
-            new_admin_id = int(id_text)
-            await add_dynamic_admin(new_admin_id)
-            new_name = await get_display_name(new_admin_id)
-            await event.respond(
-                f"✅ {new_name} (`{new_admin_id}`) is now an admin — no restart needed.",
-                buttons=[[Button.inline("🔙 Manage Admins", b"admin_manage_admins", style="primary")]]
-            )
-            try:
-                await ctx()['client'].send_message(new_admin_id, "🎉 You've been made an admin of this bot!")
-            except Exception:
-                pass
-            await log_event(
-                f"👤 **New Admin Added**\n"
-                f"🆔 New Admin: `{new_admin_id}`\n"
-                f"👤 By: `{user_id}`\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-            )
-            user_states.pop(user_id, None)
-
-    elif action == "clone_bot":
-        step = state.get("step")
-
-        if step == "token":
-            token = event.message.text.strip()
-            wait = await event.respond("⏳ Validating token and setting everything up...")
-            ok, result = await validate_bot_token(token)
-            if not ok:
-                await wait.edit(f"❌ Invalid bot token: {result}\n\nSend a valid token from @BotFather, or /cancel.")
-                return
-
-            bot_username = result["username"]
-            display_name = result["display_name"]
-            owner_id = user_id  # whoever submits the token owns & administers this clone
-            fid = re.sub(r'[^a-z0-9_]', '', bot_username.lower())[:24] or f"franchise_{owner_id}"
-
-            # Guarantee a unique franchise_id even if two bots share a similar username
-            base_fid = fid
-            suffix = 1
-            while await bot_clones_col.find_one({"franchise_id": fid}):
-                suffix += 1
-                fid = f"{base_fid}{suffix}"
-
-            await bot_clones_col.insert_one({
-                "franchise_id": fid,
-                "bot_username": bot_username,
-                "owner_id": owner_id,
-                "display_name": display_name,
-                "bot_token": token,  # needed to auto-relaunch this clone if the process restarts
-                "created_at": now_ist(),
-                "created_by": user_id,
-            })
-
-            try:
-                await launch_clone(token, fid, owner_id, display_name)
-                launch_note = f"🟢 **@{bot_username} is LIVE right now** — try messaging it!"
-            except Exception as e:
-                logging.error(f"Failed to launch clone {fid}: {e}")
-                launch_note = f"⚠️ Saved, but couldn't start it live just now ({e}). It'll retry on next restart."
-
-            requester_is_admin = await is_admin(user_id)
-            if requester_is_admin:
-                completion_buttons = [
-                    [Button.inline("💰 Add Owner Balance", f"admin_franchise_credit".encode(), style="success")],
-                    [Button.inline("🔙 Franchise Menu", b"admin_cat_franchise", style="primary")]
-                ]
-                wallet_note = "💰 Wallet: ₹0 (add credit next)"
-            else:
-                completion_buttons = [[Button.inline("🔙 Back to Menu", b"main", style="primary")]]
-                support_link = await get_support_link()
-                contact = f" or contact support: {support_link}" if support_link else ""
-                wallet_note = f"💰 Wallet: ₹0 — message the bot owner to top it up{contact}"
-
-            # No file is sent here on purpose — a generated .env would carry
-            # shared platform secrets (SMM_API_KEY, MONGO_URL, API_ID/HASH),
-            # not just this owner's own token. The clone is already running
-            # in-process, so nothing needs to be handed over at all.
-            await ctx()['client'].send_message(
-                event.chat_id,
-                f"✅ **Clone Ready!**\n\n"
-                f"{launch_note}\n\n"
-                f"🤖 Bot: @{bot_username}\n"
-                f"👤 Owner/Admin: `{owner_id}` (you)\n"
-                f"🆔 Franchise ID: `{fid}`\n"
-                f"{wallet_note}\n\n"
-                f"Go set your own UPI ID, prices, and markup inside @{bot_username}'s "
-                f"own Admin Panel — it's fully independent from here on.",
-                buttons=completion_buttons
-            )
-            await log_event(
-                f"🤖 **New Clone Provisioned**\n"
-                f"🆔 Franchise: `{fid}` | @{bot_username}\n"
-                f"👤 Owner: `{owner_id}`\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-            )
-            user_states.pop(user_id, None)
-            return
-
     elif action == "smm_search":
         step = state.get("step")
         if step == "query":
@@ -4939,14 +3077,12 @@ async def handle_message(event):
             usd = await get_usd_inr()
             markup = await get_smm_markup(service.get("category", ""))
             charge = round((float(service["rate"]) / 1000) * qty * usd * markup, 2)
-            wholesale_cost = round((float(service["rate"]) / 1000) * qty * usd, 2)
 
             user = await users_col.find_one({"user_id": user_id})
             balance = user["balance"] if user else 0
 
             state["quantity"] = qty
             state["charge"] = charge
-            state["wholesale_cost"] = wholesale_cost
             state["step"] = "confirm"
 
             text = (
@@ -4968,109 +3104,9 @@ async def handle_message(event):
         await send_main_menu(event)
 
 
-# ---------- /info ----------
-@bot.on(events.NewMessage(pattern=r'^/info(?:$|\s)'))
-async def info_cmd(event):
-    set_ctx_from_event(event)
-    user_id = event.sender_id
-    if not await is_admin(user_id):
-        await event.respond("❌ Unauthorized.")
-        return
-
-    args = event.message.text.split()
-    if len(args) < 2:
-        await event.respond("⚠️ Usage: `/info <user_id>`", parse_mode='markdown')
-        return
-    try:
-        target_id = int(args[1])
-    except ValueError:
-        await event.respond("❌ Invalid user ID.")
-        return
-
-    user = await users_col.find_one({"user_id": target_id})
-    if not user:
-        await event.respond(f"❌ No record found for user `{target_id}`.", parse_mode='markdown')
-        return
-
-    display_name = await get_display_name(target_id)
-    balance = user.get("balance", 0)
-    withdrawable = user.get("withdrawable_balance", 0)
-    joined_at = user.get("joined_at")
-    joined_str = joined_at.strftime('%d/%m/%Y %H:%M') if joined_at else "N/A"
-    referred_by = user.get("referred_by")
-
-    deposits = await deposits_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
-    withdrawals = await withdrawals_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
-    orders = await orders_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
-    smm_orders = await smm_orders_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
-    adjustments = await balance_adjustments_col.find({"user_id": target_id}).sort("created_at", -1).to_list(length=None)
-
-    approved_deposits = [d for d in deposits if d.get("status") == "approved"]
-    pending_deposits = [d for d in deposits if d.get("status") == "pending"]
-    approved_withdrawals = [w for w in withdrawals if w.get("status") == "approved"]
-    pending_withdrawals = [w for w in withdrawals if w.get("status") == "pending"]
-
-    total_deposited = sum(d.get("amount", 0) for d in approved_deposits)
-    total_withdrawn = sum(w.get("amount", 0) for w in approved_withdrawals)
-    total_purchases = sum(o.get("amount", 0) for o in orders)
-    total_smm = sum(s.get("charge", 0) for s in smm_orders)
-    total_added_manual = sum(a.get("amount", 0) for a in adjustments if a.get("amount", 0) > 0)
-    total_deducted_manual = sum(-a.get("amount", 0) for a in adjustments if a.get("amount", 0) < 0)
-
-    text = (
-        f"👤 **User Info**\n"
-        f"Name: {display_name}\n"
-        f"ID: `{target_id}`\n"
-        f"Joined: {joined_str}\n"
-    )
-    if referred_by:
-        text += f"Referred by: `{referred_by}`\n"
-    text += "\n"
-    text += (
-        f"💰 **Balance:** ₹{balance}\n"
-        f"💸 **Withdrawable:** ₹{withdrawable}\n\n"
-        f"📥 **Total Deposited:** ₹{total_deposited} ({len(approved_deposits)} approved, {len(pending_deposits)} pending)\n"
-        f"📤 **Total Withdrawn:** ₹{total_withdrawn} ({len(approved_withdrawals)} approved, {len(pending_withdrawals)} pending)\n"
-        f"🛒 **Total Purchases:** ₹{total_purchases} ({len(orders)} orders)\n"
-        f"🚀 **Total SMM Spend:** ₹{total_smm} ({len(smm_orders)} orders)\n"
-        f"➕ **Manually Added:** ₹{total_added_manual} | **Manually Deducted:** ₹{total_deducted_manual} ({len(adjustments)} adjustments)\n"
-    )
-
-    combined = []
-    for d in deposits:
-        status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(d.get("status"), "❓")
-        combined.append((d["created_at"], f"{status_emoji} Deposit +₹{d.get('amount', 0)} (Txn: `{d.get('txn_id', 'N/A')}`)"))
-    for w in withdrawals:
-        status_emoji = {"pending": "🟡", "approved": "🟢", "rejected": "🔴"}.get(w.get("status"), "❓")
-        combined.append((w["created_at"], f"{status_emoji} Withdraw -₹{w.get('amount', 0)} (UPI: `{w.get('upi_id', 'N/A')}`)"))
-    for o in orders:
-        combined.append((o["created_at"], f"🛒 Purchase -₹{o.get('amount', 0)} ({o.get('phone', 'N/A')}, {o.get('country', 'N/A')})"))
-    for s in smm_orders:
-        combined.append((s["created_at"], f"📦 SMM -₹{s.get('charge', 0)} ({s.get('service_name', 'N/A')})"))
-    for a in adjustments:
-        amt = a.get("amount", 0)
-        if amt >= 0:
-            combined.append((a["created_at"], f"➕ Manual Add +₹{amt} (by admin `{a.get('admin_id', 'N/A')}`)"))
-        else:
-            combined.append((a["created_at"], f"➖ Manual Deduct -₹{abs(amt)} (by admin `{a.get('admin_id', 'N/A')}`)"))
-
-    combined.sort(key=lambda x: x[0], reverse=True)
-    combined = combined[:25]
-
-    if combined:
-        lines = [f"{dt.strftime('%d/%m/%Y %H:%M')} — {line}" for dt, line in combined]
-        text += "\n📜 **Recent Transactions (latest 25):**\n" + "\n".join(lines)
-    else:
-        text += "\n📜 No transactions yet."
-
-    for chunk_start in range(0, len(text), 4000):
-        await event.respond(text[chunk_start:chunk_start + 4000], parse_mode='markdown')
-
-
 # ---------- /start ----------
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(event):
-    set_ctx_from_event(event)
     user_id = event.sender_id
     args = event.message.text.split()
     referrer_id = None
@@ -5131,50 +3167,11 @@ async def main():
         logging.error(f"❌ Sign-in error: {e}")
         sys.exit(1)
 
-    client_contexts[bot] = master_ctx()
-
-    # Razorpay auto-approval webhook (harmless to start even if no Razorpay
-    # keys are configured yet — it just won't have a matching secret to
-    # verify against until an admin sets one via the bot).
-    try:
-        await start_webhook_server()
-    except Exception as e:
-        logging.error(f"❌ Could not start Razorpay webhook server: {e}")
-
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests,
-                              await get_all_admin_ids(), client_resolver=get_client_for_scope)
+    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests, ADMIN_IDS)
     await acc_mgr.load_all()
-
-    # Bring every previously-created clone back online, live, in THIS SAME
-    # process — so a restart doesn't take any franchise bot offline.
-    if not IS_FRANCHISE:
-        launched = 0
-        async for clone in bot_clones_col.find({}):
-            token = clone.get("bot_token")
-            fid = clone.get("franchise_id")
-            if not token:
-                logging.warning(f"Clone '{fid}' has no stored token (created before "
-                                 f"auto-launch support) — skipping. Re-run Clone Bot to fix.")
-                continue
-            try:
-                await launch_clone(token, fid, clone["owner_id"], clone["display_name"])
-                launched += 1
-            except Exception as e:
-                logging.error(f"❌ Failed to launch clone '{fid}': {e}")
-        if launched:
-            logging.info(f"🤖 Launched {launched} clone bot(s) live alongside the master bot.")
-
     logging.info("🚀 Bot started successfully...")
-
-    # Block forever rather than exiting when just the master's connection has
-    # a hiccup — Telethon auto-reconnects individual clients on transient
-    # network issues, so one client's blip shouldn't take every clone down
-    # with it. Only an external stop (Ctrl+C, systemd, etc.) ends the process.
-    try:
-        await asyncio.Event().wait()
-    except asyncio.CancelledError:
-        pass
+    await bot.run_until_disconnected()
 
 if __name__ == '__main__':
     asyncio.run(main())
