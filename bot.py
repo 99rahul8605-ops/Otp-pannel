@@ -426,7 +426,7 @@ async def razorpay_create_qr(amount: float, dep_id, user_id: int, scope_id: str)
     }
     try:
         async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(f"{RAZORPAY_API_BASE}/qr_codes", json=payload,
+            async with s.post(f"{RAZORPAY_API_BASE}/payments/qr_codes", json=payload,
                                timeout=aiohttp.ClientTimeout(total=15)) as r:
                 body = await r.json()
                 if r.status not in (200, 201):
@@ -448,7 +448,7 @@ async def razorpay_close_qr(qr_id: str):
         return
     try:
         async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as s:
-            async with s.post(f"{RAZORPAY_API_BASE}/qr_codes/{qr_id}/close",
+            async with s.post(f"{RAZORPAY_API_BASE}/payments/qr_codes/{qr_id}/close",
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status not in (200, 201):
                     logging.warning(f"Razorpay QR close failed [{r.status}] for {qr_id}: {await r.text()}")
