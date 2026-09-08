@@ -2371,6 +2371,47 @@ async def callback_handler(event):
             await event.answer()
             return
 
+
+        if data == "deposit_method_auto":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "deposit" or not state.get("amount"):
+                await event.answer("Deposit session expired. Start again.", alert=True)
+                return
+
+            amount = float(state["amount"])
+            razorpay_ready = bool(await get_razorpay_key_id()) and bool(await get_razorpay_key_secret())
+            if not razorpay_ready:
+                await event.answer("Razorpay is not configured. Use Manual Deposit.", alert=True)
+                return
+
+            await event.edit(
+                "⏳ Creating secure Razorpay payment...",
+                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
+            )
+            await start_razorpay_auto_deposit(event, user_id, amount)
+            user_states.pop(user_id, None)
+            await event.answer()
+            return
+
+        if data == "deposit_method_manual":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "deposit" or not state.get("amount"):
+                await event.answer("Deposit session expired. Start again.", alert=True)
+                return
+
+            amount = float(state["amount"])
+            if not await get_upi_id():
+                await event.answer("Manual UPI deposit is not configured.", alert=True)
+                return
+
+            await event.edit(
+                "📲 Generating manual UPI QR...",
+                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
+            )
+            await start_manual_deposit(event, user_id, amount)
+            await event.answer()
+            return
+
         if data.startswith("cancel_my_deposit_"):
             dep_id = data[len("cancel_my_deposit_"):]
             dep = await deposits_col.find_one({"_id": ObjectId(dep_id)})
@@ -2404,12 +2445,24 @@ async def callback_handler(event):
                 except Exception as e:
                     logging.error(f"Could not disable admin deposit message: {e}")
 
-            await event.edit(
+            # Remove the user's Razorpay QR / Payment Link message completely.
+            # This callback is attached to that payment message, so deleting the
+            # callback message makes the QR/media disappear instead of merely
+            # replacing its caption/text.
+            await event.answer("✅ Deposit cancelled.")
+            try:
+                await event.delete()
+            except Exception as e:
+                logging.warning(f"Could not delete cancelled deposit message: {e}")
+
+            await ctx()['client'].send_message(
+                event.chat_id,
                 "✅ **Deposit cancelled.** You can now submit a new one.",
-                buttons=[[Button.inline("💳 New Deposit", b"deposit", style="success")],
-                         [Button.inline("🔙 Main Menu", b"main", style="primary")]]
+                buttons=[
+                    [Button.inline("💳 New Deposit", b"deposit", style="success")],
+                    [Button.inline("🔙 Main Menu", b"main", style="primary")]
+                ]
             )
-            await event.answer()
             cancel_name = await get_display_name(user_id)
             await log_event(
                 f"🚫 **Deposit Cancelled by User**\n"
@@ -4448,6 +4501,56 @@ async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float
             pass
 
 
+
+async def start_manual_deposit(event, user_id: int, amount: float):
+    """Static UPI QR + screenshot + admin approval fallback/manual option."""
+    state = user_states.setdefault(user_id, {"action": "deposit"})
+    state["action"] = "deposit"
+    state["amount"] = amount
+
+    txn_id = f"DEP{datetime.now().strftime('%y%m%d%H%M')}{random.randint(1000,9999)}"
+    state["txn_id"] = txn_id
+
+    upi_id = await get_upi_id()
+    payee_name = await get_payee_name()
+    if not upi_id:
+        msg = "❌ Manual deposits aren't set up yet — the bot owner needs to set a UPI ID first."
+        if await is_admin(user_id):
+            msg += "\n\nGo to Admin Panel → Finance & Transactions → Set UPI ID."
+        await event.respond(
+            msg,
+            buttons=[[Button.inline("🔙 Back", b"main", style="danger")]]
+        )
+        user_states.pop(user_id, None)
+        return
+
+    upi_string = f"upi://pay?pa={upi_id}&pn={payee_name}&am={amount}&tn={txn_id}"
+    img = qrcode.make(upi_string)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    buf.name = "manual_upi_qr.png"
+
+    caption = (
+        f"💳 **Manual Deposit ₹{amount}**\n"
+        f"🔑 **Txn ID:** `{txn_id}`\n\n"
+        f"📌 **Mention this Txn ID in the payment note if possible.**\n\n"
+        f"1️⃣ Scan the QR and complete payment.\n"
+        f"2️⃣ Send the payment screenshot here.\n"
+        f"3️⃣ An admin will verify and approve it manually."
+    )
+
+    await ctx()["client"].send_file(
+        event.chat_id,
+        buf,
+        caption=caption,
+        force_document=False,
+        buttons=[[Button.inline("❌ Cancel", b"goto_main_new", style="danger")]],
+    )
+    state["step"] = "screenshot"
+
+
+
 async def process_deposit_step(event):
     user_id = event.sender_id
     state = user_states.get(user_id)
@@ -4464,42 +4567,46 @@ async def process_deposit_step(event):
             return
         state["amount"] = amount
 
-        razorpay_key_id = await get_razorpay_key_id()
-        razorpay_key_secret = await get_razorpay_key_secret()
-        if razorpay_key_id and razorpay_key_secret:
-            await start_razorpay_auto_deposit(event, user_id, amount)
+        razorpay_ready = bool(await get_razorpay_key_id()) and bool(await get_razorpay_key_secret())
+        manual_ready = bool(await get_upi_id())
+
+        buttons = []
+        if razorpay_ready:
+            buttons.append([
+                Button.inline("⚡ Razorpay Auto Pay", b"deposit_method_auto", style="success")
+            ])
+        if manual_ready:
+            buttons.append([
+                Button.inline("📲 Manual UPI + Screenshot", b"deposit_method_manual", style="primary")
+            ])
+        buttons.append([Button.inline("🔙 Cancel", b"main", style="danger")])
+
+        if not razorpay_ready and not manual_ready:
+            await event.respond(
+                "❌ No deposit method is configured right now.",
+                buttons=buttons
+            )
             user_states.pop(user_id, None)
             return
 
-        # ---- Fallback: static UPI QR + manual screenshot + admin approval ----
-        txn_id = f"DEP{datetime.now().strftime('%y%m%d%H%M')}{random.randint(1000,9999)}"
-        state["txn_id"] = txn_id
-
-        upi_id = await get_upi_id()
-        payee_name = await get_payee_name()
-        if not upi_id:
-            msg = "❌ Deposits aren't set up yet — the bot owner needs to set a UPI ID first."
-            if await is_admin(user_id):
-                msg += "\n\nGo to Admin Panel → Finance & Transactions → Set UPI ID."
-            await event.respond(msg, buttons=[[Button.inline("🔙 Back", b"main", style="danger")]])
-            user_states.pop(user_id, None)
-            return
-
-        upi_string = f"upi://pay?pa={upi_id}&pn={payee_name}&am={amount}&tn={txn_id}"
-        img = qrcode.make(upi_string)
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        buf.name = "qr_code.png"
-        caption = (
-            f"💳 **Deposit ₹{amount}**\n"
-            f"🔑 **Txn ID:** `{txn_id}`\n\n"
-            f"📌 **Mention this Txn ID in payment note.**\n\n"
-            f"Scan the QR code to pay.\n\n"
-            "Send screenshot after payment."
+        state["step"] = "choose_method"
+        await event.respond(
+            f"💳 **Deposit ₹{amount}**\n\n"
+            f"Choose payment method:\n\n"
+            f"⚡ **Razorpay Auto Pay** — automatic confirmation and balance credit.\n"
+            f"📲 **Manual UPI** — pay via UPI QR, then send screenshot for admin approval.",
+            buttons=buttons
         )
-        await ctx()['client'].send_file(event.chat_id, buf, caption=caption, buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
-        state["step"] = "screenshot"
+    elif step == "choose_method":
+        await event.respond(
+            "👇 Please choose a payment method using the buttons above.",
+            buttons=[
+                [Button.inline("⚡ Razorpay Auto Pay", b"deposit_method_auto", style="success")],
+                [Button.inline("📲 Manual UPI + Screenshot", b"deposit_method_manual", style="primary")],
+                [Button.inline("🔙 Cancel", b"main", style="danger")],
+            ]
+        )
+        return
     elif step == "screenshot":
         if not event.message.photo:
             await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
