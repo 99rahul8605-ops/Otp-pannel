@@ -4260,11 +4260,28 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
 
         try:
             if image_url:
+                # Fetch the QR image first and send it as Telegram photo/media,
+                # not as a document attachment.
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        image_url,
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as r:
+                        if r.status != 200:
+                            raise RuntimeError(
+                                f"Could not download Razorpay QR image: HTTP {r.status}"
+                            )
+                        qr_bytes = await r.read()
+
+                qr_file = io.BytesIO(qr_bytes)
+                qr_file.name = f"razorpay_qr_{dep_id}.png"
+
                 await ctx()["client"].send_file(
                     event.chat_id,
-                    image_url,
+                    qr_file,
                     caption=caption,
                     buttons=buttons,
+                    force_document=False,
                 )
             elif short_url:
                 await event.respond(caption + f"\n\n🔗 {short_url}", buttons=buttons)
