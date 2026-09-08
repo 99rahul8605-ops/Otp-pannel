@@ -6,7 +6,7 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None):
+    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None, client_resolver=None):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
@@ -14,6 +14,18 @@ class AccountManager:
         self.clients = {}
         self.pending_requests = pending_requests
         self.admin_ids = admin_ids or []
+        # Optional callable: scope_id (str, "master" or a franchise_id) -> TelegramClient.
+        # Lets OTPs be delivered via the SAME bot the customer actually bought
+        # the account through, instead of always the master bot.
+        self.client_resolver = client_resolver
+
+    def _resolve_client(self, scope_id):
+        if self.client_resolver:
+            try:
+                return self.client_resolver(scope_id)
+            except Exception:
+                pass
+        return self.bot
 
     async def add_client(self, phone, session_str):
         if phone in self.clients:
@@ -80,6 +92,18 @@ class AccountManager:
                 buyer_id = buyer_doc["buyer_id"] if buyer_doc else None
 
                 if buyer_id:
+                    key = (buyer_id, phone)
+                    is_first_otp = not buyer_doc.get("first_otp_sent", False)
+
+                    # First OTP after purchase delivers automatically. Every
+                    # OTP after that only goes out if the buyer explicitly
+                    # clicked "Request New OTP" — otherwise it's silently
+                    # dropped (still consumed from Telegram, just not forwarded).
+                    if not is_first_otp and key not in self.pending_requests:
+                        logging.info(f"Suppressed unrequested OTP for {buyer_id} / {phone} "
+                                     f"(no pending request on file).")
+                        return
+
                     msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
                     twofa_password = buyer_doc.get("twofa_password")
                     if twofa_password:
@@ -89,15 +113,22 @@ class AccountManager:
                     # 🔥 Both buttons: Request New OTP & Logout from Bot
                     buttons = [[
                         Button.inline("🔄 Request New OTP", f"resend_{phone}"),
-                        Button.inline("📱 Manage Sessions", f"sessions_{phone}")
+                        Button.inline("📱 Manage Sessions", f"open_sessions_{phone}")
                     ]]
 
+                    sold_via = buyer_doc.get("sold_via_franchise_id", "master")
+                    deliver_client = self._resolve_client(sold_via)
                     try:
-                        await self.bot.send_message(buyer_id, msg, buttons=buttons)
+                        await deliver_client.send_message(buyer_id, msg, buttons=buttons)
                     except Exception as e:
-                        logging.error(f"Failed to send OTP to {buyer_id}: {e}")
+                        logging.error(f"Failed to send OTP to {buyer_id} via {sold_via}: {e}")
 
-                    key = (buyer_id, phone)
+                    if is_first_otp:
+                        await self.accounts_col.update_one(
+                            {"_id": buyer_doc["_id"]},
+                            {"$set": {"first_otp_sent": True}}
+                        )
+
                     if key in self.pending_requests:
                         del self.pending_requests[key]
                         logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
