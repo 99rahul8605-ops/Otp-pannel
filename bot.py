@@ -977,6 +977,27 @@ def _vnh_trim_label(text_value: str, max_len: int = 20) -> str:
     return text_value[: max_len - 1] + "…"
 
 
+def _vnh_country_label(name: str, code: str) -> str:
+    """Show the country's own flag at the START instead of the generic globe."""
+    name = str(name or code or "").strip()
+
+    flag_match = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", name)
+    if flag_match:
+        flag = flag_match.group(0)
+        clean_name = (name[:flag_match.start()] + name[flag_match.end():]).strip()
+        return f"{flag} {clean_name}"
+
+    code = str(code or "").strip().upper()
+    if len(code) == 2 and code.isalpha():
+        try:
+            flag = "".join(chr(127397 + ord(ch)) for ch in code)
+            return f"{flag} {name}"
+        except Exception:
+            pass
+
+    return name
+
+
 async def _build_vnh_rows_from_items(items):
     rows = []
     for item in items:
@@ -995,7 +1016,11 @@ async def _build_vnh_rows_from_items(items):
 
         cb = f"vnh_country_{code}".encode()
         rows.append([
-            Button.inline(f"🌍 {_vnh_trim_label(name, 20)}", cb, style="primary"),
+            Button.inline(
+                _vnh_trim_label(_vnh_country_label(name, code), 20),
+                cb,
+                style="primary",
+            ),
             Button.inline(final_price, cb, style="primary"),
             Button.inline(f"[{qty}]✅", cb, style="primary"),
         ])
@@ -2285,7 +2310,18 @@ async def callback_handler(event):
                 return
 
             await event.edit(
-                "🛒 **Buy Account**\n\nChoose a server:",
+                "🛒 **Buy Account**\n\n"
+                "Choose your preferred server:\n\n"
+                "🟢 **Server 1 — Private Stock**\n"
+                "• Cheapest option\n"
+                "• Directly managed private stock\n"
+                "• Limited stock may vary by country\n\n"
+                "🟠 **Server 2 — External Server**\n"
+                "• Accounts are sourced from a third-party server\n"
+                "• More countries and stock may be available\n"
+                "• Price depends on live server rates\n"
+                "• Third-party terms apply\n\n"
+                "Select a server below to continue.",
                 buttons=buttons,
             )
             await event.answer()
