@@ -6,7 +6,17 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None, client_resolver=None):
+    def __init__(
+        self,
+        accounts_col,
+        bot_client,
+        api_id,
+        api_hash,
+        pending_requests,
+        admin_ids=None,
+        client_resolver=None,
+        otp_sent_notifier=None,
+    ):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
@@ -14,6 +24,7 @@ class AccountManager:
         self.clients = {}
         self.pending_requests = pending_requests
         self.admin_ids = admin_ids or []
+        self.otp_sent_notifier = otp_sent_notifier
         # Optional callable: scope_id (str, "master" or a franchise_id) -> TelegramClient.
         # Lets OTPs be delivered via the SAME bot the customer actually bought
         # the account through, instead of always the master bot.
@@ -118,10 +129,28 @@ class AccountManager:
 
                     sold_via = buyer_doc.get("sold_via_franchise_id", "master")
                     deliver_client = self._resolve_client(sold_via)
+                    otp_delivered = False
                     try:
                         await deliver_client.send_message(buyer_id, msg, buttons=buttons)
+                        otp_delivered = True
                     except Exception as e:
                         logging.error(f"Failed to send OTP to {buyer_id} via {sold_via}: {e}")
+
+                    if otp_delivered and self.otp_sent_notifier:
+                        try:
+                            await self.otp_sent_notifier(
+                                scope_id=sold_via,
+                                buyer_id=buyer_id,
+                                phone=phone,
+                                otp=otp,
+                                server_name="Server 1",
+                                country=buyer_doc.get("country", "N/A"),
+                                is_refresh=not is_first_otp,
+                            )
+                        except Exception as e:
+                            logging.error(
+                                f"Failed to send OTP-owner notification for {buyer_id} / {phone}: {e}"
+                            )
 
                     if is_first_otp:
                         await self.accounts_col.update_one(
