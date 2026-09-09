@@ -889,52 +889,113 @@ vnh_server = VNHServer(
 )
 
 
-async def build_vnh_country_menu(page: int = 0):
-    countries = await vnh_server.available_countries()
+
+def _vnh_trim_label(text_value: str, max_len: int = 20) -> str:
+    text_value = str(text_value or "").strip()
+    if len(text_value) <= max_len:
+        return text_value
+    return text_value[: max_len - 1] + "…"
+
+
+async def _build_vnh_rows_from_items(items):
+    rows = []
+    for item in items:
+        code = str(item.get("code", "")).upper()
+        name = str(item.get("name", code)).strip()
+        qty = item.get("qty", 0)
+        supplier_price = item.get("price")
+
+        final_price = "₹--"
+        try:
+            if supplier_price is not None:
+                pricing = await vnh_server.calculate_price(float(supplier_price))
+                final_price = f"₹{pricing['retail_inr']}"
+        except Exception:
+            final_price = "₹--"
+
+        cb = f"vnh_country_{code}".encode()
+        rows.append([
+            Button.inline(f"🌍 {_vnh_trim_label(name, 20)}", cb, style="primary"),
+            Button.inline(final_price, cb, style="primary"),
+            Button.inline(f"[{qty}]✅", cb, style="primary"),
+        ])
+    return rows
+
+
+async def build_vnh_country_menu(page: int = 0, countries=None, title: str = "🛍️ **Available Telegram Services**"):
+    if countries is None:
+        countries = await vnh_server.available_countries()
     if not countries:
         return None, None
 
-    per_page = 10
+    per_page = 8
     total_pages = max(1, (len(countries) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     chunk = countries[page * per_page:(page + 1) * per_page]
 
-    buttons = [
-        [
-            Button.inline(
-                f"🌍 {item['name']} ({item['code']})",
-                f"vnh_country_{item['code']}".encode(),
-                style="primary",
-            )
-        ]
-        for item in chunk
-    ]
+    buttons = [[
+        Button.inline("🌍 Country", b"vnh_noop", style="primary"),
+        Button.inline("💰 Price", b"vnh_noop", style="primary"),
+        Button.inline("📦 Stock", b"vnh_noop", style="primary"),
+    ]]
+
+    buttons.extend(await _build_vnh_rows_from_items(chunk))
 
     nav = []
     if page > 0:
-        nav.append(
-            Button.inline(
-                "⬅️ Prev",
-                f"vnh_countries_{page-1}".encode(),
-                style="primary",
-            )
-        )
+        nav.append(Button.inline("⬅️ Prev", f"vnh_countries_{page-1}".encode(), style="primary"))
     if page < total_pages - 1:
-        nav.append(
-            Button.inline(
-                "Next ➡️",
-                f"vnh_countries_{page+1}".encode(),
-                style="primary",
-            )
-        )
+        nav.append(Button.inline("Next ➡️", f"vnh_countries_{page+1}".encode(), style="primary"))
     if nav:
         buttons.append(nav)
 
+    buttons.append([Button.inline("🔎 Search Country", b"vnh_search_country", style="success")])
     buttons.append([Button.inline("🔙 Servers", b"buy", style="primary")])
 
     text_msg = (
-        "🌐 **VNH Server**\n\n"
-        "Choose a country. Price is fetched live from the supplier.\n"
+        f"{title}\n\n"
+        "Choose any country row to continue.\n"
+        f"Page {page+1}/{total_pages}"
+    )
+    return text_msg, buttons
+
+
+async def build_vnh_search_results_menu(user_id: int, page: int = 0):
+    state = user_states.get(user_id, {})
+    query = str(state.get("query", "")).strip()
+    countries = state.get("matches", [])
+    if not countries:
+        return None, None
+
+    per_page = 8
+    total_pages = max(1, (len(countries) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = countries[page * per_page:(page + 1) * per_page]
+
+    buttons = [[
+        Button.inline("🌍 Country", b"vnh_noop", style="primary"),
+        Button.inline("💰 Price", b"vnh_noop", style="primary"),
+        Button.inline("📦 Stock", b"vnh_noop", style="primary"),
+    ]]
+    buttons.extend(await _build_vnh_rows_from_items(chunk))
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"vnh_search_page_{page-1}".encode(), style="primary"))
+    if page < total_pages - 1:
+        nav.append(Button.inline("Next ➡️", f"vnh_search_page_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([
+        Button.inline("🔎 New Search", b"vnh_search_country", style="success"),
+        Button.inline("📋 All Countries", b"buy_vnh", style="primary"),
+    ])
+    buttons.append([Button.inline("🔙 Servers", b"buy", style="primary")])
+
+    text_msg = (
+        f"🔎 **Search Results** for `{query}`\n\n"
+        "Choose any country row to continue.\n"
         f"Page {page+1}/{total_pages}"
     )
     return text_msg, buttons
@@ -2126,12 +2187,12 @@ async def callback_handler(event):
 
             if manual_count > 0:
                 buttons.append([
-                    Button.inline("📦 Manual Stock", b"buy_manual", style="primary")
+                    Button.inline("Server 1", b"buy_manual", style="primary")
                 ])
 
             if vnh_server.configured:
                 buttons.append([
-                    Button.inline("🌐 VNH Server", b"buy_vnh", style="success")
+                    Button.inline("Server 2", b"buy_vnh", style="success")
                 ])
 
             buttons.append([Button.inline("🔙 Back", b"main", style="primary")])
@@ -2172,6 +2233,31 @@ async def callback_handler(event):
             await event.answer()
             return
 
+        if data == "vnh_noop":
+            await event.answer("Select a country row.", alert=False)
+            return
+
+        if data == "vnh_search_country":
+            if not vnh_server.configured:
+                await event.answer("❌ Server 2 is not configured.", alert=True)
+                return
+
+            user_states[user_id] = {
+                "action": "vnh_search_country",
+                "step": "await_query",
+            }
+            await event.edit(
+                "🔎 **Search Country**\n\n"
+                "Send country name or country code.\n"
+                "Examples: `India`, `IN`, `Bangladesh`, `US`",
+                buttons=[
+                    [Button.inline("📋 Back to All Countries", b"buy_vnh", style="primary")],
+                    [Button.inline("🔙 Servers", b"buy", style="danger")],
+                ],
+            )
+            await event.answer()
+            return
+
         if data == "buy_vnh":
             if not vnh_server.configured:
                 await event.answer("❌ VNH server is not configured.", alert=True)
@@ -2198,6 +2284,21 @@ async def callback_handler(event):
             msg, buttons = await build_vnh_country_menu(page)
             if not buttons:
                 await event.answer("❌ VNH server unavailable.", alert=True)
+                return
+
+            await event.edit(msg, buttons=buttons)
+            await event.answer()
+            return
+
+        if data.startswith("vnh_search_page_"):
+            try:
+                page = int(data.rsplit("_", 1)[1])
+            except Exception:
+                page = 0
+
+            msg, buttons = await build_vnh_search_results_menu(user_id, page)
+            if not buttons:
+                await event.answer("❌ Search results expired. Search again.", alert=True)
                 return
 
             await event.edit(msg, buttons=buttons)
@@ -5465,6 +5566,39 @@ async def handle_message(event):
             await event.respond(f"✅ Account markup set to {val}x.",
                                  buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]])
             user_states.pop(user_id, None)
+
+    elif action == "vnh_search_country":
+        if state.get("step") == "await_query":
+            query = event.message.text.strip()
+            countries = await vnh_server.available_countries(force=True)
+
+            q = query.casefold()
+            matches = []
+            for item in countries:
+                name = str(item.get("name", "")).casefold()
+                code = str(item.get("code", "")).casefold()
+                if q in name or q in code:
+                    matches.append(item)
+
+            if not matches:
+                await event.respond(
+                    f"❌ No country found for `{query}`.",
+                    buttons=[
+                        [Button.inline("🔎 Search Again", b"vnh_search_country", style="success")],
+                        [Button.inline("📋 All Countries", b"buy_vnh", style="primary")],
+                    ],
+                )
+                return
+
+            user_states[user_id] = {
+                "action": "vnh_search_results",
+                "query": query,
+                "matches": matches,
+            }
+
+            msg, buttons = await build_vnh_search_results_menu(user_id, 0)
+            await event.respond(msg, buttons=buttons)
+            return
 
     elif action == "set_vnh_markup":
         if state.get("step") == "await_value":
