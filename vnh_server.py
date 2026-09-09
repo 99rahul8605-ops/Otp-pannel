@@ -43,6 +43,8 @@ class VNHServer:
 
     @staticmethod
     def ok(data) -> bool:
+        if isinstance(data, list):
+            return len(data) > 0 and data[0] is True
         if not isinstance(data, dict):
             return False
         if data.get("success") is True:
@@ -109,20 +111,77 @@ class VNHServer:
             return self._country_cache["items"]
 
         result = await self._get("/tg/available_countries")
-        if not self.ok(result):
+
+        # VNH currently returns:
+        # [true, {"BD": {...}, "IN": {...}, ...}]
+        # Keep compatibility with dict-style responses too.
+        raw = None
+
+        if isinstance(result, list):
+            if len(result) >= 2 and result[0] is True:
+                raw = result[1]
+            else:
+                return []
+
+        elif isinstance(result, dict):
+            if not self.ok(result):
+                return []
+            raw = result.get("data", result)
+
+        else:
             return []
 
-        raw = result.get("data", [])
-        if isinstance(raw, dict):
-            raw = raw.get("countries", [])
-
         countries = []
-        if isinstance(raw, list):
+
+        # Current VNH format: dict keyed by country code
+        if isinstance(raw, dict):
+            # Sometimes APIs may nest it under "countries".
+            if "countries" in raw and isinstance(raw["countries"], (dict, list)):
+                raw = raw["countries"]
+
+            if isinstance(raw, dict):
+                for key, item in raw.items():
+                    if not isinstance(item, dict):
+                        continue
+
+                    code = str(
+                        item.get("code")
+                        or item.get("country_code")
+                        or key
+                        or ""
+                    ).strip().upper()
+
+                    name = str(
+                        item.get("name")
+                        or item.get("country")
+                        or code
+                    ).strip()
+
+                    qty = item.get("qty", 0)
+                    price = item.get("price")
+
+                    if code:
+                        countries.append({
+                            "code": code,
+                            "name": name or code,
+                            "qty": qty,
+                            "price": price,
+                            "code_num": item.get("code_Num"),
+                        })
+
+        # Compatibility with list-style country payloads
+        elif isinstance(raw, list):
             for item in raw:
                 if isinstance(item, str):
                     code = item.strip().upper()
                     if code:
-                        countries.append({"code": code, "name": code})
+                        countries.append({
+                            "code": code,
+                            "name": code,
+                            "qty": 0,
+                            "price": None,
+                            "code_num": None,
+                        })
                     continue
 
                 if not isinstance(item, dict):
@@ -142,7 +201,13 @@ class VNHServer:
                 ).strip()
 
                 if code:
-                    countries.append({"code": code, "name": name or code})
+                    countries.append({
+                        "code": code,
+                        "name": name or code,
+                        "qty": item.get("qty", 0),
+                        "price": item.get("price"),
+                        "code_num": item.get("code_Num"),
+                    })
 
         self._country_cache = {"ts": now, "items": countries}
         return countries
