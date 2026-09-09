@@ -2523,19 +2523,42 @@ async def callback_handler(event):
             return
 
         if data.startswith("vnh_otp_"):
-            order_id = data.split("vnh_otp_", 1)[1]
+            order_id = data.split("vnh_otp_", 1)[1].strip()
 
             try:
-                order = await orders_col.find_one({
-                    "_id": ObjectId(order_id),
-                    "user_id": user_id,
-                    "source": "vnh",
-                })
-            except Exception:
+                oid = ObjectId(order_id)
+                # Fetch by _id first. Older/newer records may not always contain
+                # exactly the same optional metadata fields.
+                order = await orders_col.find_one({"_id": oid})
+            except Exception as e:
+                logging.error(f"VNH OTP invalid order id {order_id}: {e}")
                 order = None
 
             if not order:
-                await event.answer("❌ Order not found.", alert=True)
+                logging.warning(
+                    f"VNH OTP order not found: order_id={order_id}, user_id={user_id}"
+                )
+                await event.answer("❌ Order not found. Please contact admin.", alert=True)
+                return
+
+            # Ownership check, tolerant of int/string user_id storage.
+            stored_uid = order.get("user_id")
+            if str(stored_uid) != str(user_id):
+                logging.warning(
+                    f"VNH OTP ownership mismatch: order_id={order_id}, "
+                    f"stored_uid={stored_uid}, callback_uid={user_id}"
+                )
+                await event.answer("❌ This order does not belong to you.", alert=True)
+                return
+
+            # Keep compatibility with orders created before the `source` field
+            # was added. Reject only when a different source is explicitly set.
+            order_source = order.get("source")
+            if order_source not in (None, "", "vnh"):
+                logging.warning(
+                    f"VNH OTP source mismatch: order_id={order_id}, source={order_source}"
+                )
+                await event.answer("❌ Invalid order type.", alert=True)
                 return
 
             phone = order.get("phone", "")
