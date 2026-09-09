@@ -2126,12 +2126,12 @@ async def callback_handler(event):
 
             if manual_count > 0:
                 buttons.append([
-                    Button.inline("📦 Manual Stock", b"buy_manual", style="primary")
+                    Button.inline("Server 1", b"buy_manual", style="primary")
                 ])
 
             if vnh_server.configured:
                 buttons.append([
-                    Button.inline("🌐 VNH Server", b"buy_vnh", style="success")
+                    Button.inline("Server 2", b"buy_vnh", style="success")
                 ])
 
             buttons.append([Button.inline("🔙 Back", b"main", style="primary")])
