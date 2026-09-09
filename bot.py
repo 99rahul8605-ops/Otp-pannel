@@ -2260,13 +2260,13 @@ async def callback_handler(event):
 
         if data == "buy_vnh":
             if not vnh_server.configured:
-                await event.answer("❌ VNH server is not configured.", alert=True)
+                await event.answer("❌ Server 2 is not configured.", alert=True)
                 return
 
             msg, buttons = await build_vnh_country_menu(0)
             if not buttons:
                 await event.answer(
-                    "❌ VNH server is unavailable or has no countries right now.",
+                    "❌ Server 2 is temporarily unavailable.",
                     alert=True,
                 )
                 return
@@ -2283,7 +2283,7 @@ async def callback_handler(event):
 
             msg, buttons = await build_vnh_country_menu(page)
             if not buttons:
-                await event.answer("❌ VNH server unavailable.", alert=True)
+                await event.answer("❌ Server 2 is temporarily unavailable.", alert=True)
                 return
 
             await event.edit(msg, buttons=buttons)
@@ -2311,7 +2311,7 @@ async def callback_handler(event):
             pricing = await vnh_server.get_country_live_price(country_code)
             if not pricing.get("success"):
                 await event.answer(
-                    f"❌ {pricing.get('message', 'Could not fetch live price')}",
+                    "❌ Server 2 is temporarily unavailable. Please try again later.",
                     alert=True,
                 )
                 return
@@ -2332,19 +2332,25 @@ async def callback_handler(event):
             }
 
             await event.edit(
-                f"🌐 **VNH Server**\n\n"
+                f"🌐 **Server 2**\n\n"
                 f"🌍 Country: **{country_name} ({country_code})**\n"
                 f"💰 Price: **₹{pricing['retail_inr']}**\n\n"
-                "After confirmation, VNH will reserve a number immediately.",
+                "⚠️ **Terms & Conditions**\n"
+                "• This account is being purchased from a third-party server.\n"
+                "• We do not have access to or control over the account after delivery.\n"
+                "• In case of account loss, logout, ban, recovery, or future access issues, "
+                "we will not be responsible.\n"
+                "• Please proceed only if you understand and accept these conditions.\n\n"
+                "By clicking **I Agree & Proceed**, you accept the above Terms & Conditions.",
                 buttons=[
                     [
                         Button.inline(
-                            "✅ Confirm Purchase",
+                            "✅ I Agree & Proceed",
                             b"vnh_confirm_purchase",
                             style="success",
                         )
                     ],
-                    [Button.inline("🔙 Back", b"buy_vnh", style="primary")],
+                    [Button.inline("❌ Cancel", b"buy_vnh", style="danger")],
                 ],
             )
             await event.answer()
@@ -2366,7 +2372,7 @@ async def callback_handler(event):
             pricing = await vnh_server.get_country_live_price(country_code)
             if not pricing.get("success"):
                 await event.answer(
-                    f"❌ {pricing.get('message', 'Supplier unavailable')}",
+                    "❌ Server 2 is temporarily unavailable. Please try again later.",
                     alert=True,
                 )
                 return
@@ -2413,11 +2419,20 @@ async def callback_handler(event):
                 )
                 return
 
-            await event.edit("⏳ Reserving a number from VNH Server...")
+            await event.edit("⏳ Reserving a number from Server 2...")
 
             order_response = await vnh_server.place_order(country_code)
 
             if not vnh_server.ok(order_response):
+                # Never expose supplier/provider errors to customers.
+                # This also covers insufficient supplier balance.
+                logging.error(
+                    "Server 2 supplier order failed for user=%s country=%s response=%r",
+                    user_id,
+                    country_code,
+                    order_response,
+                )
+
                 await users_col.update_one(
                     {"user_id": user_id},
                     {"$inc": {"balance": retail_price}},
@@ -2426,11 +2441,10 @@ async def callback_handler(event):
                 user_states.pop(user_id, None)
 
                 await event.edit(
-                    f"❌ VNH order failed: "
-                    f"{order_response.get('message', 'Unknown supplier error')}\n\n"
+                    "❌ **Something went wrong. Please contact admin.**\n\n"
                     f"₹{retail_price} has been returned to your bot balance.",
                     buttons=[
-                        [Button.inline("🔙 Buy Again", b"buy_vnh", style="primary")]
+                        [Button.inline("🔙 Back", b"buy", style="primary")]
                     ],
                 )
                 return
@@ -2457,7 +2471,7 @@ async def callback_handler(event):
                 )
 
                 await event.edit(
-                    "❌ Supplier returned an incomplete order. "
+                    "❌ **Something went wrong. Please contact admin.**\n\n"
                     "Your bot balance was refunded.",
                     buttons=[
                         [Button.inline("🔙 Main Menu", b"main", style="primary")]
@@ -2565,8 +2579,14 @@ async def callback_handler(event):
             otp_response = await vnh_server.get_code(phone)
 
             if not vnh_server.ok(otp_response):
+                logging.warning(
+                    "Server 2 OTP fetch failed for order=%s phone=%s response=%r",
+                    order_id,
+                    phone,
+                    otp_response,
+                )
                 await event.answer(
-                    f"⏳ {otp_response.get('message', 'OTP not ready yet. Try again.')}",
+                    "⏳ OTP is not available yet. Please try again shortly.",
                     alert=True,
                 )
                 return
@@ -3504,7 +3524,7 @@ async def callback_handler(event):
                 # their own retail markup on top of it.
                 btns = [
                     [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
-                    [Button.inline("🌐 Set VNH Server Markup", b"admin_vnh_markup", style="primary")],
+                    [Button.inline("🌐 Set Server 2 Markup", b"admin_vnh_markup", style="primary")],
                     [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
                 ]
                 await event.edit(
@@ -3521,7 +3541,7 @@ async def callback_handler(event):
                 [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock", style="success")],
                 [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
                 [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
-                [Button.inline("🌐 Set VNH Server Markup", b"admin_vnh_markup", style="primary")],
+                [Button.inline("🌐 Set Server 2 Markup", b"admin_vnh_markup", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("📦 **Accounts & Stock**", buttons=btns)
@@ -3576,7 +3596,7 @@ async def callback_handler(event):
             }
 
             await event.edit(
-                f"🌐 **VNH Server Settings**\n\n"
+                f"🌐 **Server 2 Settings**\n\n"
                 f"Status: {api_status}{balance_line}\n"
                 f"Current markup: **{current_markup}%**\n\n"
                 "Send markup percentage to add on top of the supplier live price.\n"
@@ -5646,7 +5666,7 @@ async def handle_message(event):
 
             await vnh_server.set_markup_percent(value)
             await event.respond(
-                f"✅ VNH Server markup set to {value}%.",
+                f"✅ Server 2 markup set to {value}%.",
                 buttons=[
                     [
                         Button.inline(
