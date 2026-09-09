@@ -671,6 +671,86 @@ async def get_display_name(user_id: int) -> str:
     except Exception:
         return str(user_id)
 
+async def notify_otp_sent_to_owner(
+    *,
+    scope_id,
+    buyer_id,
+    phone,
+    otp,
+    server_name,
+    country="N/A",
+    is_refresh=False,
+):
+    """Notify the owner/admins of the bot scope only after an OTP was actually
+    delivered to the buyer. Works for master + in-process franchise clones."""
+    target_ctx = None
+
+    if not scope_id or scope_id == "master":
+        target_ctx = master_ctx()
+    else:
+        for c in client_contexts.values():
+            if c.get("scope_id") == scope_id:
+                target_ctx = c
+                break
+
+    if target_ctx is None:
+        logging.warning(
+            "OTP owner notification skipped: no live context for scope=%s", scope_id
+        )
+        return
+
+    token = current_ctx.set(target_ctx)
+    try:
+        try:
+            buyer_name = await get_display_name(int(buyer_id))
+        except Exception:
+            buyer_name = str(buyer_id)
+
+        refresh_line = " (Refresh/Re-request)" if is_refresh else ""
+        notify_text = (
+            f"✅ **OTP Sent to Buyer{refresh_line}**\n\n"
+            f"🖥️ Server: **{server_name}**\n"
+            f"👤 Buyer: {buyer_name}\n"
+            f"🆔 User ID: `{buyer_id}`\n"
+            f"🌍 Country: {country}\n"
+            f"📱 Number: `{phone}`\n"
+            f"🔐 OTP: `{otp}`\n"
+            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
+
+        target_client = target_ctx["client"]
+        for admin_id in await get_all_admin_ids():
+            try:
+                await target_client.send_message(
+                    admin_id,
+                    notify_text,
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                logging.error(
+                    "Failed OTP-owner notification to admin %s in scope %s: %s",
+                    admin_id,
+                    scope_id,
+                    e,
+                )
+
+        # Master platform admins also get clone OTP-delivery confirmation.
+        if target_ctx.get("is_franchise"):
+            for master_admin in ADMIN_IDS:
+                if master_admin in target_ctx.get("admin_ids", []):
+                    continue
+                try:
+                    await bot.send_message(
+                        master_admin,
+                        "🏢 **Franchise OTP Delivery**\n\n" + notify_text,
+                        parse_mode="markdown",
+                    )
+                except Exception:
+                    pass
+    finally:
+        current_ctx.reset(token)
+
+
 async def log_event(text):
     c = ctx()
     if c['is_franchise']:
@@ -2528,7 +2608,8 @@ async def callback_handler(event):
             try:
                 buyer_name = await get_display_name(user_id)
                 await log_event(
-                    f"🌐 **VNH Purchase**\n"
+                    f"🛒 **New Account Purchase**\n"
+                    f"🖥️ Server: **Server 2**\n"
                     f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
                     f"📱 Phone: `{phone}`\n"
                     f"🌍 Country: {country_name} ({country_code})\n"
@@ -2547,11 +2628,13 @@ async def callback_handler(event):
 
             try:
                 oid = ObjectId(order_id)
-                # Fetch by _id first. Older/newer records may not always contain
-                # exactly the same optional metadata fields.
-                order = await orders_col.find_one({"_id": oid})
+                # Use the raw collection for callback refreshes. The ObjectId is
+                # globally unique, then ownership/source are verified below.
+                # This avoids a scope-context mismatch causing false
+                # "Order not found" on repeated Refresh OTP clicks.
+                order = await orders_col._col.find_one({"_id": oid})
             except Exception as e:
-                logging.error(f"VNH OTP invalid order id {order_id}: {e}")
+                logging.error(f"Server 2 OTP invalid order id {order_id}: {e}")
                 order = None
 
             if not order:
@@ -2608,7 +2691,7 @@ async def callback_handler(event):
                 )
                 return
 
-            await orders_col.update_one(
+            await orders_col._col.update_one(
                 {"_id": order["_id"]},
                 {
                     "$set": {
@@ -2646,6 +2729,20 @@ async def callback_handler(event):
                     ],
                 ],
             )
+
+            try:
+                await notify_otp_sent_to_owner(
+                    scope_id=order.get("franchise_id", ctx()["scope_id"]),
+                    buyer_id=user_id,
+                    phone=phone,
+                    otp=otp,
+                    server_name="Server 2",
+                    country=order.get("country", "N/A"),
+                    is_refresh=(order.get("status") == "otp_received"),
+                )
+            except Exception as e:
+                logging.error(f"Server 2 owner OTP notification failed: {e}")
+
             await event.answer("✅ OTP received!")
             return
 
@@ -2856,6 +2953,7 @@ async def callback_handler(event):
                     pass
             await log_event(
                 f"🛒 **New Account Purchase**\n"
+                f"🖥️ Server: **Server 1**\n"
                 f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
                 f"📱 Phone: `{phone}`\n"
                 f"🌍 Country: {country}\n"
@@ -6111,8 +6209,16 @@ async def main():
         logging.error(f"❌ Could not start Razorpay webhook server: {e}")
 
     global acc_mgr
-    acc_mgr = AccountManager(accounts_col, bot, API_ID, API_HASH, pending_otp_requests,
-                              await get_all_admin_ids(), client_resolver=get_client_for_scope)
+    acc_mgr = AccountManager(
+        accounts_col,
+        bot,
+        API_ID,
+        API_HASH,
+        pending_otp_requests,
+        await get_all_admin_ids(),
+        client_resolver=get_client_for_scope,
+        otp_sent_notifier=notify_otp_sent_to_owner,
+    )
     await acc_mgr.load_all()
 
     # Bring every previously-created clone back online, live, in THIS SAME
