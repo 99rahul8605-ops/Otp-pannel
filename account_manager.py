@@ -95,12 +95,27 @@ class AccountManager:
             if code_match:
                 otp = code_match.group(1)
 
-                # 🔧 Always get the most recent buyer
+                # IMPORTANT SECURITY BINDING:
+                # Forward OTP only when THIS exact monitored session is the one
+                # that was sold. If the same phone number was returned/re-added
+                # with a NEW session, an OTP from that new session must never be
+                # forwarded to an older buyer from a previous sale.
                 buyer_doc = await self.accounts_col.find_one(
-                    {"phone": phone, "status": "sold"},
+                    {
+                        "phone": phone,
+                        "session_string": session_str,
+                        "status": "sold",
+                    },
                     sort=[("sold_at", -1)]
                 )
                 buyer_id = buyer_doc["buyer_id"] if buyer_doc else None
+
+                if not buyer_doc:
+                    logging.info(
+                        f"Ignored OTP for {phone}: current monitored session is "
+                        f"not bound to an active sold record."
+                    )
+                    return
 
                 if buyer_id:
                     key = (buyer_id, phone)
@@ -108,11 +123,27 @@ class AccountManager:
 
                     # First OTP after purchase delivers automatically. Every
                     # OTP after that only goes out if the buyer explicitly
-                    # clicked "Request New OTP" — otherwise it's silently
-                    # dropped (still consumed from Telegram, just not forwarded).
+                    # clicked "Request New OTP".
                     if not is_first_otp and key not in self.pending_requests:
-                        logging.info(f"Suppressed unrequested OTP for {buyer_id} / {phone} "
-                                     f"(no pending request on file).")
+                        logging.info(
+                            f"Suppressed unrequested OTP for {buyer_id} / {phone} "
+                            f"(no pending request on file)."
+                        )
+                        return
+
+                    # If Re-Request was clicked after an OTP was already sent,
+                    # never send the same old code again. Keep waiting until
+                    # Telegram sends a genuinely different OTP.
+                    last_otp_sent = str(buyer_doc.get("last_otp_sent", "")).strip()
+                    if (
+                        not is_first_otp
+                        and key in self.pending_requests
+                        and last_otp_sent == str(otp)
+                    ):
+                        logging.info(
+                            f"Ignored duplicate old OTP for {buyer_id} / {phone}; "
+                            f"still waiting for a new code."
+                        )
                         return
 
                     msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
@@ -152,15 +183,24 @@ class AccountManager:
                                 f"Failed to send OTP-owner notification for {buyer_id} / {phone}: {e}"
                             )
 
-                    if is_first_otp:
+                    if otp_delivered:
+                        update_fields = {"last_otp_sent": str(otp)}
+                        if is_first_otp:
+                            update_fields["first_otp_sent"] = True
+
                         await self.accounts_col.update_one(
                             {"_id": buyer_doc["_id"]},
-                            {"$set": {"first_otp_sent": True}}
+                            {"$set": update_fields}
                         )
 
-                    if key in self.pending_requests:
-                        del self.pending_requests[key]
-                        logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
+                        # Clear the pending request only after a NEW OTP
+                        # was actually delivered successfully.
+                        if key in self.pending_requests:
+                            del self.pending_requests[key]
+                            logging.info(
+                                f"Cleared pending OTP request after new OTP delivery "
+                                f"for {buyer_id} / {phone}"
+                            )
 
         logging.info(f"✅ Client started for {phone}")
 

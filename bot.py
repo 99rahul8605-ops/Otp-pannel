@@ -3036,18 +3036,25 @@ async def callback_handler(event):
             if phone not in acc_mgr.clients:
                 await event.answer("❌ Session expired. Contact admin.", alert=True)
                 return
-            pending_otp_requests[(user_id, phone)] = True
-            await event.answer("✅ Waiting for new OTP.", alert=True)
-            async def clear_pending():
-                await asyncio.sleep(90)
-                key = (user_id, phone)
-                if key in pending_otp_requests:
-                    del pending_otp_requests[key]
-                    try:
-                        await ctx()['client'].send_message(user_id, "⏰ No OTP received. Try again.")
-                    except:
-                        pass
-            asyncio.create_task(clear_pending())
+
+            key = (user_id, phone)
+            already_waiting = key in pending_otp_requests
+
+            # Keep waiting until Telegram actually sends a new OTP.
+            # No short timeout: the request is cleared only after a new OTP
+            # is successfully delivered to the buyer.
+            pending_otp_requests[key] = True
+
+            if already_waiting:
+                await event.answer(
+                    "⏳ Already waiting for a new OTP. It will be sent automatically when it arrives.",
+                    alert=True,
+                )
+            else:
+                await event.answer(
+                    "✅ Please wait for the new OTP. It will be sent automatically as soon as it arrives.",
+                    alert=True,
+                )
             return
 
         # ---------- BALANCE ----------
