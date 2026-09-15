@@ -1,5 +1,6 @@
 import re
 import logging
+from datetime import timezone, timedelta
 from telethon import TelegramClient, events, Button, functions
 from telethon.sessions import StringSession
 
@@ -71,14 +72,30 @@ class AccountManager:
             except Exception as e:
                 logging.error(f"Could not flag {phone} as inactive: {e}")
 
+            try:
+                inactive_doc = await self.accounts_col.find_one({"phone": phone}, sort=[("_id", -1)])
+                acc_id = inactive_doc.get("_id") if inactive_doc else None
+                tg_name = (inactive_doc or {}).get("tg_name", "Unknown")
+            except Exception:
+                acc_id = None
+                tg_name = "Unknown"
+
+            buttons = None
+            if acc_id:
+                buttons = [
+                    [Button.inline("♻️ Replace Session", f"inactive_replace_{acc_id}")],
+                    [Button.inline("🗑️ Remove From Stock", f"inactive_remove_{acc_id}")],
+                ]
             for admin in self.admin_ids:
                 try:
                     await self.bot.send_message(
                         admin,
                         f"⚠️ **Invalid Stock Detected on Startup!**\n"
                         f"📱 Phone: `{phone}`\n"
+                        f"👤 Name: **{tg_name}**\n"
                         f"❌ Session is invalid/expired (logged out or revoked).\n"
-                        f"🔄 Status: Marked as `inactive` in DB — replace this account's session."
+                        f"🔄 Status: Marked as `inactive` in DB.",
+                        buttons=buttons,
                     )
                 except Exception:
                     pass
@@ -146,7 +163,17 @@ class AccountManager:
                         )
                         return
 
-                    msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
+                    otp_dt = event.message.date
+                    if otp_dt.tzinfo is None:
+                        otp_dt = otp_dt.replace(tzinfo=timezone.utc)
+                    otp_ist = otp_dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
+                    otp_received_at = otp_ist.strftime("%d/%m/%Y %I:%M:%S %p")
+
+                    msg = (
+                        f"📞 **Phone Number:** `{phone}`\n"
+                        f"📩 **OTP:** `{otp}`\n"
+                        f"🗓️ **Received:** `{otp_received_at} IST`"
+                    )
                     twofa_password = buyer_doc.get("twofa_password")
                     if twofa_password:
                         msg += f"\n🔐 **Password:** `{twofa_password}`"
@@ -177,6 +204,7 @@ class AccountManager:
                                 server_name="Server 1",
                                 country=buyer_doc.get("country", "N/A"),
                                 is_refresh=not is_first_otp,
+                                received_at=otp_received_at,
                             )
                         except Exception as e:
                             logging.error(
@@ -184,7 +212,10 @@ class AccountManager:
                             )
 
                     if otp_delivered:
-                        update_fields = {"last_otp_sent": str(otp)}
+                        update_fields = {
+                            "last_otp_sent": str(otp),
+                            "last_otp_received_at": otp_ist,
+                        }
                         if is_first_otp:
                             update_fields["first_otp_sent"] = True
 
@@ -203,6 +234,29 @@ class AccountManager:
                             )
 
         logging.info(f"✅ Client started for {phone}")
+
+    async def validate_client(self, phone):
+        """Strong health check used immediately before sale and while waiting
+        for the first OTP. Returns (ok, reason)."""
+        client = self.clients.get(phone)
+        if not client:
+            return False, "client_not_loaded"
+
+        try:
+            if not client.is_connected():
+                await client.connect()
+
+            if not await client.is_user_authorized():
+                return False, "session_not_authorized"
+
+            me = await client.get_me()
+            if not me:
+                return False, "telegram_account_unavailable"
+
+            return True, None
+        except Exception as e:
+            logging.warning(f"Session health check failed for {phone}: {e}")
+            return False, str(e)[:180]
 
     async def get_authorizations(self, phone):
         """Fetch the list of active device sessions (Authorization objects) for this account."""
@@ -272,7 +326,16 @@ class AccountManager:
         self.clients.clear()
 
     async def load_all(self):
-        async for acc in self.accounts_col.find({"status": "available"}):
+        # Keep available stock online AND keep freshly sold accounts online
+        # until their first OTP has been delivered. This makes the OTP flow
+        # survive a bot/process restart.
+        query = {
+            "$or": [
+                {"status": "available"},
+                {"status": "sold", "first_otp_sent": {"$ne": True}},
+            ]
+        }
+        async for acc in self.accounts_col.find(query):
             try:
                 await self.add_client(acc["phone"], acc["session_string"])
             except Exception as e:

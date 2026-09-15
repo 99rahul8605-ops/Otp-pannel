@@ -671,6 +671,34 @@ async def get_display_name(user_id: int) -> str:
     except Exception:
         return str(user_id)
 
+async def send_inactive_account_admin_notice(account_doc, reason: str = "Session inactive"):
+    if not account_doc:
+        return
+    acc_id = account_doc.get("_id")
+    phone = account_doc.get("phone", "N/A")
+    country = account_doc.get("country", "N/A")
+    price = account_doc.get("price", DEFAULT_PRICE)
+    tg_name = str(account_doc.get("tg_name") or "Unknown")
+    text = (
+        f"⚠️ **Inactive Stock Detected**\n\n"
+        f"📱 Number: `{phone}`\n"
+        f"👤 Name: **{tg_name}**\n"
+        f"🌍 Country: `{country}`\n"
+        f"💰 Price: `₹{price}`\n"
+        f"❌ Reason: `{str(reason)[:160]}`\n\n"
+        "Choose an action:"
+    )
+    buttons = [
+        [Button.inline("♻️ Replace Session", f"inactive_replace_{acc_id}", style="primary")],
+        [Button.inline("🗑️ Remove From Stock", f"inactive_remove_{acc_id}", style="danger")],
+    ]
+    target_client = ctx()["client"]
+    for admin_id in await get_all_admin_ids():
+        try:
+            await target_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
+        except Exception as e:
+            logging.error(f"Could not send inactive-stock action to {admin_id}: {e}")
+
 async def notify_otp_sent_to_owner(
     *,
     scope_id,
@@ -680,6 +708,7 @@ async def notify_otp_sent_to_owner(
     server_name,
     country="N/A",
     is_refresh=False,
+    received_at=None,
 ):
     """Notify the owner/admins of the bot scope only after an OTP was actually
     delivered to the buyer. Works for master + in-process franchise clones."""
@@ -715,7 +744,7 @@ async def notify_otp_sent_to_owner(
             f"🌍 Country: {country}\n"
             f"📱 Number: `{phone}`\n"
             f"🔐 OTP: `{otp}`\n"
-            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            f"🗓️ OTP Received: `{received_at or now_ist().strftime('%d/%m/%Y %I:%M:%S %p')} IST`"
         )
 
         target_client = target_ctx["client"]
@@ -771,6 +800,343 @@ async def log_event(text):
                 await bot.send_message(admin_id, text, parse_mode="markdown")
             except Exception as e:
                 logging.error(f"Failed to DM master admin {admin_id} about franchise event: {e}")
+
+# ---------- SERVER 1 POST-PURCHASE WARRANTY ----------
+# A rare Telegram-side account deletion/revocation can happen after the sale
+# passed its pre-check but before the buyer receives the first OTP. Keep the
+# buyer protected during that window and replace the number automatically.
+SERVER1_HEALTH_CHECK_INTERVAL = 15
+SERVER1_FAILURES_BEFORE_REPLACE = 2
+SERVER1_MAX_AUTO_REPLACEMENTS = 3
+
+
+def _ctx_for_scope_snapshot(scope_snapshot: dict) -> dict:
+    """Return the captured bot/clone context used by a background warranty task."""
+    return scope_snapshot or master_ctx()
+
+
+async def _server1_send_admin_notice(text: str):
+    target_client = ctx()["client"]
+    for admin_id in await get_all_admin_ids():
+        try:
+            await target_client.send_message(admin_id, text, parse_mode="markdown")
+        except Exception as e:
+            logging.error(f"Server 1 warranty admin notice failed for {admin_id}: {e}")
+
+
+async def _server1_pick_active_replacement(
+    *,
+    buyer_id: int,
+    country: str,
+    original_wholesale: float,
+    old_account_id,
+):
+    """Reserve and validate another Server 1 number.
+
+    Prefer the same wholesale price first. If none survives validation, fall
+    back to any available number in the same country. The buyer is never
+    charged again for a warranty replacement.
+    """
+    queries = [
+        {"country": country, "status": "available", "price": original_wholesale},
+        {"country": country, "status": "available"},
+    ]
+    seen_ids = set()
+
+    for query in queries:
+        cursor = accounts_col.find(query).sort("price", 1)
+        async for candidate in cursor:
+            cid = candidate["_id"]
+            if cid == old_account_id or str(cid) in seen_ids:
+                continue
+            seen_ids.add(str(cid))
+
+            reserved = await accounts_col.find_one_and_update(
+                {"_id": cid, "status": "available"},
+                {"$set": {
+                    "status": "sold",
+                    "buyer_id": buyer_id,
+                    "sold_at": now_ist(),
+                    "sold_via_franchise_id": ctx()["scope_id"],
+                    "first_otp_sent": False,
+                    "replacement_for_account_id": str(old_account_id),
+                }},
+            )
+            if reserved is None:
+                continue
+
+            phone = candidate["phone"]
+            ok, reason = await acc_mgr.validate_client(phone)
+            if not ok:
+                await accounts_col.update_one(
+                    {"_id": cid},
+                    {"$set": {
+                        "status": "inactive",
+                        "inactive_reason": str(reason or "health_check_failed")[:180],
+                        "inactive_at": now_ist(),
+                    }}
+                )
+                continue
+
+            # find_one_and_update returns the pre-update document by default,
+            # so enrich it locally with the new sale binding.
+            candidate["status"] = "sold"
+            candidate["buyer_id"] = buyer_id
+            candidate["sold_via_franchise_id"] = ctx()["scope_id"]
+            candidate["first_otp_sent"] = False
+            return candidate
+
+    return None
+
+
+async def _server1_refund_after_failed_replacement(
+    *,
+    buyer_id: int,
+    order_id,
+    retail_price: float,
+    original_wholesale: float,
+    old_phone: str,
+    reason: str,
+):
+    """Final fallback only when no healthy replacement is available."""
+    order_doc = await orders_col.find_one({"_id": order_id})
+    if not order_doc or order_doc.get("status") == "failed_refunded":
+        return
+
+    withdrawable_refund = float(order_doc.get("withdrawable_deducted", 0) or 0)
+    inc = {"balance": retail_price}
+    if withdrawable_refund:
+        inc["withdrawable_balance"] = withdrawable_refund
+
+    await users_col.update_one(
+        {"user_id": buyer_id},
+        {"$inc": inc}
+    )
+    await refund_franchise_wallet(original_wholesale)
+
+    await orders_col.update_one(
+        {"_id": order_id},
+        {"$set": {
+            "status": "failed_refunded",
+            "failure_reason": reason,
+            "refunded_at": now_ist(),
+        }}
+    )
+
+    try:
+        await ctx()["client"].send_message(
+            buyer_id,
+            f"⚠️ **Account became unavailable before OTP delivery.**\n\n"
+            f"📱 Previous number: `{old_phone}`\n"
+            f"❌ No healthy replacement is available right now.\n"
+            f"💰 ₹{retail_price} has been refunded to your bot balance.\n\n"
+            f"Please try purchasing again later.",
+            parse_mode="markdown",
+        )
+    except Exception:
+        pass
+
+    await _server1_send_admin_notice(
+        f"🔴 **Server 1 Purchase Auto-Refunded**\n\n"
+        f"👤 Buyer: `{buyer_id}`\n"
+        f"📱 Failed number: `{old_phone}`\n"
+        f"🌍 Reason: `{reason}`\n"
+        f"💰 Refunded: ₹{retail_price}\n"
+        f"📦 No healthy replacement stock was available."
+    )
+    await log_event(
+        f"🔴 **Server 1 Auto Refund**\n"
+        f"👤 Buyer: `{buyer_id}`\n"
+        f"📱 Failed Number: `{old_phone}`\n"
+        f"💰 Refund: ₹{retail_price}\n"
+        f"❌ Reason: `{reason}`"
+    )
+
+
+async def monitor_server1_purchase_until_first_otp(
+    *,
+    account_id,
+    order_id,
+    buyer_id: int,
+    country: str,
+    original_wholesale: float,
+    retail_price: float,
+    scope_snapshot: dict,
+):
+    """Watch a completed Server 1 purchase only until its first OTP arrives.
+
+    Two consecutive failed health checks are required before replacement so a
+    brief network hiccup does not consume stock unnecessarily.
+    """
+    token = current_ctx.set(_ctx_for_scope_snapshot(scope_snapshot))
+    try:
+        current_account_id = account_id
+        replacement_count = 0
+        consecutive_failures = 0
+
+        while True:
+            await asyncio.sleep(SERVER1_HEALTH_CHECK_INTERVAL)
+
+            account = await accounts_col.find_one({"_id": current_account_id})
+            if not account:
+                return
+
+            # OTP delivered -> warranty watcher has completed its job.
+            if account.get("first_otp_sent") is True:
+                return
+
+            # If another admin flow changed ownership/status, do not interfere.
+            if (
+                account.get("status") != "sold"
+                or str(account.get("buyer_id")) != str(buyer_id)
+            ):
+                return
+
+            phone = account.get("phone")
+            ok, health_reason = await acc_mgr.validate_client(phone)
+            if ok:
+                consecutive_failures = 0
+                continue
+
+            consecutive_failures += 1
+            logging.warning(
+                "Server 1 post-purchase health failure %s/%s for %s: %s",
+                consecutive_failures,
+                SERVER1_FAILURES_BEFORE_REPLACE,
+                phone,
+                health_reason,
+            )
+            if consecutive_failures < SERVER1_FAILURES_BEFORE_REPLACE:
+                continue
+
+            reason = str(health_reason or "session_unavailable")[:180]
+
+            # This sold account died before its first OTP.
+            await accounts_col.update_one(
+                {"_id": current_account_id},
+                {"$set": {
+                    "status": "inactive",
+                    "inactive_reason": reason,
+                    "inactive_at": now_ist(),
+                    "replaced_before_first_otp": True,
+                }}
+            )
+            inactive_doc = dict(account)
+            inactive_doc["status"] = "inactive"
+            await send_inactive_account_admin_notice(inactive_doc, reason)
+            try:
+                await acc_mgr.remove_client(phone)
+            except Exception:
+                pass
+            pending_otp_requests.pop((buyer_id, phone), None)
+
+            if replacement_count >= SERVER1_MAX_AUTO_REPLACEMENTS:
+                await _server1_refund_after_failed_replacement(
+                    buyer_id=buyer_id,
+                    order_id=order_id,
+                    retail_price=retail_price,
+                    original_wholesale=original_wholesale,
+                    old_phone=phone,
+                    reason=f"replacement_limit_reached: {reason}",
+                )
+                return
+
+            replacement = await _server1_pick_active_replacement(
+                buyer_id=buyer_id,
+                country=country,
+                original_wholesale=original_wholesale,
+                old_account_id=current_account_id,
+            )
+
+            if not replacement:
+                await _server1_refund_after_failed_replacement(
+                    buyer_id=buyer_id,
+                    order_id=order_id,
+                    retail_price=retail_price,
+                    original_wholesale=original_wholesale,
+                    old_phone=phone,
+                    reason=reason,
+                )
+                return
+
+            new_phone = replacement["phone"]
+            new_twofa = replacement.get("twofa_password")
+            replacement_count += 1
+
+            await orders_col.update_one(
+                {"_id": order_id},
+                {
+                    "$set": {
+                        "account_id": str(replacement["_id"]),
+                        "phone": new_phone,
+                        "status": "completed",
+                        "replacement_count": replacement_count,
+                        "last_replaced_at": now_ist(),
+                    },
+                    "$push": {
+                        "replacement_history": {
+                            "old_account_id": str(current_account_id),
+                            "old_phone": phone,
+                            "new_account_id": str(replacement["_id"]),
+                            "new_phone": new_phone,
+                            "reason": reason,
+                            "at": now_ist(),
+                        }
+                    },
+                }
+            )
+
+            buyer_msg = (
+                "⚠️ **Your previous number became unavailable before OTP delivery.**\n\n"
+                "✅ A replacement has been issued automatically at **no extra charge**.\n\n"
+                f"📱 **New Number:** `{new_phone}`\n"
+            )
+            if new_twofa:
+                buyer_msg += f"🔒 **2FA Password:** `{new_twofa}`\n"
+            buyer_msg += (
+                "\nPlease login using this new number. "
+                "The OTP will be sent here automatically."
+            )
+
+            try:
+                await ctx()["client"].send_message(
+                    buyer_id,
+                    buyer_msg,
+                    buttons=[[
+                        Button.inline("🔄 Request New OTP", f"resend_{new_phone}", style="primary"),
+                    ]],
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                logging.error(f"Could not send replacement number to buyer {buyer_id}: {e}")
+
+            await _server1_send_admin_notice(
+                f"♻️ **Server 1 Auto Replacement**\n\n"
+                f"👤 Buyer: `{buyer_id}`\n"
+                f"🌍 Country: {country}\n"
+                f"❌ Old Number: `{phone}`\n"
+                f"✅ New Number: `{new_phone}`\n"
+                f"🧾 Reason: `{reason}`\n"
+                f"💰 Extra charge to buyer: ₹0"
+            )
+            await log_event(
+                f"♻️ **Server 1 Automatic Replacement**\n"
+                f"👤 Buyer: `{buyer_id}`\n"
+                f"🌍 Country: {country}\n"
+                f"❌ Old: `{phone}`\n"
+                f"✅ New: `{new_phone}`\n"
+                f"🧾 Reason: `{reason}`"
+            )
+
+            current_account_id = replacement["_id"]
+            consecutive_failures = 0
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logging.exception(f"Server 1 post-purchase watcher crashed: {e}")
+    finally:
+        current_ctx.reset(token)
+
 
 # ---------- FRANCHISE WALLET ----------
 # Linked directly to the owner's own MASTER-bot personal balance — there is no
@@ -1580,6 +1946,42 @@ async def broadcast_callback(event):
 # ---------- Accounts: status filter + pagination ----------
 PAGE_SIZE = 20
 
+def format_telegram_name(user) -> str:
+    if not user:
+        return "Unknown"
+    first = str(getattr(user, "first_name", "") or "").strip()
+    last = str(getattr(user, "last_name", "") or "").strip()
+    name = " ".join(x for x in (first, last) if x).strip()
+    if name:
+        return name
+    username = str(getattr(user, "username", "") or "").strip()
+    return f"@{username}" if username else "Unknown"
+
+async def get_stock_account_name(acc: dict) -> str:
+    saved = str(acc.get("tg_name") or "").strip()
+    if saved:
+        return saved
+    phone = str(acc.get("phone") or "").strip()
+    client = acc_mgr.clients.get(phone) if acc_mgr and phone else None
+    if not client:
+        return "Unknown"
+    try:
+        if not client.is_connected():
+            await client.connect()
+        me = await client.get_me()
+        name = format_telegram_name(me)
+        fields = {
+            "tg_name": name,
+            "tg_user_id": getattr(me, "id", None),
+            "tg_username": getattr(me, "username", None),
+        }
+        await accounts_col.update_one({"_id": acc["_id"]}, {"$set": fields})
+        acc.update(fields)
+        return name
+    except Exception as e:
+        logging.debug(f"Could not resolve Telegram name for {phone}: {e}")
+        return "Unknown"
+
 async def show_all_accounts(event, user_id, status_filter="all", page=0):
     """Show accounts, filtered by status (available/sold/invalid/all), paginated."""
     try:
@@ -1613,8 +2015,10 @@ async def show_all_accounts(event, user_id, status_filter="all", page=0):
             for acc in accounts:
                 emoji = status_emoji.get(acc.get("status"), "❓")
                 buyer = f" (buyer:{acc['buyer_id']})" if acc.get("buyer_id") else ""
+                tg_name = await get_stock_account_name(acc)
                 lines.append(
-                    f"{emoji} `{acc['phone']}` | {acc['country']} | ₹{acc.get('price', '?')} | {acc.get('status', 'unknown')}{buyer}"
+                    f"{emoji} `{acc['phone']}` | 👤 {tg_name} | {acc['country']} | "
+                    f"₹{acc.get('price', '?')} | {acc.get('status', 'unknown')}{buyer}"
                 )
             txt = (
                 f"📋 **Accounts - {label}** (Total: {total_count} | Page {page+1}/{total_pages})\n"
@@ -2872,29 +3276,18 @@ async def callback_handler(event):
                     continue
 
                 phone = acc["phone"]
-                client = acc_mgr.clients.get(phone)
-                if client:
-                    try:
-                        await client.get_me()
-                    except Exception as e:
-                        error_msg = str(e)[:150]
-                        logging.warning(f"Session invalid for {phone}: {e}")
-                        await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
-                        for admin in await get_all_admin_ids():
-                            try:
-                                await ctx()['client'].send_message(admin,
-                                    f"⚠️ **Inactive Session Detected!**\n"
-                                    f"📱 Phone: `{phone}`\n"
-                                    f"🌍 Country: {country}\n"
-                                    f"💰 Price: ₹{price}\n"
-                                    f"❌ Error: `{error_msg}`\n"
-                                    f"🔄 Status: Marked as `inactive` in DB."
-                                )
-                            except:
-                                pass
-                        continue
-                else:
-                    await accounts_col.update_one({"_id": updated["_id"]}, {"$set": {"status": "inactive"}})
+                valid_session, health_error = await acc_mgr.validate_client(phone)
+                if not valid_session:
+                    error_msg = str(health_error or "unknown")[:150]
+                    logging.warning(f"Session invalid for {phone}: {error_msg}")
+                    await accounts_col.update_one(
+                        {"_id": updated["_id"]},
+                        {"$set": {"status": "inactive", "inactive_reason": error_msg, "inactive_at": now_ist()}}
+                    )
+                    inactive_doc = dict(acc)
+                    inactive_doc["_id"] = updated["_id"]
+                    inactive_doc["status"] = "inactive"
+                    await send_inactive_account_admin_notice(inactive_doc, error_msg)
                     continue
 
                 selected_acc = updated
@@ -2938,14 +3331,17 @@ async def callback_handler(event):
                 await event.answer("❌ Insufficient balance! Please deposit and try again.", alert=True)
                 return
 
-            await orders_col.insert_one({
+            withdrawable_deducted = max(0, old_withdrawable - new_withdrawable)
+            order_result = await orders_col.insert_one({
                 "user_id": user_id,
                 "account_id": str(acc["_id"]),
                 "phone": phone,
                 "country": country,
                 "amount": retail_price,
                 "wholesale_amount": price,
+                "withdrawable_deducted": withdrawable_deducted,
                 "status": "completed",
+                "replacement_count": 0,
                 "created_at": now_ist()
             })
 
@@ -2964,6 +3360,21 @@ async def callback_handler(event):
                 ]
             )
             user_states.pop(user_id, None)
+
+            # Keep checking this exact Server 1 session until the FIRST OTP is
+            # delivered. If Telegram deletes/revokes the account in between,
+            # automatically issue another active number from the same country.
+            asyncio.create_task(
+                monitor_server1_purchase_until_first_otp(
+                    account_id=acc["_id"],
+                    order_id=order_result.inserted_id,
+                    buyer_id=user_id,
+                    country=country,
+                    original_wholesale=price,
+                    retail_price=retail_price,
+                    scope_snapshot=dict(ctx()),
+                )
+            )
 
             # Admin notification
             try:
@@ -3055,6 +3466,67 @@ async def callback_handler(event):
                     "✅ Please wait for the new OTP. It will be sent automatically as soon as it arrives.",
                     alert=True,
                 )
+            return
+
+        # ---------- INACTIVE STOCK QUICK ACTIONS ----------
+        if data.startswith("inactive_remove_"):
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            try:
+                oid = ObjectId(data[len("inactive_remove_"):])
+            except Exception:
+                await event.answer("❌ Invalid account ID.", alert=True)
+                return
+            account = await accounts_col.find_one({"_id": oid})
+            if not account:
+                await event.answer("❌ Account already removed/not found.", alert=True)
+                return
+            phone = account.get("phone", "N/A")
+            result = await accounts_col.delete_one({"_id": oid})
+            if result.deleted_count:
+                try:
+                    await acc_mgr.remove_client(phone)
+                except Exception:
+                    pass
+                await event.edit(
+                    f"🗑️ **Removed From Stock**\n\n📱 Number: `{phone}`\n✅ Account deleted from database.",
+                    buttons=None,
+                )
+                await event.answer("✅ Removed")
+            else:
+                await event.answer("❌ Could not remove account.", alert=True)
+            return
+
+        if data.startswith("inactive_replace_"):
+            if not await is_admin(user_id):
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            try:
+                oid = ObjectId(data[len("inactive_replace_"):])
+            except Exception:
+                await event.answer("❌ Invalid account ID.", alert=True)
+                return
+            account = await accounts_col.find_one({"_id": oid})
+            if not account:
+                await event.answer("❌ Account not found.", alert=True)
+                return
+            user_states[user_id] = {
+                "action": "replace_inactive_session",
+                "step": "await_session",
+                "account_id": str(oid),
+            }
+            await event.edit(
+                "♻️ **Replace Inactive Session**\n\n"
+                f"📱 Number: `{account.get('phone', 'N/A')}`\n"
+                f"👤 Name: **{account.get('tg_name', 'Unknown')}**\n"
+                f"🌍 Country: `{account.get('country', 'N/A')}`\n"
+                f"💰 Price: `₹{account.get('price', DEFAULT_PRICE)}`\n\n"
+                "Send the **new Telethon StringSession** for this same account.\n"
+                "The bot will validate it before returning the account to available stock.",
+                buttons=[[Button.inline("❌ Cancel", b"admin_accounts", style="danger")]],
+            )
+            await event.answer()
             return
 
         # ---------- BALANCE ----------
@@ -4265,8 +4737,170 @@ async def callback_handler(event):
             if not await is_admin(user_id):
                 await event.answer("❌ Unauthorized", alert=True)
                 return
+            if ctx()['is_franchise']:
+                await event.answer("❌ Stock prices are managed by the platform owner only.", alert=True)
+                return
+
+            available_count = await accounts_col.count_documents({"status": "available"})
+            await event.edit(
+                "💲 **Server 1 Stock Price Manager**\n\n"
+                f"📦 Available stock: **{available_count}**\n\n"
+                "Choose what you want to update:",
+                buttons=[
+                    [Button.inline("📱 One Number", b"admin_price_one", style="primary")],
+                    [Button.inline("🌍 Country Stock", b"admin_price_country", style="primary")],
+                    [Button.inline("🏷 Current Price Group", b"admin_price_group", style="primary")],
+                    [Button.inline("📦 All Available Stock", b"admin_price_all", style="primary")],
+                    [Button.inline("⚙️ Default Price Only", b"admin_price_default", style="primary")],
+                    [Button.inline("🔙 Back", b"admin_cat_finance", style="primary")],
+                ],
+            )
+            await event.answer()
+            return
+
+        if data == "admin_price_one":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            user_states[user_id] = {"action": "set_stock_price", "mode": "one", "step": "await_target"}
+            await event.edit(
+                "📱 **Change One Account Price**\n\n"
+                "Send the phone number exactly as stored in stock.\n"
+                "Example: `919876543210`",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+            )
+            await event.answer()
+            return
+
+        if data == "admin_price_country":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            countries = await accounts_col.distinct("country", {"status": "available"})
+            preview = ", ".join(str(c) for c in countries[:20]) if countries else "No available stock"
+            user_states[user_id] = {"action": "set_stock_price", "mode": "country", "step": "await_target"}
+            await event.edit(
+                "🌍 **Change Country Stock Price**\n\n"
+                "Send the country name exactly as shown in stock.\n\n"
+                f"Available: `{preview}`",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+            )
+            await event.answer()
+            return
+
+        if data == "admin_price_group":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            prices = await accounts_col.distinct("price", {"status": "available"})
+            prices = sorted([p for p in prices if p is not None])
+            preview = ", ".join(f"₹{p}" for p in prices[:25]) if prices else "No available stock"
+            user_states[user_id] = {"action": "set_stock_price", "mode": "price_group", "step": "await_target"}
+            await event.edit(
+                "🏷 **Change Price Group**\n\n"
+                "Send the CURRENT price whose available stock you want to change.\n\n"
+                f"Current prices: `{preview}`",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+            )
+            await event.answer()
+            return
+
+        if data == "admin_price_all":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+            count = await accounts_col.count_documents({"status": "available"})
+            if count == 0:
+                await event.answer("❌ No available stock.", alert=True)
+                return
+            user_states[user_id] = {
+                "action": "set_stock_price",
+                "mode": "all",
+                "step": "await_new_price",
+                "query": {"status": "available"},
+                "matched_count": count,
+                "target_label": "all available stock",
+            }
+            await event.edit(
+                f"📦 **All Available Stock**\n\n"
+                f"Matched accounts: **{count}**\n\n"
+                "Send the NEW price:",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+            )
+            await event.answer()
+            return
+
+        if data == "admin_price_default":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
             user_states[user_id] = {"action": "set_price", "step": "await_price"}
-            await event.edit("💲 Send new default price (e.g., 50):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
+            await event.edit(
+                "⚙️ **Default Price Only**\n\n"
+                "This does NOT modify existing stock.\n"
+                "Send new default price (e.g. `50`):",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+            )
+            await event.answer()
+            return
+
+        if data == "admin_price_confirm":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await event.answer("❌ Unauthorized", alert=True)
+                return
+
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "set_stock_price" or state.get("step") != "await_confirm":
+                await event.answer("❌ Price update session expired. Start again.", alert=True)
+                return
+
+            query = state.get("query") or {}
+            new_price = state.get("new_price")
+            matched_count = await accounts_col.count_documents(query)
+            if matched_count <= 0:
+                user_states.pop(user_id, None)
+                await event.edit(
+                    "❌ No matching available stock found anymore.",
+                    buttons=[[Button.inline("🔙 Price Manager", b"admin_setprice", style="primary")]],
+                )
+                await event.answer()
+                return
+
+            result = await accounts_col.update_many(
+                query,
+                {"$set": {"price": new_price, "price_updated_at": now_ist(), "price_updated_by": user_id}},
+            )
+
+            admin_name = await get_display_name(user_id)
+            target_label = state.get("target_label", "selected stock")
+            await log_event(
+                f"💲 **Server 1 Stock Price Updated**\n"
+                f"👤 Admin: {admin_name} (`{user_id}`)\n"
+                f"🎯 Target: {target_label}\n"
+                f"💰 New Price: ₹{new_price}\n"
+                f"📦 Updated: {result.modified_count} account(s)"
+            )
+
+            user_states.pop(user_id, None)
+            await event.edit(
+                f"✅ **Price Updated**\n\n"
+                f"🎯 Target: {target_label}\n"
+                f"💰 New price: **₹{new_price}**\n"
+                f"📦 Accounts updated: **{result.modified_count}**",
+                buttons=[
+                    [Button.inline("💲 Change More Prices", b"admin_setprice", style="primary")],
+                    [Button.inline("🔙 Admin Menu", b"admin", style="primary")],
+                ],
+            )
+            await event.answer("✅ Stock price updated.")
+            return
+
+        if data == "admin_price_cancel_confirm":
+            user_states.pop(user_id, None)
+            await event.edit(
+                "❌ Price change cancelled.",
+                buttons=[[Button.inline("🔙 Price Manager", b"admin_setprice", style="primary")]],
+            )
             await event.answer()
             return
         if data == "admin_support":
@@ -4491,8 +5125,12 @@ async def process_phone_otp_step(event):
             await event.respond(f"❌ Login failed: {str(e)}", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             user_states.pop(user_id, None)
             return
+        me = await temp_client.get_me()
         session_str = temp_client.session.save()
         state["session"] = session_str
+        state["tg_name"] = format_telegram_name(me)
+        state["tg_user_id"] = getattr(me, "id", None)
+        state["tg_username"] = getattr(me, "username", None)
         state["step"] = "choose_country"
         existing = await get_existing_countries()
         btns = [[Button.inline(c, f"addcountry_{c}", style="primary")] for c in existing]
@@ -4505,8 +5143,12 @@ async def process_phone_otp_step(event):
         temp_client = state["temp_client"]
         try:
             await temp_client.sign_in(password=password)
+            me = await temp_client.get_me()
             session_str = temp_client.session.save()
             state["session"] = session_str
+            state["tg_name"] = format_telegram_name(me)
+            state["tg_user_id"] = getattr(me, "id", None)
+            state["tg_username"] = getattr(me, "username", None)
             state["twofa_password"] = password
             state["step"] = "choose_country"
             existing = await get_existing_countries()
@@ -4542,7 +5184,10 @@ async def process_phone_otp_step(event):
             "country": country,
             "session_string": session_str,
             "status": "available",
-            "price": price
+            "price": price,
+            "tg_name": state.get("tg_name", "Unknown"),
+            "tg_user_id": state.get("tg_user_id"),
+            "tg_username": state.get("tg_username"),
         }
         if twofa_password:
             insert_data["twofa_password"] = twofa_password
@@ -4575,6 +5220,9 @@ async def process_session_step(event):
             me = await temp_client.get_me()
             phone = me.phone
             state["phone"] = phone
+            state["tg_name"] = format_telegram_name(me)
+            state["tg_user_id"] = getattr(me, "id", None)
+            state["tg_username"] = getattr(me, "username", None)
             state["client"] = temp_client
             state["step"] = "ask_2fa"
             await event.respond(f"📱 Number: {phone}\n\n🔐 2FA password? (send or 'skip'):", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
@@ -4642,7 +5290,10 @@ async def process_session_step(event):
             "country": country,
             "session_string": new_session,
             "status": "available",
-            "price": price
+            "price": price,
+            "tg_name": state.get("tg_name", "Unknown"),
+            "tg_user_id": state.get("tg_user_id"),
+            "tg_username": state.get("tg_username"),
         }
         if twofa_password:
             insert_data["twofa_password"] = twofa_password
@@ -4715,6 +5366,9 @@ async def process_add_stock_step(event):
 
             me = await temp_client.get_me()
             phone = me.phone
+            tg_name = format_telegram_name(me)
+            tg_user_id = getattr(me, "id", None)
+            tg_username = getattr(me, "username", None)
             new_session = temp_client.session.save()
             await temp_client.disconnect()
 
@@ -4728,7 +5382,10 @@ async def process_add_stock_step(event):
                 "country": country,
                 "session_string": new_session,
                 "status": "available",
-                "price": price
+                "price": price,
+                "tg_name": tg_name,
+                "tg_user_id": tg_user_id,
+                "tg_username": tg_username,
             }
             if twofa:
                 insert_data["twofa_password"] = twofa
@@ -5657,6 +6314,219 @@ async def handle_message(event):
             await event.respond("✅ Razorpay Webhook Secret saved.",
                                  buttons=[[Button.inline("🔙 Razorpay Settings", b"admin_razorpay", style="primary")]])
             user_states.pop(user_id, None)
+
+    elif action == "replace_inactive_session":
+        if state.get("step") != "await_session":
+            return
+        session_str = (event.message.text or "").strip()
+        if not session_str:
+            await event.respond("❌ Empty session. Send a valid Telethon StringSession.")
+            return
+        try:
+            oid = ObjectId(state["account_id"])
+        except Exception:
+            user_states.pop(user_id, None)
+            await event.respond("❌ Account reference expired. Start again.")
+            return
+        account = await accounts_col.find_one({"_id": oid})
+        if not account:
+            user_states.pop(user_id, None)
+            await event.respond("❌ Account no longer exists.")
+            return
+        phone = account.get("phone")
+        old_session = account.get("session_string")
+        try:
+            ok = await acc_mgr.add_client(phone, session_str)
+        except Exception as e:
+            ok = False
+            logging.error(f"Replacement session add failed for {phone}: {e}")
+        if not ok:
+            if old_session:
+                try:
+                    await acc_mgr.add_client(phone, old_session)
+                except Exception:
+                    pass
+            await event.respond(
+                "❌ **New session is invalid/expired.**\n\nAccount is still inactive. Send another valid session:",
+                buttons=[[Button.inline("❌ Cancel", b"admin_accounts", style="danger")]],
+            )
+            return
+        health_ok, health_reason = await acc_mgr.validate_client(phone)
+        if not health_ok:
+            try:
+                await acc_mgr.remove_client(phone)
+            except Exception:
+                pass
+            if old_session:
+                try:
+                    await acc_mgr.add_client(phone, old_session)
+                except Exception:
+                    pass
+            await event.respond(
+                f"❌ Session validation failed: `{str(health_reason)[:140]}`\n\nSend another valid session:",
+                buttons=[[Button.inline("❌ Cancel", b"admin_accounts", style="danger")]],
+            )
+            return
+        replacement_client = acc_mgr.clients.get(phone)
+        replacement_me = None
+        if replacement_client:
+            try:
+                replacement_me = await replacement_client.get_me()
+            except Exception:
+                pass
+        replacement_name = format_telegram_name(replacement_me)
+        await accounts_col.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "session_string": session_str,
+                    "status": "available",
+                    "tg_name": replacement_name,
+                    "tg_user_id": getattr(replacement_me, "id", None) if replacement_me else None,
+                    "tg_username": getattr(replacement_me, "username", None) if replacement_me else None,
+                    "session_replaced_at": now_ist(),
+                    "session_replaced_by": user_id,
+                },
+                "$unset": {
+                    "inactive_reason": "", "inactive_at": "",
+                    "replaced_before_first_otp": "", "buyer_id": "",
+                    "sold_at": "", "first_otp_sent": "", "last_otp_sent": "",
+                    "last_otp_received_at": "",
+                },
+            },
+        )
+        user_states.pop(user_id, None)
+        await event.respond(
+            "✅ **Session Replaced Successfully**\n\n"
+            f"📱 Number: `{phone}`\n"
+            f"👤 Name: **{replacement_name}**\n"
+            "🟢 Status: `available`\n\nAccount is back in stock.",
+            buttons=[[Button.inline("📦 Accounts", b"admin_accounts", style="primary")]],
+        )
+        return
+
+    elif action == "set_stock_price":
+        mode = state.get("mode")
+        step = state.get("step")
+        text = (event.message.text or "").strip()
+
+        if step == "await_target":
+            if mode == "one":
+                # Be forgiving about a leading + while matching the stored phone.
+                phone = text.replace(" ", "").lstrip("+")
+                doc = await accounts_col.find_one({"phone": phone, "status": "available"})
+                if not doc:
+                    # Some older records may contain a + prefix.
+                    doc = await accounts_col.find_one({"phone": f"+{phone}", "status": "available"})
+                if not doc:
+                    await event.respond(
+                        "❌ This number is not in **available stock**.\n"
+                        "Send another stock number:",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+                    )
+                    return
+                query = {"_id": doc["_id"], "status": "available"}
+                target_label = f"{doc.get('phone')} ({doc.get('country', 'N/A')})"
+                count = 1
+
+            elif mode == "country":
+                # Country matching is case-insensitive but still exact as a value.
+                countries = await accounts_col.distinct("country", {"status": "available"})
+                matched_country = next(
+                    (c for c in countries if str(c).strip().casefold() == text.casefold()),
+                    None,
+                )
+                if matched_country is None:
+                    await event.respond(
+                        "❌ No available stock found for that country.\n"
+                        "Send a valid country name:",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+                    )
+                    return
+                query = {"country": matched_country, "status": "available"}
+                count = await accounts_col.count_documents(query)
+                target_label = f"{matched_country} available stock"
+
+            elif mode == "price_group":
+                try:
+                    old_price = float(text.replace("₹", "").strip())
+                    if old_price <= 0:
+                        raise ValueError
+                except ValueError:
+                    await event.respond(
+                        "❌ Invalid current price. Example: `50`",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+                    )
+                    return
+                query = {"price": old_price, "status": "available"}
+                count = await accounts_col.count_documents(query)
+                if count == 0:
+                    await event.respond(
+                        f"❌ No available stock currently has price ₹{old_price}.\n"
+                        "Send another current price:",
+                        buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+                    )
+                    return
+                target_label = f"available stock currently priced ₹{old_price}"
+
+            else:
+                user_states.pop(user_id, None)
+                await event.respond(
+                    "❌ Invalid price-manager state.",
+                    buttons=[[Button.inline("🔙 Price Manager", b"admin_setprice", style="primary")]],
+                )
+                return
+
+            state["query"] = query
+            state["matched_count"] = count
+            state["target_label"] = target_label
+            state["step"] = "await_new_price"
+            await event.respond(
+                f"🎯 Target: **{target_label}**\n"
+                f"📦 Matched accounts: **{count}**\n\n"
+                "Now send the **NEW price**:",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+            )
+            return
+
+        if step == "await_new_price":
+            try:
+                new_price = float(text.replace("₹", "").strip())
+                if new_price <= 0:
+                    raise ValueError
+            except ValueError:
+                await event.respond(
+                    "❌ Invalid new price. Send a positive number, e.g. `65`:",
+                    buttons=[[Button.inline("🔙 Cancel", b"admin_setprice", style="danger")]],
+                )
+                return
+
+            query = state.get("query") or {}
+            matched_count = await accounts_col.count_documents(query)
+            if matched_count <= 0:
+                user_states.pop(user_id, None)
+                await event.respond(
+                    "❌ Matching stock is no longer available. Start again.",
+                    buttons=[[Button.inline("🔙 Price Manager", b"admin_setprice", style="primary")]],
+                )
+                return
+
+            state["new_price"] = new_price
+            state["matched_count"] = matched_count
+            state["step"] = "await_confirm"
+
+            await event.respond(
+                "⚠️ **Confirm Stock Price Change**\n\n"
+                f"🎯 Target: **{state.get('target_label', 'selected stock')}**\n"
+                f"📦 Accounts: **{matched_count}**\n"
+                f"💰 New price: **₹{new_price}**\n\n"
+                "Existing **available stock** matching this target will be updated.",
+                buttons=[
+                    [Button.inline("✅ Confirm Update", b"admin_price_confirm", style="success")],
+                    [Button.inline("❌ Cancel", b"admin_price_cancel_confirm", style="danger")],
+                ],
+            )
+            return
 
     elif action == "set_price":
         step = state.get("step")
