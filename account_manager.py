@@ -114,20 +114,40 @@ class AccountManager:
                         pass
 
             elif current_status == "sold":
-                # Keep sold status untouched, even if the session is now dead.
                 logging.warning(
-                    f"Sold account {phone} has an invalid session; status remains sold."
+                    f"Sold account {phone} has an invalid session; "
+                    f"removing dead session from future monitoring."
                 )
+
+                try:
+                    await self.accounts_col.update_one(
+                        {"_id": account_doc["_id"], "status": "sold"},
+                        {
+                            "$set": {
+                                "monitor_disabled": True,
+                                "sold_session_invalid": True,
+                                "sold_session_invalid_reason": "session_not_authorized",
+                            },
+                            "$unset": {
+                                "session_string": "",
+                            },
+                        }
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"Could not disable dead sold session monitoring for {phone}: {e}"
+                    )
+
                 for admin in self.admin_ids:
                     try:
                         await self.bot.send_message(
                             admin,
-                            f"ℹ️ **Sold Account Session Invalid**\n"
+                            f"ℹ️ **Sold Account Session Removed From Monitoring**\n"
                             f"📱 Phone: `{phone}`\n"
                             f"👤 Name: **{account_doc.get('tg_name', 'Unknown')}**\n"
-                            f"📦 Status: `sold` (unchanged)\n"
-                            f"❌ Stored session is no longer authorized.\n\n"
-                            f"This record was **not** moved to inactive stock."
+                            f"📦 Sale record remains: `sold`\n"
+                            f"❌ Dead/invalid session removed from monitoring.\n\n"
+                            f"It will **not show again on every restart**."
                         )
                     except Exception:
                         pass
@@ -372,7 +392,12 @@ class AccountManager:
         query = {
             "$or": [
                 {"status": "available"},
-                {"status": "sold", "first_otp_sent": {"$ne": True}},
+                {
+                    "status": "sold",
+                    "first_otp_sent": {"$ne": True},
+                    "monitor_disabled": {"$ne": True},
+                    "session_string": {"$exists": True, "$nin": [None, ""]},
+                },
             ]
         }
         async for acc in self.accounts_col.find(query):
