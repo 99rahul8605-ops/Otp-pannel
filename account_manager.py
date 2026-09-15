@@ -58,47 +58,87 @@ class AccountManager:
             return False
 
         if not authorized:
-            # Session is expired/invalid/logged-out. Never call client.start()
-            # here without credentials — Telethon falls back to an interactive
-            # input() prompt for phone/bot_token, which hangs a headless server.
-            logging.error(f"❌ Session for {phone} is invalid/expired — skipping this account. "
-                           f"Re-add it with a fresh session string.")
+            # Session is expired/invalid/logged-out. Do not start interactive login.
+            logging.error(
+                f"❌ Session for {phone} is invalid/expired — skipping this client."
+            )
             await client.disconnect()
+
+            # IMPORTANT:
+            # SOLD accounts are history, not available stock. A restart/redeploy
+            # must never turn a sold record into `inactive`.
+            account_doc = None
             try:
-                await self.accounts_col.update_one(
-                    {"phone": phone},
-                    {"$set": {"status": "inactive"}}
+                account_doc = await self.accounts_col.find_one(
+                    {"phone": phone, "session_string": session_str},
+                    sort=[("sold_at", -1), ("created_at", -1), ("_id", -1)]
                 )
             except Exception as e:
-                logging.error(f"Could not flag {phone} as inactive: {e}")
+                logging.error(f"Could not inspect account status for {phone}: {e}")
 
-            try:
-                inactive_doc = await self.accounts_col.find_one({"phone": phone}, sort=[("_id", -1)])
-                acc_id = inactive_doc.get("_id") if inactive_doc else None
-                tg_name = (inactive_doc or {}).get("tg_name", "Unknown")
-            except Exception:
-                acc_id = None
-                tg_name = "Unknown"
+            current_status = (account_doc or {}).get("status")
 
-            buttons = None
-            if acc_id:
-                buttons = [
-                    [Button.inline("♻️ Replace Session", f"inactive_replace_{acc_id}")],
-                    [Button.inline("🗑️ Remove From Stock", f"inactive_remove_{acc_id}")],
-                ]
-            for admin in self.admin_ids:
+            if current_status == "available":
                 try:
-                    await self.bot.send_message(
-                        admin,
-                        f"⚠️ **Invalid Stock Detected on Startup!**\n"
-                        f"📱 Phone: `{phone}`\n"
-                        f"👤 Name: **{tg_name}**\n"
-                        f"❌ Session is invalid/expired (logged out or revoked).\n"
-                        f"🔄 Status: Marked as `inactive` in DB.",
-                        buttons=buttons,
+                    await self.accounts_col.update_one(
+                        {"_id": account_doc["_id"], "status": "available"},
+                        {"$set": {
+                            "status": "inactive",
+                            "inactive_reason": "session_invalid_on_startup",
+                        }}
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.error(f"Could not mark available stock {phone} inactive: {e}")
+
+                acc_id = account_doc.get("_id")
+                tg_name = account_doc.get("tg_name", "Unknown")
+                buttons = None
+                if acc_id:
+                    buttons = [
+                        [Button.inline("♻️ Replace Session", f"inactive_replace_{acc_id}")],
+                        [Button.inline("🗑️ Remove From Stock", f"inactive_remove_{acc_id}")],
+                    ]
+
+                for admin in self.admin_ids:
+                    try:
+                        await self.bot.send_message(
+                            admin,
+                            f"⚠️ **Invalid Stock Detected on Startup!**\n"
+                            f"📱 Phone: `{phone}`\n"
+                            f"👤 Name: **{tg_name}**\n"
+                            f"❌ Session is invalid/expired (logged out or revoked).\n"
+                            f"🔄 Status: Marked as `inactive` in DB.",
+                            buttons=buttons,
+                        )
+                    except Exception:
+                        pass
+
+            elif current_status == "sold":
+                # Keep sold status untouched, even if the session is now dead.
+                logging.warning(
+                    f"Sold account {phone} has an invalid session; status remains sold."
+                )
+                for admin in self.admin_ids:
+                    try:
+                        await self.bot.send_message(
+                            admin,
+                            f"ℹ️ **Sold Account Session Invalid**\n"
+                            f"📱 Phone: `{phone}`\n"
+                            f"👤 Name: **{account_doc.get('tg_name', 'Unknown')}**\n"
+                            f"📦 Status: `sold` (unchanged)\n"
+                            f"❌ Stored session is no longer authorized.\n\n"
+                            f"This record was **not** moved to inactive stock."
+                        )
+                    except Exception:
+                        pass
+
+            else:
+                # Preserve inactive/other historical states as-is.
+                logging.warning(
+                    f"Session invalid for {phone}; preserving existing status "
+                    f"{current_status!r}."
+                )
+
             return False
 
         self.clients[phone] = client
