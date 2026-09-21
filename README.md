@@ -319,3 +319,60 @@ Public/private stock logs now trigger for all stock-add methods:
 - Bulk stock add
 
 Single-account public logs show the phone number masked and `New Stock Added: 1`.
+
+
+## Legacy / Fake Clone Balance Protection
+
+A Master Managed clone no longer trusts the visible `balance` field by itself.
+
+New field:
+- `platform_backed_balance`
+
+Rules:
+- Fresh deposits approved through the current Master Managed flow increase both `balance` and `platform_backed_balance`.
+- Purchases in Master Managed mode require enough `platform_backed_balance`.
+- Old balances from older clone versions have no trusted backing and are blocked from purchases.
+- Failed purchases restore the reserved trusted balance.
+- Refunds restore trusted balance.
+- Master-funded referral bonuses are also marked trusted.
+- Master/clone admin receives an alert when a user has visible old balance but insufficient verified balance.
+
+This specifically prevents an old/fake clone balance from surviving an update and later being used to buy platform stock.
+
+
+## Clone Owner / Closure Notice Fix
+
+Clone ownership remains per-clone using `bot_clones.owner_id`.
+
+Closure notifications are now separated:
+- Generic customer closure notices go only to real clone customers.
+- The clone owner is excluded from the generic customer broadcast.
+- Master/founding admins are excluded from the generic customer broadcast.
+- If a Master Admin removes another user's clone, only that clone's stored `owner_id` gets the owner-specific closure notice.
+- The admin who removes the clone is not treated as the clone owner unless their user ID actually matches `bot_clones.owner_id`.
+
+This also prevents the platform/master admin from receiving a customer closure message merely because they previously opened or tested a clone bot.
+
+
+## Master Admin - Clone User Balance Control
+
+Path:
+`Admin Panel -> Franchises -> Franchise Records -> View Users -> Select User`
+
+Master admin can now:
+- view a clone user's wallet record
+- see normal balance, verified/platform-backed balance, owner-backed balance, deposits and recent orders
+- use `Zero User Balance`
+- confirm before any balance is changed
+
+When confirmed:
+- `balance` -> 0
+- `withdrawable_balance` -> 0
+- `platform_backed_balance` -> 0
+- `owner_backed_balance` -> 0
+- deposit/order history remains intact
+- an audit record is saved
+
+Own Payment safety:
+- If the user's balance has owner-backed collateral, that collateral is released back to the clone owner's Master Bot wallet.
+- If the backing figures are inconsistent, the zero-balance action is blocked instead of silently corrupting finance records.

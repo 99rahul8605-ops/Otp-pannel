@@ -376,7 +376,12 @@ async def launch_clone(token: str, franchise_id: str, owner_id: int, display_nam
     client.add_event_handler(handle_message, events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
     client.add_event_handler(start_cmd, events.NewMessage(pattern='/start'))
 
-    logging.info(f"🤖 Clone launched live: franchise_id={franchise_id} owner={owner_id}")
+    logging.info(
+        "🤖 Clone launched live: franchise_id=%s owner=%s admin_ids=%s",
+        franchise_id,
+        owner_id,
+        [owner_id],
+    )
     return client
 
 async def stop_clone(franchise_id: str):
@@ -1399,6 +1404,47 @@ async def refund_franchise_wallet(amount: float):
     if owner_id:
         await refund_owner_master_balance(owner_id, amount)
 
+async def notify_unbacked_legacy_balance(buyer_id: int, attempted_amount: float):
+    if not ctx()['is_franchise']:
+        return
+    try:
+        udoc = await db['users'].find_one({
+            "user_id": int(buyer_id),
+            "franchise_id": ctx()['franchise_id'],
+        }) or {}
+        visible = float(udoc.get("balance", 0) or 0)
+        verified = float(udoc.get("platform_backed_balance", 0) or 0)
+
+        if visible < attempted_amount or verified >= attempted_amount:
+            return
+
+        msg = (
+            "🛡️ **Unverified Legacy Balance Blocked**\n\n"
+            f"User: `{buyer_id}`\n"
+            f"Visible balance: ₹{visible:.2f}\n"
+            f"Verified balance: ₹{verified:.2f}\n"
+            f"Attempted spend: ₹{attempted_amount:.2f}\n\n"
+            "This old balance was not verified by the current Master Managed payment flow, "
+            "so the purchase was blocked."
+        )
+
+        try:
+            await ctx()['client'].send_message(ctx()['owner_id'], msg)
+        except Exception:
+            pass
+
+        for admin in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin,
+                    msg + f"\nClone: `{ctx()['franchise_id']}`"
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logging.warning("Could not notify unverified legacy balance: %s", e)
+
+
 async def notify_franchise_low_balance(attempted_cost: float):
     """Alert the franchise owner privately — never expose wholesale mechanics to
     the end customer, who just sees a generic 'unavailable' message."""
@@ -1767,10 +1813,36 @@ async def reserve_franchise_sale(wholesale_cost: float, retail_price: float, buy
                 fid, retail, wholesale,
             )
             return None
+
+        # SECURITY: Master Managed purchases may spend only balance that was
+        # credited by the current trusted/platform-controlled flow.
+        trusted_reserve = await db['users'].update_one(
+            {
+                "user_id": int(buyer_id),
+                "franchise_id": fid,
+                "platform_backed_balance": {"$gte": retail},
+            },
+            {"$inc": {"platform_backed_balance": -retail}},
+        )
+        if trusted_reserve.modified_count == 0:
+            udoc = await db['users'].find_one(
+                {"user_id": int(buyer_id), "franchise_id": fid}
+            ) or {}
+            await clone_audit(
+                fid,
+                "MASTER_MANAGED_SALE_BLOCKED_UNBACKED_BALANCE",
+                buyer_id=int(buyer_id),
+                retail=retail,
+                wallet_balance=float(udoc.get("balance", 0) or 0),
+                platform_backed_balance=float(udoc.get("platform_backed_balance", 0) or 0),
+            )
+            return None
+
         return {
             "mode": "master_managed", "ok": True, "franchise_id": fid,
             "buyer_id": int(buyer_id), "wholesale": wholesale, "retail": retail,
             "margin_due": round(max(0.0, retail - wholesale), 2),
+            "platform_backed_used": retail,
         }
 
     user_doc = await db['users'].find_one({"user_id": int(buyer_id), "franchise_id": fid}) or {}
@@ -1848,9 +1920,28 @@ async def commit_franchise_sale(token: dict | None, source: str = "sale", order_
 
 
 async def rollback_franchise_sale(token: dict | None, reason: str = "sale_failed"):
-    if not token or token.get("mode") in (None, "master", "master_managed"):
+    if not token or token.get("mode") in (None, "master"):
         return
     fid = token.get("franchise_id")
+
+    if token.get("mode") == "master_managed":
+        backed = float(token.get("platform_backed_used", 0) or 0)
+        if backed > 0:
+            await db['users'].update_one(
+                {
+                    "user_id": int(token["buyer_id"]),
+                    "franchise_id": fid,
+                },
+                {"$inc": {"platform_backed_balance": backed}},
+                upsert=True,
+            )
+        await clone_audit(
+            fid,
+            "MASTER_MANAGED_SALE_ROLLED_BACK",
+            reason=reason,
+            **token,
+        )
+        return
     backed = float(token.get("backed_used", 0) or 0)
     shortfall = float(token.get("owner_shortfall", 0) or 0)
     if backed > 0:
@@ -1882,6 +1973,16 @@ async def reverse_committed_franchise_sale(token: dict | None, reason: str = "cu
             await bot_clones_col.update_one(
                 {"franchise_id": fid},
                 {"$inc": {"earnings_wallet": -margin, "total_margin_earned": -margin}}
+            )
+        backed = float(token.get("platform_backed_used", 0) or 0)
+        if backed > 0:
+            await db['users'].update_one(
+                {
+                    "user_id": int(token["buyer_id"]),
+                    "franchise_id": fid,
+                },
+                {"$inc": {"platform_backed_balance": backed}},
+                upsert=True,
             )
         await clone_audit(fid, "MASTER_MANAGED_SALE_REVERSED", reason=reason, **token)
         return
@@ -1915,15 +2016,38 @@ async def reverse_committed_franchise_sale(token: dict | None, reason: str = "cu
 
 
 async def notify_clone_users_before_closure(clone: dict):
+    """Notify actual clone customers only.
+
+    Do NOT send the generic customer-closure notice to:
+    - the real clone owner
+    - master/founding admins
+
+    This prevents the platform owner/admin from receiving a customer notice
+    simply because they previously opened or tested that clone bot.
+    """
     fid = clone["franchise_id"]
     client = clone_clients.get(fid)
     if not client:
         return 0
+
+    clone_owner_id = int(clone.get("owner_id") or 0)
+    excluded_ids = set(ADMIN_IDS)
+    if clone_owner_id:
+        excluded_ids.add(clone_owner_id)
+
     sent = 0
     async for u in db['users'].find({"franchise_id": fid}):
         uid = u.get("user_id")
         if not uid:
             continue
+        try:
+            uid = int(uid)
+        except Exception:
+            continue
+
+        if uid in excluded_ids:
+            continue
+
         bal = float(u.get("balance", 0) or 0)
         try:
             await client.send_message(
@@ -1939,6 +2063,33 @@ async def notify_clone_users_before_closure(clone: dict):
         except Exception:
             pass
     return sent
+
+
+async def notify_real_clone_owner(clone: dict, text: str):
+    """Notify only the owner stored on this clone record, never a global/default owner."""
+    try:
+        owner_id = int(clone.get("owner_id") or 0)
+    except Exception:
+        owner_id = 0
+    if not owner_id:
+        return False
+
+    # Prefer master bot because the owner necessarily interacted with the
+    # master bot when creating the clone. Fall back to the clone client.
+    try:
+        await bot.send_message(owner_id, text)
+        return True
+    except Exception:
+        pass
+
+    client = clone_clients.get(clone.get("franchise_id"))
+    if client:
+        try:
+            await client.send_message(owner_id, text)
+            return True
+        except Exception:
+            pass
+    return False
 
 async def cleanup_expired_clone_deposit_reservations():
     """Release stale own-payment capacity reservations for abandoned deposits."""
@@ -3826,6 +3977,7 @@ async def callback_handler(event):
 
             finance_reservation = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
             if not finance_reservation:
+                await notify_unbacked_legacy_balance(user_id, retail_price)
                 await notify_franchise_low_balance(wholesale_inr)
                 await safe_callback_answer(event, 
                     "⚠️ Server temporarily unavailable. Please try later.",
@@ -4225,6 +4377,7 @@ async def callback_handler(event):
 
             finance_reservation = await reserve_franchise_sale(price, retail_price, user_id)
             if not finance_reservation:
+                await notify_unbacked_legacy_balance(user_id, retail_price)
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
                     {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
@@ -4783,6 +4936,7 @@ async def callback_handler(event):
 
             finance_reservation = await reserve_franchise_sale(wholesale_cost, charge, user_id)
             if not finance_reservation:
+                await notify_unbacked_legacy_balance(user_id, charge)
                 await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": charge}})
                 await notify_franchise_low_balance(wholesale_cost)
                 await event.edit("⚠️ Service temporarily unavailable. Please try again shortly.\n\n"
@@ -5049,6 +5203,19 @@ async def callback_handler(event):
                 return
 
             summary = await get_clone_finance_summary(fid)
+
+            # If Master Admin removes another user's clone, notify the REAL owner
+            # stored in bot_clones.owner_id. Do not treat the remover as owner.
+            if is_master_admin and not is_owner:
+                await notify_real_clone_owner(
+                    clone,
+                    f"⚠️ **Clone Closure Requested**\n\n"
+                    f"Your clone @{clone.get('bot_username', 'N/A')} is being closed by the Master Admin.\n"
+                    f"Franchise ID: `{fid}`\n\n"
+                    f"Customer/payment records will be retained. If liabilities remain, "
+                    f"the clone will enter CLOSING mode until they are resolved."
+                )
+
             notified = await notify_clone_users_before_closure(clone)
             liabilities = (
                 summary['clone_user_balance'] > 0.009
@@ -5200,7 +5367,11 @@ async def callback_handler(event):
             lines=[]; btns=[]
             for u in users:
                 uid=u.get('user_id'); name=u.get('first_name') or u.get('username') or 'User'
-                lines.append(f"• {name} (`{uid}`) — bal ₹{float(u.get('balance',0) or 0):.2f} | backed ₹{float(u.get('owner_backed_balance',0) or 0):.2f}")
+                lines.append(
+                    f"• {name} (`{uid}`) — bal ₹{float(u.get('balance',0) or 0):.2f} "
+                    f"| verified ₹{float(u.get('platform_backed_balance',0) or 0):.2f} "
+                    f"| owner-backed ₹{float(u.get('owner_backed_balance',0) or 0):.2f}"
+                )
                 btns.append([Button.inline(f"👤 {name[:20]} | {uid}", f"admin_clone_user_{fid}_{uid}".encode(), style="primary")])
             pages=max(1,(total+page_size-1)//page_size)
             nav=[]
@@ -5241,6 +5412,7 @@ async def callback_handler(event):
                 f"Name: {u.get('first_name','')} {u.get('last_name','')}",
                 f"Username: @{u.get('username')}" if u.get('username') else "Username: N/A",
                 f"Balance: ₹{float(u.get('balance',0) or 0):.2f}",
+                f"Verified/platform-backed: ₹{float(u.get('platform_backed_balance',0) or 0):.2f}",
                 f"Owner-backed balance: ₹{float(u.get('owner_backed_balance',0) or 0):.2f}",
                 f"Approved deposits total: ₹{total_dep:.2f}",
                 f"Referred by: {u.get('referred_by','N/A')}",
@@ -5251,8 +5423,208 @@ async def callback_handler(event):
             lines.append("\nRecent account orders:")
             for o in orders:
                 lines.append(f"• ₹{o.get('amount',0)} | {o.get('status')} | {o.get('phone','N/A')}")
-            await event.edit("\n".join(lines), buttons=[[Button.inline("🔙 Users", f"admin_clone_users_{fid}_0".encode(), style="primary")]])
+            await event.edit(
+                "\n".join(lines),
+                buttons=[
+                    [Button.inline(
+                        "🧹 Zero User Balance",
+                        f"admin_zero_clone_user_{fid}_{uid}".encode(),
+                        style="danger"
+                    )],
+                    [Button.inline("🔙 Users", f"admin_clone_users_{fid}_0".encode(), style="primary")]
+                ]
+            )
             await safe_callback_answer(event, )
+            return
+
+        if data.startswith("admin_zero_clone_user_"):
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            rest = data[len("admin_zero_clone_user_"):]
+            try:
+                fid, uid_s = rest.rsplit("_", 1)
+                target_uid = int(uid_s)
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid user.", alert=True)
+                return
+
+            u = await db['users'].find_one({
+                "franchise_id": fid,
+                "user_id": target_uid,
+            })
+            if not u:
+                await safe_callback_answer(event, "❌ User not found.", alert=True)
+                return
+
+            bal = float(u.get("balance", 0) or 0)
+            withdrawable = float(u.get("withdrawable_balance", 0) or 0)
+            platform_backed = float(u.get("platform_backed_balance", 0) or 0)
+            owner_backed = float(u.get("owner_backed_balance", 0) or 0)
+
+            await event.edit(
+                "⚠️ **Zero Clone User Balance?**\n\n"
+                f"Clone: `{fid}`\n"
+                f"User: `{target_uid}`\n\n"
+                f"Wallet Balance: **₹{bal:.2f}**\n"
+                f"Withdrawable: ₹{withdrawable:.2f}\n"
+                f"Platform-backed: ₹{platform_backed:.2f}\n"
+                f"Owner-backed: ₹{owner_backed:.2f}\n\n"
+                "This will set the user's spendable/withdrawable balance to **₹0**. "
+                "Deposit/order history will NOT be deleted.\n\n"
+                "If this clone uses Own Payment mode, the user's locked owner-backed "
+                "funds will be released back to the clone owner's Master Bot wallet.",
+                buttons=[
+                    [Button.inline(
+                        "✅ Confirm Zero Balance",
+                        f"admin_zero_clone_confirm_{fid}_{target_uid}".encode(),
+                        style="danger"
+                    )],
+                    [Button.inline(
+                        "❌ Cancel",
+                        f"admin_clone_user_{fid}_{target_uid}".encode(),
+                        style="primary"
+                    )],
+                ]
+            )
+            await safe_callback_answer(event, )
+            return
+
+        if data.startswith("admin_zero_clone_confirm_"):
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            rest = data[len("admin_zero_clone_confirm_"):]
+            try:
+                fid, uid_s = rest.rsplit("_", 1)
+                target_uid = int(uid_s)
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid user.", alert=True)
+                return
+
+            u = await db['users'].find_one({
+                "franchise_id": fid,
+                "user_id": target_uid,
+            })
+            if not u:
+                await safe_callback_answer(event, "❌ User not found.", alert=True)
+                return
+
+            clone = await bot_clones_col.find_one({"franchise_id": fid})
+            if not clone:
+                await safe_callback_answer(event, "❌ Clone not found.", alert=True)
+                return
+
+            old_balance = round(float(u.get("balance", 0) or 0), 2)
+            old_withdrawable = round(float(u.get("withdrawable_balance", 0) or 0), 2)
+            old_platform_backed = round(float(u.get("platform_backed_balance", 0) or 0), 2)
+            old_owner_backed = round(float(u.get("owner_backed_balance", 0) or 0), 2)
+
+            released_owner_backing = 0.0
+
+            # Own-payment customer funds were physically locked from the clone
+            # owner's master wallet. Zeroing the customer balance must release
+            # that exact backing; otherwise we'd leave funds stranded.
+            if clone.get("payment_mode", "master_managed") == "own_payment" and old_owner_backed > 0:
+                release = old_owner_backed
+                dec = await bot_clones_col.update_one(
+                    {
+                        "_id": clone["_id"],
+                        "customer_funds_locked": {"$gte": release},
+                    },
+                    {"$inc": {"customer_funds_locked": -release}}
+                )
+                if dec.modified_count == 0:
+                    await safe_callback_answer(
+                        event,
+                        "❌ Backing mismatch detected. Balance was NOT changed. Check clone finance audit.",
+                        alert=True
+                    )
+                    await clone_audit(
+                        fid,
+                        "ZERO_USER_BALANCE_BLOCKED_BACKING_MISMATCH",
+                        target_user_id=target_uid,
+                        requested_by=user_id,
+                        user_owner_backed=old_owner_backed,
+                        clone_customer_funds_locked=float(clone.get("customer_funds_locked", 0) or 0),
+                    )
+                    return
+
+                try:
+                    await users_col._col.update_one(
+                        {
+                            "user_id": int(clone["owner_id"]),
+                            "franchise_id": "master",
+                        },
+                        {"$inc": {"balance": release}},
+                        upsert=True,
+                    )
+                    released_owner_backing = release
+                except Exception:
+                    # Restore clone lock if owner-wallet refund failed.
+                    await bot_clones_col.update_one(
+                        {"_id": clone["_id"]},
+                        {"$inc": {"customer_funds_locked": release}}
+                    )
+                    raise
+
+            await db['users'].update_one(
+                {
+                    "franchise_id": fid,
+                    "user_id": target_uid,
+                },
+                {
+                    "$set": {
+                        "balance": 0.0,
+                        "withdrawable_balance": 0.0,
+                        "platform_backed_balance": 0.0,
+                        "owner_backed_balance": 0.0,
+                        "balance_zeroed_at": now_ist(),
+                        "balance_zeroed_by": user_id,
+                    }
+                }
+            )
+
+            await clone_audit(
+                fid,
+                "CLONE_USER_BALANCE_ZEROED",
+                target_user_id=target_uid,
+                master_admin=user_id,
+                old_balance=old_balance,
+                old_withdrawable_balance=old_withdrawable,
+                old_platform_backed_balance=old_platform_backed,
+                old_owner_backed_balance=old_owner_backed,
+                released_owner_backing=released_owner_backing,
+            )
+
+            await event.edit(
+                "✅ **Clone User Balance Zeroed**\n\n"
+                f"Clone: `{fid}`\n"
+                f"User: `{target_uid}`\n"
+                f"Previous balance: ₹{old_balance:.2f}\n"
+                f"Current balance: **₹0.00**\n"
+                + (
+                    f"Released to clone owner Master Wallet: ₹{released_owner_backing:.2f}\n"
+                    if released_owner_backing > 0
+                    else ""
+                )
+                + "\nDeposit/order records were retained.",
+                buttons=[
+                    [Button.inline(
+                        "👤 View User Record",
+                        f"admin_clone_user_{fid}_{target_uid}".encode(),
+                        style="primary"
+                    )],
+                    [Button.inline(
+                        "👥 Clone Users",
+                        f"admin_clone_users_{fid}_0".encode(),
+                        style="primary"
+                    )],
+                ]
+            )
+            await safe_callback_answer(event, "✅ Balance set to zero")
             return
 
         if data.startswith("admin_clone_audit_"):
@@ -6633,9 +7005,19 @@ async def callback_handler(event):
                 await event.edit("✅ Withdrawal approved.", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             else:
                 # Refund the reserved amount back since the withdrawal did not happen.
+                reject_inc = {
+                    "balance": withdrawal["amount"],
+                    "withdrawable_balance": withdrawal["amount"],
+                }
+                if (
+                    ctx()['is_franchise']
+                    and await get_clone_payment_mode(ctx()['franchise_id']) == "master_managed"
+                ):
+                    reject_inc["platform_backed_balance"] = withdrawal["amount"]
+
                 await users_col.update_one(
                     {"user_id": withdrawal["user_id"]},
-                    {"$inc": {"balance": withdrawal["amount"], "withdrawable_balance": withdrawal["amount"]}},
+                    {"$inc": reject_inc},
                     upsert=True
                 )
                 await withdrawals_col.update_one(
@@ -7144,9 +7526,16 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
     if not await activate_clone_customer_collateral(deposit):
         raise RuntimeError(f"Could not activate collateral for deposit {deposit.get('_id')}")
 
+    deposit_inc = {"balance": amount}
+    if (
+        ctx()['is_franchise']
+        and await get_clone_payment_mode(ctx()['franchise_id']) == "master_managed"
+    ):
+        deposit_inc["platform_backed_balance"] = amount
+
     await users_col.update_one(
         {"user_id": user_id_dep},
-        {"$inc": {"balance": amount}},
+        {"$inc": deposit_inc},
         upsert=True
     )
 
@@ -7198,15 +7587,20 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
                         )
                     else:
                         try:
+                            referral_inc = {
+                                "balance": bonus,
+                                "withdrawable_balance": bonus,
+                                "referral_earnings": bonus,
+                            }
+                            if (
+                                ctx()['is_franchise']
+                                and await get_clone_payment_mode(ctx()['franchise_id']) == "master_managed"
+                            ):
+                                referral_inc["platform_backed_balance"] = bonus
+
                             await users_col.update_one(
                                 {"user_id": referrer_id},
-                                {
-                                    "$inc": {
-                                        "balance": bonus,
-                                        "withdrawable_balance": bonus,
-                                        "referral_earnings": bonus,
-                                    }
-                                },
+                                {"$inc": referral_inc},
                                 upsert=True
                             )
 
@@ -8000,9 +8394,25 @@ async def handle_message(event):
             # Atomically reserve the funds right now so the same balance can't be
             # used for another withdrawal request or a purchase while this one
             # is pending. Refunded automatically if the admin rejects it.
+            wd_query = {
+                "user_id": user_id,
+                "withdrawable_balance": {"$gte": amount},
+                "balance": {"$gte": amount},
+            }
+            wd_inc = {
+                "balance": -amount,
+                "withdrawable_balance": -amount,
+            }
+            if (
+                ctx()['is_franchise']
+                and await get_clone_payment_mode(ctx()['franchise_id']) == "master_managed"
+            ):
+                wd_query["platform_backed_balance"] = {"$gte": amount}
+                wd_inc["platform_backed_balance"] = -amount
+
             reserve_result = await users_col.update_one(
-                {"user_id": user_id, "withdrawable_balance": {"$gte": amount}},
-                {"$inc": {"balance": -amount, "withdrawable_balance": -amount}}
+                wd_query,
+                {"$inc": wd_inc}
             )
             if reserve_result.modified_count == 0:
                 await event.respond(
