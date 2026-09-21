@@ -291,3 +291,21 @@ Latest package syntax-check status:
 - `bot.py` — PASS
 - `account_manager.py` — PASS
 - `vnh_server.py` — PASS
+
+
+## Force-Join Manager Update
+
+Force-Join channels/groups are now managed individually.
+
+- `Add Channel / Group` appends one new entry.
+- Existing IDs/usernames remain saved automatically.
+- You no longer need to re-enter old channel/group IDs when adding another.
+- `Remove One` shows buttons for existing entries and removes only the selected one.
+- `Clear All` is still available.
+- Duplicate entries are prevented.
+- New entries are checked with Telegram before being saved.
+
+
+## Public Log Formatting Fix
+
+Fixed literal `\\n\\n` showing before the bot username. Public logs now use real line breaks.
