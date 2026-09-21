@@ -86,6 +86,16 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
+PUBLIC_LOG_CHANNEL_ID = os.getenv("PUBLIC_LOG_CHANNEL_ID", "").strip()
+if PUBLIC_LOG_CHANNEL_ID:
+    try:
+        PUBLIC_LOG_CHANNEL_ID = int(PUBLIC_LOG_CHANNEL_ID)
+    except ValueError:
+        PUBLIC_LOG_CHANNEL_ID = None
+        logging.warning("PUBLIC_LOG_CHANNEL_ID is not a valid integer, public logs disabled.")
+else:
+    PUBLIC_LOG_CHANNEL_ID = None
+
 # ---------- FRANCHISE MODE ----------
 # Leave FRANCHISE_ID empty to run this bot as the MASTER (source of stock/SMM API,
 # owns the shared MongoDB, no wallet gating). Set FRANCHISE_ID on a franchise
@@ -771,6 +781,66 @@ def mask_phone(phone: str) -> str:
     if len(phone) <= 4:
         return "*" * len(phone)
     return phone[:2] + "*" * (len(phone) - 4) + phone[-2:]
+
+def mask_user_id(user_id) -> str:
+    """Mask roughly half of a Telegram numeric ID for public logs."""
+    raw = str(user_id or "")
+    if not raw:
+        return "N/A"
+    if len(raw) <= 4:
+        return raw[:1] + "*" * max(1, len(raw) - 1)
+    visible_left = max(2, len(raw) // 3)
+    visible_right = max(1, len(raw) // 4)
+    hidden = max(1, len(raw) - visible_left - visible_right)
+    return raw[:visible_left] + ("*" * hidden) + raw[-visible_right:]
+
+
+def mask_public_phone(phone) -> str:
+    """Show about half the number, keeping enough context for public proof."""
+    raw = str(phone or "")
+    if not raw or raw == "N/A":
+        return "N/A"
+    if len(raw) <= 6:
+        return raw[:2] + "*" * max(1, len(raw) - 3) + raw[-1:]
+    left = max(2, len(raw) // 4)
+    right = max(2, len(raw) // 4)
+    return raw[:left] + ("*" * max(1, len(raw) - left - right)) + raw[-right:]
+
+
+async def get_source_bot_username() -> str:
+    """Fetch the current master/clone bot username from Telegram itself."""
+    try:
+        me = await ctx()['client'].get_me()
+        if me and getattr(me, "username", None):
+            return f"@{me.username}"
+    except Exception as e:
+        logging.warning("Could not fetch source bot username for public log: %s", e)
+    return "@UnknownBot"
+
+
+async def public_log_event(text: str):
+    """Send privacy-safe public activity logs through the master bot.
+
+    The source bot/clone username is fetched live from Telegram and appended
+    to every message. PUBLIC_LOG_CHANNEL_ID must be set and the master bot
+    must be able to post in that channel.
+    """
+    if not PUBLIC_LOG_CHANNEL_ID:
+        return
+
+    try:
+        source_username = await get_source_bot_username()
+        final_text = (
+            text.rstrip()
+            + f"\\n\\n🤖 **Bot:** {source_username}"
+        )
+        await bot.send_message(
+            PUBLIC_LOG_CHANNEL_ID,
+            final_text,
+            parse_mode="markdown",
+        )
+    except Exception as e:
+        logging.error("Failed to send public log: %s", e)
 
 async def get_display_name(user_id: int) -> str:
     """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
@@ -2343,7 +2413,10 @@ async def show_welcome_menu(event, user_id):
     if row3:
         buttons.append(row3)
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
-        buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
+        buttons.append([
+            Button.inline("💵 Margin Wallet", b"clone_margin_wallet", style="success"),
+            Button.inline("🏢 Franchise Finance", b"my_franchise_wallet", style="primary"),
+        ])
     if not ctx()['is_franchise']:
         my_clone = await get_user_clone(user_id)
         if my_clone:
@@ -2378,7 +2451,10 @@ async def _build_main_menu(user_id):
     if row3:
         buttons.append(row3)
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
-        buttons.append([Button.inline("🏢 My Franchise Wallet", b"my_franchise_wallet", style="success")])
+        buttons.append([
+            Button.inline("💵 Margin Wallet", b"clone_margin_wallet", style="success"),
+            Button.inline("🏢 Franchise Finance", b"my_franchise_wallet", style="primary"),
+        ])
     if not ctx()['is_franchise']:
         my_clone = await get_user_clone(user_id)
         if my_clone:
@@ -3286,17 +3362,17 @@ async def callback_handler(event):
                 text += (
                     "**Master Managed Mode**\n"
                     "Customer deposits are handled by the platform. You do not control deposit approval/payment credentials. "
-                    "Your sale margin collects in Margin Wallet and can be withdrawn by request."
+                    "Your sale margin collects in Margin Wallet. You can withdraw it or instantly transfer it to your Master Bot wallet."
                 )
                 buttons.append([Button.inline("🏦 Switch to Own Payments", b"clone_switch_own", style="danger")])
-                if summary['earnings_wallet'] > 0:
-                    buttons.append([Button.inline("💸 Withdraw Margin", b"clone_margin_withdraw", style="success")])
+                buttons.append([Button.inline("💵 Open Margin Wallet", b"clone_margin_wallet", style="success")])
             else:
                 text += (
                     "**Own Payment Mode**\n"
                     "Your security deposit stays locked. Every customer deposit is also reserved from your free master balance. "
                     "You can only accept new deposits up to your current free master balance."
                 )
+                buttons.append([Button.inline("💵 Open Margin Wallet", b"clone_margin_wallet", style="success")])
             buttons.append([Button.inline("🔙 Back", b"main", style="primary")])
             await event.edit(text, buttons=buttons)
             await safe_callback_answer(event, )
@@ -3349,6 +3425,59 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
+        if data == "clone_margin_wallet":
+            if not (ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            clone = await get_clone_doc(ctx()['franchise_id'])
+            earnings = round(float((clone or {}).get("earnings_wallet", 0) or 0), 2)
+            total_earned = round(float((clone or {}).get("total_margin_earned", 0) or 0), 2)
+            master_balance = round(await get_owner_master_balance(user_id), 2)
+
+            await event.edit(
+                "💵 **Margin Wallet**\n\n"
+                f"💰 Available Margin: **₹{earnings:.2f}**\n"
+                f"📈 Total Margin Earned: ₹{total_earned:.2f}\n"
+                f"👛 Your Master Bot Wallet: ₹{master_balance:.2f}\n\n"
+                "Choose what you want to do with your available margin:",
+                buttons=[
+                    [
+                        Button.inline("💸 Withdraw Margin", b"clone_margin_withdraw", style="success"),
+                        Button.inline("💰 Transfer to Wallet", b"clone_margin_transfer", style="primary"),
+                    ],
+                    [Button.inline("🔙 Main Menu", b"main", style="primary")],
+                ]
+            )
+            await safe_callback_answer(event, )
+            return
+
+        if data == "clone_margin_transfer":
+            if not (ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            clone = await get_clone_doc(ctx()['franchise_id'])
+            earnings = round(float((clone or {}).get("earnings_wallet", 0) or 0), 2)
+            if earnings <= 0:
+                await safe_callback_answer(event, "No margin available to transfer.", alert=True)
+                return
+
+            user_states[user_id] = {
+                "action": "clone_margin_transfer",
+                "step": "amount",
+                "franchise_id": ctx()['franchise_id'],
+            }
+            await event.edit(
+                "💰 **Transfer Margin to Master Wallet**\n\n"
+                f"Available Margin: **₹{earnings:.2f}**\n\n"
+                "Send the amount you want to transfer.\n"
+                "The transfer is instant and does not require withdrawal approval.",
+                buttons=[[Button.inline("❌ Cancel", b"clone_margin_wallet", style="danger")]]
+            )
+            await safe_callback_answer(event, )
+            return
+
         if data == "clone_margin_withdraw":
             if not (ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']):
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
@@ -3361,7 +3490,7 @@ async def callback_handler(event):
             user_states[user_id] = {"action": "clone_margin_withdraw", "step": "amount", "franchise_id": ctx()['franchise_id']}
             await event.edit(
                 f"💸 **Withdraw Franchise Margin**\n\nAvailable: ₹{earnings:.2f}\n\nSend withdrawal amount:",
-                buttons=[[Button.inline("❌ Cancel", b"my_franchise_wallet", style="danger")]]
+                buttons=[[Button.inline("❌ Cancel", b"clone_margin_wallet", style="danger")]]
             )
             await safe_callback_answer(event, )
             return
@@ -3808,6 +3937,16 @@ async def callback_handler(event):
                     f"🧾 Supplier cost: ₹{wholesale_inr}\n"
                     f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
                 )
+                await public_log_event(
+                    f"🛒 **New Purchase**\n"
+                    f"🖥️ Server: **Server 2**\n"
+                    f"👤 User ID: `{mask_user_id(user_id)}`\n"
+                    f"📱 Number: `{mask_public_phone(phone)}`\n"
+                    f"🌍 Country: **{country_name}**\n"
+                    f"💰 Amount: **₹{retail_price}**\n"
+                    f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST\n\n"
+                    "💙 **Thank you for your purchase!**"
+                )
             except Exception:
                 pass
 
@@ -4159,6 +4298,16 @@ async def callback_handler(event):
                 f"💰 Price: ₹{retail_price}" + (f" (wholesale ₹{price})" if ctx()['is_franchise'] else "") + "\n"
                 f"👛 Balance After: ₹{new_balance}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+            )
+            await public_log_event(
+                f"🛒 **New Purchase**\n"
+                f"🖥️ Server: **Server 1**\n"
+                f"👤 User ID: `{mask_user_id(user_id)}`\n"
+                f"📱 Number: `{mask_public_phone(phone)}`\n"
+                f"🌍 Country: **{country}**\n"
+                f"💰 Amount: **₹{retail_price}**\n"
+                f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST\n\n"
+                "💙 **Thank you for your purchase!**"
             )
             await safe_callback_answer(event, "✅ Purchase successful!", alert=True)
             return
@@ -6059,59 +6208,241 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        # ---------- APPROVE / REJECT WITHDRAWAL ----------
-        if data.startswith("cwapprove_") or data.startswith("cwreject_"):
+        # ---------- CLONE MARGIN WITHDRAWAL: APPROVE -> CONFIRM PAYMENT ----------
+        if (
+            data.startswith("cwapprove_")
+            or data.startswith("cwreject_")
+            or data.startswith("cwpaid_")
+            or data.startswith("cwcancel_")
+        ):
             if ctx()['is_franchise'] or not await is_admin(user_id):
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
                 return
-            approve = data.startswith("cwapprove_")
-            wid = data.split("_", 1)[1]
+
+            if data.startswith("cwapprove_"):
+                action = "approve"
+                wid = data[len("cwapprove_"):]
+            elif data.startswith("cwreject_"):
+                action = "reject"
+                wid = data[len("cwreject_"):]
+            elif data.startswith("cwpaid_"):
+                action = "paid"
+                wid = data[len("cwpaid_"):]
+            else:
+                action = "cancel"
+                wid = data[len("cwcancel_"):]
+
             try:
                 oid = ObjectId(wid)
             except Exception:
                 await safe_callback_answer(event, "❌ Invalid request.", alert=True)
                 return
+
             req = await clone_withdrawals_col.find_one({"_id": oid})
             if not req:
                 await safe_callback_answer(event, "❌ Request not found.", alert=True)
                 return
-            result = await clone_withdrawals_col.update_one(
-                {"_id": oid, "status": "pending"},
-                {"$set": {
-                    "status": "approved" if approve else "rejected",
-                    "processed_at": now_ist(),
-                    "processed_by": user_id,
-                }}
-            )
-            if result.modified_count == 0:
-                await safe_callback_answer(event, "Already processed.", alert=True)
+
+            # Step 1: Admin approval only moves the request into payout_pending.
+            # It does NOT finalize the withdrawal until "Payment Sent" is confirmed.
+            if action == "approve":
+                result = await clone_withdrawals_col.update_one(
+                    {"_id": oid, "status": "pending"},
+                    {"$set": {
+                        "status": "payout_pending",
+                        "approved_at": now_ist(),
+                        "approved_by": user_id,
+                    }}
+                )
+                if result.modified_count == 0:
+                    current = await clone_withdrawals_col.find_one({"_id": oid})
+                    status = (current or {}).get("status", "unknown")
+                    await safe_callback_answer(
+                        event,
+                        f"Already processed / current status: {status}",
+                        alert=True
+                    )
+                    return
+
+                await clone_audit(
+                    req['franchise_id'],
+                    "MARGIN_WITHDRAWAL_APPROVED_AWAITING_PAYMENT",
+                    amount=req['amount'],
+                    request_id=str(oid),
+                    master_admin=user_id,
+                )
+
+                try:
+                    msg = await event.get_message()
+                    base = (msg.text or msg.message or "") if msg else ""
+                    if "AWAITING PAYMENT" not in base:
+                        base += (
+                            "\n\n🟡 **APPROVED — AWAITING PAYMENT**\n"
+                            "Send the payout first, then press **Payment Sent**."
+                        )
+                    await event.edit(
+                        base,
+                        buttons=[
+                            [Button.inline(
+                                "✅ Payment Sent",
+                                f"cwpaid_{oid}",
+                                style="success"
+                            )],
+                            [Button.inline(
+                                "❌ Cancel & Restore Margin",
+                                f"cwcancel_{oid}",
+                                style="danger"
+                            )],
+                        ]
+                    )
+                except Exception as e:
+                    logging.warning("Could not update clone withdrawal admin message: %s", e)
+
+                await safe_callback_answer(
+                    event,
+                    "Approved. Confirm after payment is actually sent.",
+                    alert=True
+                )
                 return
-            if not approve:
+
+            # Step 2: Payment confirmation finalizes the withdrawal.
+            if action == "paid":
+                result = await clone_withdrawals_col.update_one(
+                    {"_id": oid, "status": "payout_pending"},
+                    {"$set": {
+                        "status": "approved",
+                        "payment_sent_at": now_ist(),
+                        "payment_sent_by": user_id,
+                        "processed_at": now_ist(),
+                        "processed_by": user_id,
+                    }}
+                )
+                if result.modified_count == 0:
+                    current = await clone_withdrawals_col.find_one({"_id": oid})
+                    status = (current or {}).get("status", "unknown")
+                    await safe_callback_answer(
+                        event,
+                        f"Cannot confirm payment. Current status: {status}",
+                        alert=True
+                    )
+                    return
+
+                clone = await bot_clones_col.find_one(
+                    {"franchise_id": req['franchise_id']}
+                )
+                if clone:
+                    client = clone_clients.get(req['franchise_id'])
+                    if client:
+                        try:
+                            await client.send_message(
+                                clone['owner_id'],
+                                f"✅ **Margin Withdrawal Paid**\n\n"
+                                f"Amount: ₹{float(req['amount']):.2f}\n"
+                                f"UPI: `{req.get('upi_id', 'N/A')}`\n\n"
+                                "The master admin has marked your payout as sent."
+                            )
+                        except Exception:
+                            pass
+
+                await clone_audit(
+                    req['franchise_id'],
+                    "MARGIN_WITHDRAWAL_PAYMENT_SENT",
+                    amount=req['amount'],
+                    request_id=str(oid),
+                    master_admin=user_id,
+                    upi_id=req.get("upi_id"),
+                )
+
+                try:
+                    msg = await event.get_message()
+                    base = (msg.text or msg.message or "") if msg else ""
+                    # Keep only one final marker if possible.
+                    if "✅ **PAID / COMPLETED**" not in base:
+                        base += (
+                            "\n\n✅ **PAID / COMPLETED**\n"
+                            f"Confirmed by master admin `{user_id}`."
+                        )
+                    await event.edit(base, buttons=None)
+                except Exception:
+                    pass
+
+                await safe_callback_answer(event, "✅ Payment marked as sent")
+                return
+
+            # Reject from the initial request OR cancel after preliminary approval.
+            # Margin is restored exactly once because the status transition is atomic.
+            if action in ("reject", "cancel"):
+                result = await clone_withdrawals_col.update_one(
+                    {
+                        "_id": oid,
+                        "status": {"$in": ["pending", "payout_pending"]},
+                    },
+                    {"$set": {
+                        "status": "rejected" if action == "reject" else "cancelled",
+                        "processed_at": now_ist(),
+                        "processed_by": user_id,
+                    }}
+                )
+                if result.modified_count == 0:
+                    current = await clone_withdrawals_col.find_one({"_id": oid})
+                    status = (current or {}).get("status", "unknown")
+                    await safe_callback_answer(
+                        event,
+                        f"Already processed / current status: {status}",
+                        alert=True
+                    )
+                    return
+
                 await bot_clones_col.update_one(
                     {"franchise_id": req['franchise_id']},
                     {"$inc": {"earnings_wallet": float(req['amount'])}}
                 )
-            clone = await bot_clones_col.find_one({"franchise_id": req['franchise_id']})
-            if clone:
-                client = clone_clients.get(req['franchise_id'])
-                if client:
-                    try:
-                        await client.send_message(
-                            clone['owner_id'],
-                            (f"✅ Margin withdrawal ₹{req['amount']} approved. Please allow the master admin time to complete payout."
-                             if approve else f"❌ Margin withdrawal ₹{req['amount']} rejected. Amount restored to your Margin Wallet.")
-                        )
-                    except Exception:
-                        pass
-            await clone_audit(req['franchise_id'], "MARGIN_WITHDRAWAL_APPROVED" if approve else "MARGIN_WITHDRAWAL_REJECTED", amount=req['amount'], request_id=str(oid), master_admin=user_id)
-            try:
-                msg = await event.get_message()
-                base = (msg.text or msg.message or "") if msg else ""
-                await event.edit(base + ("\n\n✅ **APPROVED**" if approve else "\n\n❌ **REJECTED**"), buttons=None)
-            except Exception:
-                pass
-            await safe_callback_answer(event, "✅ Approved" if approve else "❌ Rejected")
-            return
+
+                clone = await bot_clones_col.find_one(
+                    {"franchise_id": req['franchise_id']}
+                )
+                if clone:
+                    client = clone_clients.get(req['franchise_id'])
+                    if client:
+                        try:
+                            label = "cancelled" if action == "cancel" else "rejected"
+                            await client.send_message(
+                                clone['owner_id'],
+                                f"❌ Margin withdrawal ₹{float(req['amount']):.2f} {label}.\n"
+                                "The amount has been restored to your Margin Wallet."
+                            )
+                        except Exception:
+                            pass
+
+                await clone_audit(
+                    req['franchise_id'],
+                    "MARGIN_WITHDRAWAL_CANCELLED"
+                    if action == "cancel"
+                    else "MARGIN_WITHDRAWAL_REJECTED",
+                    amount=req['amount'],
+                    request_id=str(oid),
+                    master_admin=user_id,
+                )
+
+                try:
+                    msg = await event.get_message()
+                    base = (msg.text or msg.message or "") if msg else ""
+                    final_text = (
+                        "\n\n❌ **CANCELLED — MARGIN RESTORED**"
+                        if action == "cancel"
+                        else "\n\n❌ **REJECTED — MARGIN RESTORED**"
+                    )
+                    await event.edit(base + final_text, buttons=None)
+                except Exception:
+                    pass
+
+                await safe_callback_answer(
+                    event,
+                    "❌ Cancelled & restored"
+                    if action == "cancel"
+                    else "❌ Rejected & restored"
+                )
+                return
 
         if data.startswith("wapprove_") or data.startswith("wreject_"):
             if not await is_admin(user_id):
@@ -6600,6 +6931,13 @@ async def process_add_stock_step(event):
         f"➕ Added: {added} | ♻️ Duplicates: {duplicates} | ❌ Failed: {failed}\n"
         f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
     )
+    await public_log_event(
+        f"📦 **Stock Update**\n"
+        f"🌍 Country: **{country}**\n"
+        f"💰 Price: **₹{price}**\n"
+        f"✅ New Stock Added: **{added}**\n"
+        f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+    )
     user_states.pop(user_id, None)
 
 
@@ -6792,6 +7130,13 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
         f"🧾 Ref: `{deposit.get('txn_id') or deposit.get('qr_code_id') or 'N/A'}`\n"
         f"👤 Approved by: {approver_label}\n"
         f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+    )
+    await public_log_event(
+        f"💳 **Deposit Successful**\n"
+        f"👤 User ID: `{mask_user_id(user_id_dep)}`\n"
+        f"💰 Amount: **₹{amount}**\n"
+        f"✅ Status: **Approved**\n"
+        f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
     )
 
 
@@ -8110,6 +8455,102 @@ async def handle_message(event):
         user_states.pop(user_id, None)
         return
 
+    elif action == "clone_margin_transfer":
+        if not (ctx()['is_franchise'] and ctx()['owner_id'] == user_id):
+            user_states.pop(user_id, None)
+            return
+
+        if state.get("step") != "amount":
+            return
+
+        fid = state.get("franchise_id") or ctx()['franchise_id']
+
+        try:
+            amount = round(float((event.message.text or "").strip()), 2)
+            if amount <= 0:
+                raise ValueError
+        except Exception:
+            await event.respond("❌ Send a valid positive amount.")
+            return
+
+        # Reserve the margin atomically so two simultaneous transfer attempts
+        # cannot spend the same Margin Wallet balance.
+        reserve = await bot_clones_col.update_one(
+            {
+                "franchise_id": fid,
+                "owner_id": user_id,
+                "earnings_wallet": {"$gte": amount},
+            },
+            {
+                "$inc": {"earnings_wallet": -amount},
+                "$set": {"updated_at": now_ist()},
+            }
+        )
+
+        if reserve.modified_count == 0:
+            clone = await bot_clones_col.find_one({"franchise_id": fid})
+            available = round(float((clone or {}).get("earnings_wallet", 0) or 0), 2)
+            await event.respond(
+                f"❌ Transfer failed. Available Margin Wallet is ₹{available:.2f}."
+            )
+            user_states.pop(user_id, None)
+            return
+
+        try:
+            # Credit the clone owner's personal wallet on the MASTER scope.
+            await refund_owner_master_balance(user_id, amount)
+        except Exception as e:
+            # Compensating rollback: return the reserved margin if master-wallet
+            # credit did not complete.
+            await bot_clones_col.update_one(
+                {"franchise_id": fid, "owner_id": user_id},
+                {"$inc": {"earnings_wallet": amount}}
+            )
+            logging.exception(
+                "Margin-to-master-wallet transfer failed for franchise %s owner %s",
+                fid,
+                user_id,
+            )
+            await clone_audit(
+                fid,
+                "MARGIN_TRANSFER_FAILED",
+                owner_id=user_id,
+                amount=amount,
+                error=str(e)[:300],
+            )
+            await event.respond(
+                "❌ Transfer could not be completed. Your Margin Wallet amount was restored."
+            )
+            user_states.pop(user_id, None)
+            return
+
+        new_master_balance = round(await get_owner_master_balance(user_id), 2)
+        clone = await bot_clones_col.find_one({"franchise_id": fid})
+        remaining_margin = round(float((clone or {}).get("earnings_wallet", 0) or 0), 2)
+
+        await clone_audit(
+            fid,
+            "MARGIN_TRANSFERRED_TO_MASTER_WALLET",
+            owner_id=user_id,
+            amount=amount,
+            remaining_margin=remaining_margin,
+            new_master_balance=new_master_balance,
+        )
+
+        await event.respond(
+            "✅ **Margin Transferred Successfully**\n\n"
+            f"💰 Transferred: ₹{amount:.2f}\n"
+            f"💵 Remaining Margin: ₹{remaining_margin:.2f}\n"
+            f"👛 Master Bot Wallet: ₹{new_master_balance:.2f}\n\n"
+            "You can now use this amount normally from your Master Bot wallet.",
+            buttons=[
+                [Button.inline("💵 Margin Wallet", b"clone_margin_wallet", style="success")],
+                [Button.inline("🔙 Main Menu", b"main", style="primary")],
+            ]
+        )
+        user_states.pop(user_id, None)
+        return
+
     elif action == "clone_margin_withdraw":
         if not (ctx()['is_franchise'] and ctx()['owner_id'] == user_id):
             user_states.pop(user_id, None)
@@ -8169,7 +8610,7 @@ async def handle_message(event):
             await clone_audit(fid, "MARGIN_WITHDRAWAL_REQUESTED", owner_id=user_id, amount=amount, upi_id=upi, request_id=str(req.inserted_id))
             await event.respond(
                 f"✅ Margin withdrawal request submitted.\nAmount: ₹{amount:.2f}\nUPI: `{upi}`",
-                buttons=[[Button.inline("🏢 Finance Status", b"my_franchise_wallet", style="primary")]]
+                buttons=[[Button.inline("💵 Margin Wallet", b"clone_margin_wallet", style="primary")]]
             )
             user_states.pop(user_id, None)
             return
