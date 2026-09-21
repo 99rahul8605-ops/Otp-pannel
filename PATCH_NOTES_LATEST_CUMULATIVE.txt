@@ -1,0 +1,34 @@
+Original/full bot cumulative patch
+
+Base:
+Otp-pannel_ORIGINAL_FULL_SOLD_INVALID_NO_REPEAT.zip
+
+Added:
+1. Support URL safety
+   - Invalid stored support links no longer crash /start.
+   - @username and t.me/username normalize to https://t.me/username.
+   - Invalid admin input is rejected.
+
+2. Telegram callback/transient RPC resilience
+   - 244 explicit event.answer() calls now use safe_callback_answer().
+   - QueryIdInvalidError from expired callbacks is ignored safely.
+   - Temporary Telegram ServerError/RPC -500 errors retry on force-join checks.
+   - Asyncio background callback/server errors are handled more cleanly.
+
+3. Referral reward one-time atomic claim
+   - Prevents duplicate reward from concurrent manual/Razorpay approvals.
+   - First approved deposit consumes the reward opportunity exactly once.
+   - Adds referral audit metadata.
+   - Historical duplicates are NOT automatically reversed.
+
+Preserved original/full features:
+- Server 1
+- Server 2 / VNH
+- clone / franchise
+- Razorpay / auto-payment
+- SMM
+- inactive Replace/Remove
+- stock Telegram names
+- OTP received time
+- sold status preservation
+- sold invalid no-repeat cleanup

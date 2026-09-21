@@ -1,0 +1,50 @@
+CLONE / FRANCHISE FRAUD PROTECTION PATCH
+
+Default mode: MASTER MANAGED
+- Master/platform handles clone customer deposits.
+- Clone owner cannot manually add customer balance.
+- Successful sale margin is collected in clone earnings_wallet.
+- Clone owner can request margin withdrawal.
+
+OWN PAYMENT mode
+- Clone owner must first lock the required security deposit from their personal master-bot balance.
+- Security remains locked and is not automatically returned on clone removal.
+- Every clone-customer deposit additionally locks the SAME amount from the clone owner's free master-bot balance.
+- If free backing is insufficient, that deposit is rejected.
+
+Example:
+Owner master balance: Rs 2,000
+Security requirement: Rs 1,000
+After switching to OWN PAYMENT:
+  Security locked: Rs 1,000
+  Free balance: Rs 1,000
+
+Customer deposits Rs 1,000:
+  Customer backing locked: Rs 1,000
+  Owner free balance: Rs 0
+
+So the owner cannot accept the customer's deposit and then spend its backing on the master bot.
+
+Other protections:
+- approved own-payment deposits become customer_funds_locked / owner_backed_balance
+- cancelled/rejected/expired reservations release backing
+- sale failures roll back finance reservations
+- clone referral rewards are funded by clone, not master
+- manual customer balance adjustment is blocked for clone admin
+- low security falls back to master-managed protection
+- clone closure notifies users and freezes deposits
+- clones with liabilities enter CLOSING instead of being erased
+- historical clone/users/deposits/orders/audit records remain available to master
+- master admin can inspect clone users, balances, backing, deposits, orders and finance audit
+- security deposit stays locked on removal
+
+Environment fallback:
+CLONE_SECURITY_DEPOSIT_MIN=1000
+
+Static validation:
+bot.py: PASS
+account_manager.py: PASS
+vnh_server.py: PASS
+audit_referrals.py: PASS
+
+No live Telegram/Razorpay/MongoDB integration test was performed.
