@@ -309,3 +309,13 @@ Force-Join channels/groups are now managed individually.
 ## Public Log Formatting Fix
 
 Fixed literal `\\n\\n` showing before the bot username. Public logs now use real line breaks.
+
+
+## Single Account Stock Log Fix
+
+Public/private stock logs now trigger for all stock-add methods:
+- Add account by phone number + OTP
+- Add account by session string
+- Bulk stock add
+
+Single-account public logs show the phone number masked and `New Stock Added: 1`.

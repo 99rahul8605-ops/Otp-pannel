@@ -6827,7 +6827,30 @@ async def process_phone_otp_step(event):
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, session_str)
-        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+        await event.respond(
+            f"✅ Account `{phone}` ({country}) added at ₹{price}!",
+            buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]]
+        )
+
+        admin_name = await get_display_name(user_id)
+        await log_event(
+            f"📦 **Stock Added**\n"
+            f"👤 Admin: {admin_name} (`{user_id}`)\n"
+            f"📱 Phone: `{phone}`\n"
+            f"🌍 Country: {country}\n"
+            f"💰 Price: ₹{price}\n"
+            f"➕ Added: 1\n"
+            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
+        await public_log_event(
+            f"📦 **Stock Update**\n"
+            f"📱 Number: `{mask_public_phone(phone)}`\n"
+            f"🌍 Country: **{country}**\n"
+            f"💰 Price: **₹{price}**\n"
+            f"✅ New Stock Added: **1**\n"
+            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
+
         user_states.pop(user_id, None)
 
 async def start_add_session_flow(event):
@@ -6933,7 +6956,30 @@ async def process_session_step(event):
             insert_data["twofa_password"] = twofa_password
         await accounts_col.insert_one(insert_data)
         await acc_mgr.add_client(phone, new_session)
-        await event.respond(f"✅ Account `{phone}` ({country}) added at ₹{price}!", buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
+        await event.respond(
+            f"✅ Account `{phone}` ({country}) added at ₹{price}!",
+            buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]]
+        )
+
+        admin_name = await get_display_name(user_id)
+        await log_event(
+            f"📦 **Stock Added**\n"
+            f"👤 Admin: {admin_name} (`{user_id}`)\n"
+            f"📱 Phone: `{phone}`\n"
+            f"🌍 Country: {country}\n"
+            f"💰 Price: ₹{price}\n"
+            f"➕ Added: 1\n"
+            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
+        await public_log_event(
+            f"📦 **Stock Update**\n"
+            f"📱 Number: `{mask_public_phone(phone)}`\n"
+            f"🌍 Country: **{country}**\n"
+            f"💰 Price: **₹{price}**\n"
+            f"✅ New Stock Added: **1**\n"
+            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
+
         user_states.pop(user_id, None)
 
 
