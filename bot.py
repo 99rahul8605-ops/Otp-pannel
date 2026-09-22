@@ -2491,9 +2491,16 @@ def parse_chat_id(raw_id: str):
         return None
 
 async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
+    """Return True only for an actual usable member.
+
+    Telegram can still return a permissions object for a banned/kicked
+    participant. The old code treated any successful get_permissions() call
+    as membership, which allowed banned users to keep using the bot.
+    """
     parsed = parse_chat_id(chat_id_raw)
     if parsed is None:
         return False
+
     try:
         client = ctx()['client']
         entity = await telegram_retry(
@@ -2502,13 +2509,43 @@ async def is_user_member_of(chat_id_raw: str, user_id: int) -> bool:
             base_delay=1.0,
             label=f"Get entity {chat_id_raw}"
         )
-        await telegram_retry(
+
+        perms = await telegram_retry(
             lambda: client.get_permissions(entity, user_id),
             attempts=3,
             base_delay=1.0,
             label=f"Check membership {chat_id_raw}/{user_id}"
         )
+
+        # IMPORTANT: get_permissions() may succeed even for banned users.
+        # Explicitly reject banned/left participant states.
+        if getattr(perms, "is_banned", False):
+            logging.info(
+                "Force-join rejected banned user %s in %s",
+                user_id, chat_id_raw
+            )
+            return False
+
+        participant = getattr(perms, "participant", None)
+        participant_type = type(participant).__name__ if participant is not None else ""
+        if participant_type in {"ChannelParticipantBanned", "ChannelParticipantLeft"}:
+            logging.info(
+                "Force-join rejected user %s in %s (%s)",
+                user_id, chat_id_raw, participant_type
+            )
+            return False
+
+        # Some Telethon versions expose view_messages=False for a ban.
+        view_messages = getattr(perms, "view_messages", None)
+        if view_messages is False:
+            logging.info(
+                "Force-join rejected user %s in %s (view_messages=False)",
+                user_id, chat_id_raw
+            )
+            return False
+
         return True
+
     except UserNotParticipantError:
         return False
     except (ChatAdminRequiredError, ChannelPrivateError) as e:

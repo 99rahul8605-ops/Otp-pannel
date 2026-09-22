@@ -376,3 +376,20 @@ When confirmed:
 Own Payment safety:
 - If the user's balance has owner-backed collateral, that collateral is released back to the clone owner's Master Bot wallet.
 - If the backing figures are inconsistent, the zero-balance action is blocked instead of silently corrupting finance records.
+
+
+## Force-Join Ban Fix
+
+Force-join membership verification now explicitly rejects:
+- users banned from a required channel/group
+- users represented as `ChannelParticipantBanned`
+- users represented as `ChannelParticipantLeft`
+- permission states where `view_messages=False`
+
+Previously a successful Telegram `get_permissions()` call was treated as membership,
+even when Telegram returned a banned participant object. This allowed some banned
+users to keep using the bot.
+
+The force-join check is already executed on `/start`, normal private messages,
+menu callbacks, and purchase-related callbacks, so a banned user is blocked the
+next time they interact with the bot.
