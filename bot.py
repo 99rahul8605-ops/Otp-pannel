@@ -2203,7 +2203,7 @@ async def build_vnh_search_results_menu(user_id: int, page: int = 0):
 
     buttons.append([
         Button.inline("🔎 New Search", b"vnh_search_country", style="success"),
-        Button.inline("📋 All Countries", b"buy_vnh", style="primary"),
+        Button.inline("📋 All Countries", b"server2", style="primary"),
     ])
     buttons.append([Button.inline("🔙 Servers", b"buy", style="primary")])
 
@@ -3611,7 +3611,7 @@ async def callback_handler(event):
 
             if vnh_server.configured:
                 buttons.append([
-                    Button.inline("Server 2", b"buy_vnh", style="success")
+                    Button.inline("Server 2", b"server2", style="success")
                 ])
 
             buttons.append([Button.inline("🔙 Back", b"main", style="primary")])
@@ -3681,14 +3681,14 @@ async def callback_handler(event):
                 "Send country name or country code.\n"
                 "Examples: `India`, `IN`, `Bangladesh`, `US`",
                 buttons=[
-                    [Button.inline("📋 Back to All Countries", b"buy_vnh", style="primary")],
+                    [Button.inline("📋 Back to All Countries", b"server2", style="primary")],
                     [Button.inline("🔙 Servers", b"buy", style="danger")],
                 ],
             )
             await safe_callback_answer(event, )
             return
 
-        if data == "buy_vnh":
+        if data == "server2":
             if not vnh_server.configured:
                 await safe_callback_answer(event, "❌ Server 2 is not configured.", alert=True)
                 return
@@ -3786,7 +3786,7 @@ async def callback_handler(event):
                             style="success",
                         )
                     ],
-                    [Button.inline("❌ Cancel", b"buy_vnh", style="danger")],
+                    [Button.inline("❌ Cancel", b"server2", style="danger")],
                 ],
             )
             await safe_callback_answer(event, )
@@ -8550,7 +8550,7 @@ async def handle_message(event):
                     f"❌ No country found for `{query}`.",
                     buttons=[
                         [Button.inline("🔎 Search Again", b"vnh_search_country", style="success")],
-                        [Button.inline("📋 All Countries", b"buy_vnh", style="primary")],
+                        [Button.inline("📋 All Countries", b"server2", style="primary")],
                     ],
                 )
                 return
