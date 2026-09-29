@@ -33,7 +33,7 @@ import hmac
 from aiohttp import web
 from bson import ObjectId
 from account_manager import AccountManager
-from vnh_server import VNHServer
+from server2_server import Server2Server
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -51,10 +51,10 @@ REFERRAL_BONUS_MAX = float(os.getenv("REFERRAL_BONUS_MAX", "5").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
 CLONE_SECURITY_DEPOSIT_MIN = float(os.getenv("CLONE_SECURITY_DEPOSIT_MIN", "1000").strip())
 
-# ---------- VNHAPI TELEGRAM SERVER ----------
-VNH_API_KEY = os.getenv("VNH_API_KEY", "").strip()
-VNH_API_BASE = os.getenv("VNH_API_BASE", "https://api.vnhotp.com").strip()
-VNH_MARKUP_PERCENT = float(os.getenv("VNH_MARKUP_PERCENT", "20").strip())
+# ---------- SERVER 2 TELEGRAM API ----------
+SERVER2_API_KEY = os.getenv("SERVER2_API_KEY", os.getenv("VNH_API_KEY", "")).strip()
+SERVER2_API_BASE = os.getenv("SERVER2_API_BASE", os.getenv("VNH_API_BASE", "https://api.vnhotp.com")).strip()
+SERVER2_MARKUP_PERCENT = float(os.getenv("SERVER2_MARKUP_PERCENT", os.getenv("VNH_MARKUP_PERCENT", "20")).strip())
 
 # ---------- RAZORPAY (auto-approved UPI QR deposits) ----------
 # Optional. If a Razorpay Key ID + Key Secret are configured (via .env for the
@@ -2067,26 +2067,26 @@ async def get_usd_inr() -> float:
     return _usd_inr
 
 
-# ---------- VNH SERVER INSTANCE ----------
-vnh_server = VNHServer(
-    api_key=VNH_API_KEY,
-    base_url=VNH_API_BASE,
+# ---------- SERVER 2 INSTANCE ----------
+server2_server = Server2Server(
+    api_key=SERVER2_API_KEY,
+    base_url=SERVER2_API_BASE,
     settings_col=settings_col,
     get_usd_inr=get_usd_inr,
     now_ist=now_ist,
-    default_markup_percent=VNH_MARKUP_PERCENT,
+    default_markup_percent=SERVER2_MARKUP_PERCENT,
 )
 
 
 
-def _vnh_trim_label(text_value: str, max_len: int = 20) -> str:
+def _server2_trim_label(text_value: str, max_len: int = 20) -> str:
     text_value = str(text_value or "").strip()
     if len(text_value) <= max_len:
         return text_value
     return text_value[: max_len - 1] + "…"
 
 
-def _vnh_country_label(name: str, code: str) -> str:
+def _server2_country_label(name: str, code: str) -> str:
     """Show the country's own flag at the START instead of the generic globe."""
     name = str(name or code or "").strip()
 
@@ -2107,7 +2107,7 @@ def _vnh_country_label(name: str, code: str) -> str:
     return name
 
 
-async def _build_vnh_rows_from_items(items):
+async def _build_server2_rows_from_items(items):
     rows = []
     for item in items:
         code = str(item.get("code", "")).upper()
@@ -2118,15 +2118,15 @@ async def _build_vnh_rows_from_items(items):
         final_price = "₹--"
         try:
             if supplier_price is not None:
-                pricing = await vnh_server.calculate_price(float(supplier_price))
+                pricing = await server2_server.calculate_price(float(supplier_price))
                 final_price = f"₹{pricing['retail_inr']}"
         except Exception:
             final_price = "₹--"
 
-        cb = f"vnh_country_{code}".encode()
+        cb = f"server2_country_{code}".encode()
         rows.append([
             Button.inline(
-                _vnh_trim_label(_vnh_country_label(name, code), 20),
+                _server2_trim_label(_server2_country_label(name, code), 20),
                 cb,
                 style="primary",
             ),
@@ -2136,9 +2136,9 @@ async def _build_vnh_rows_from_items(items):
     return rows
 
 
-async def build_vnh_country_menu(page: int = 0, countries=None, title: str = "🛍️ **Available Telegram Services**"):
+async def build_server2_country_menu(page: int = 0, countries=None, title: str = "🛍️ **Available Telegram Services**"):
     if countries is None:
-        countries = await vnh_server.available_countries()
+        countries = await server2_server.available_countries()
     if not countries:
         return None, None
 
@@ -2148,22 +2148,22 @@ async def build_vnh_country_menu(page: int = 0, countries=None, title: str = "�
     chunk = countries[page * per_page:(page + 1) * per_page]
 
     buttons = [[
-        Button.inline("🌍 Country", b"vnh_noop", style="primary"),
-        Button.inline("💰 Price", b"vnh_noop", style="primary"),
-        Button.inline("📦 Stock", b"vnh_noop", style="primary"),
+        Button.inline("🌍 Country", b"server2_noop", style="primary"),
+        Button.inline("💰 Price", b"server2_noop", style="primary"),
+        Button.inline("📦 Stock", b"server2_noop", style="primary"),
     ]]
 
-    buttons.extend(await _build_vnh_rows_from_items(chunk))
+    buttons.extend(await _build_server2_rows_from_items(chunk))
 
     nav = []
     if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"vnh_countries_{page-1}".encode(), style="primary"))
+        nav.append(Button.inline("⬅️ Prev", f"server2_countries_{page-1}".encode(), style="primary"))
     if page < total_pages - 1:
-        nav.append(Button.inline("Next ➡️", f"vnh_countries_{page+1}".encode(), style="primary"))
+        nav.append(Button.inline("Next ➡️", f"server2_countries_{page+1}".encode(), style="primary"))
     if nav:
         buttons.append(nav)
 
-    buttons.append([Button.inline("🔎 Search Country", b"vnh_search_country", style="success")])
+    buttons.append([Button.inline("🔎 Search Country", b"server2_search_country", style="success")])
     buttons.append([Button.inline("🔙 Servers", b"buy", style="primary")])
 
     text_msg = (
@@ -2174,7 +2174,7 @@ async def build_vnh_country_menu(page: int = 0, countries=None, title: str = "�
     return text_msg, buttons
 
 
-async def build_vnh_search_results_menu(user_id: int, page: int = 0):
+async def build_server2_search_results_menu(user_id: int, page: int = 0):
     state = user_states.get(user_id, {})
     query = str(state.get("query", "")).strip()
     countries = state.get("matches", [])
@@ -2187,22 +2187,22 @@ async def build_vnh_search_results_menu(user_id: int, page: int = 0):
     chunk = countries[page * per_page:(page + 1) * per_page]
 
     buttons = [[
-        Button.inline("🌍 Country", b"vnh_noop", style="primary"),
-        Button.inline("💰 Price", b"vnh_noop", style="primary"),
-        Button.inline("📦 Stock", b"vnh_noop", style="primary"),
+        Button.inline("🌍 Country", b"server2_noop", style="primary"),
+        Button.inline("💰 Price", b"server2_noop", style="primary"),
+        Button.inline("📦 Stock", b"server2_noop", style="primary"),
     ]]
-    buttons.extend(await _build_vnh_rows_from_items(chunk))
+    buttons.extend(await _build_server2_rows_from_items(chunk))
 
     nav = []
     if page > 0:
-        nav.append(Button.inline("⬅️ Prev", f"vnh_search_page_{page-1}".encode(), style="primary"))
+        nav.append(Button.inline("⬅️ Prev", f"server2_search_page_{page-1}".encode(), style="primary"))
     if page < total_pages - 1:
-        nav.append(Button.inline("Next ➡️", f"vnh_search_page_{page+1}".encode(), style="primary"))
+        nav.append(Button.inline("Next ➡️", f"server2_search_page_{page+1}".encode(), style="primary"))
     if nav:
         buttons.append(nav)
 
     buttons.append([
-        Button.inline("🔎 New Search", b"vnh_search_country", style="success"),
+        Button.inline("🔎 New Search", b"server2_search_country", style="success"),
         Button.inline("📋 All Countries", b"server2", style="primary"),
     ])
     buttons.append([Button.inline("🔙 Servers", b"buy", style="primary")])
@@ -3092,6 +3092,14 @@ async def callback_handler(event):
     try:
         set_ctx_from_event(event)
         data = event.data.decode("utf-8")
+
+        # Backward compatibility for buttons sent before the Server 2 rename.
+        # New messages only use clean `server2...` callbacks.
+        if data == "buy_vnh":
+            data = "server2"
+        elif data.startswith("vnh_"):
+            data = "server2_" + data[4:]
+
         user_id = event.sender_id
         logging.info(f"Callback received: {data} from user {user_id}")
 
@@ -3124,7 +3132,7 @@ async def callback_handler(event):
                     "admin_cat_accounts", "admin_cat_finance", "admin_cat_smm", "admin_cat_settings",
                     "admin_referral_settings", "admin_set_ref_percent", "admin_set_ref_max",
                     "admin_cat_franchise", "admin_franchise_list", "admin_franchise_credit",
-                    "admin_account_markup", "admin_vnh_markup", "my_franchise_wallet", "admin_clone_bot",
+                    "admin_account_markup", "admin_server2_markup", "my_franchise_wallet", "admin_clone_bot",
                     "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot",
                     "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name",
                     "admin_razorpay", "admin_edit_rzp_key_id", "admin_edit_rzp_key_secret",
@@ -3609,7 +3617,7 @@ async def callback_handler(event):
                     Button.inline("Server 1", b"buy_manual", style="primary")
                 ])
 
-            if vnh_server.configured:
+            if server2_server.configured:
                 buttons.append([
                     Button.inline("Server 2", b"server2", style="success")
                 ])
@@ -3663,17 +3671,17 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        if data == "vnh_noop":
+        if data == "server2_noop":
             await safe_callback_answer(event, "Select a country row.", alert=False)
             return
 
-        if data == "vnh_search_country":
-            if not vnh_server.configured:
+        if data == "server2_search_country":
+            if not server2_server.configured:
                 await safe_callback_answer(event, "❌ Server 2 is not configured.", alert=True)
                 return
 
             user_states[user_id] = {
-                "action": "vnh_search_country",
+                "action": "server2_search_country",
                 "step": "await_query",
             }
             await event.edit(
@@ -3689,11 +3697,11 @@ async def callback_handler(event):
             return
 
         if data == "server2":
-            if not vnh_server.configured:
+            if not server2_server.configured:
                 await safe_callback_answer(event, "❌ Server 2 is not configured.", alert=True)
                 return
 
-            msg, buttons = await build_vnh_country_menu(0)
+            msg, buttons = await build_server2_country_menu(0)
             if not buttons:
                 await safe_callback_answer(event, 
                     "❌ Server 2 is temporarily unavailable.",
@@ -3705,13 +3713,13 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        if data.startswith("vnh_countries_"):
+        if data.startswith("server2_countries_"):
             try:
                 page = int(data.rsplit("_", 1)[1])
             except Exception:
                 page = 0
 
-            msg, buttons = await build_vnh_country_menu(page)
+            msg, buttons = await build_server2_country_menu(page)
             if not buttons:
                 await safe_callback_answer(event, "❌ Server 2 is temporarily unavailable.", alert=True)
                 return
@@ -3720,13 +3728,13 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        if data.startswith("vnh_search_page_"):
+        if data.startswith("server2_search_page_"):
             try:
                 page = int(data.rsplit("_", 1)[1])
             except Exception:
                 page = 0
 
-            msg, buttons = await build_vnh_search_results_menu(user_id, page)
+            msg, buttons = await build_server2_search_results_menu(user_id, page)
             if not buttons:
                 await safe_callback_answer(event, "❌ Search results expired. Search again.", alert=True)
                 return
@@ -3735,10 +3743,10 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        if data.startswith("vnh_country_"):
-            country_code = data.split("vnh_country_", 1)[1].upper()
+        if data.startswith("server2_country_"):
+            country_code = data.split("server2_country_", 1)[1].upper()
 
-            pricing = await vnh_server.get_country_live_price(country_code)
+            pricing = await server2_server.get_country_live_price(country_code)
             if not pricing.get("success"):
                 await safe_callback_answer(event, 
                     "❌ Server 2 is temporarily unavailable. Please try again later.",
@@ -3747,13 +3755,13 @@ async def callback_handler(event):
                 return
 
             country_name = country_code
-            for item in await vnh_server.available_countries():
+            for item in await server2_server.available_countries():
                 if item["code"] == country_code:
                     country_name = item["name"]
                     break
 
             user_states[user_id] = {
-                "action": "vnh_confirmation",
+                "action": "server2_confirmation",
                 "code": country_code,
                 "country": country_name,
                 "supplier_price": pricing["supplier_price"],
@@ -3782,7 +3790,7 @@ async def callback_handler(event):
                     [
                         Button.inline(
                             "✅ I Agree & Proceed",
-                            b"vnh_confirm_purchase",
+                            b"server2_confirm_purchase",
                             style="success",
                         )
                     ],
@@ -3792,9 +3800,9 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        if data == "vnh_confirm_purchase":
+        if data == "server2_confirm_purchase":
             state = user_states.get(user_id)
-            if not state or state.get("action") != "vnh_confirmation":
+            if not state or state.get("action") != "server2_confirmation":
                 await safe_callback_answer(event, 
                     "Session expired. Please start again.",
                     alert=True,
@@ -3805,7 +3813,7 @@ async def callback_handler(event):
             country_name = state["country"]
 
             # Refresh supplier price immediately before purchase.
-            pricing = await vnh_server.get_country_live_price(country_code)
+            pricing = await server2_server.get_country_live_price(country_code)
             if not pricing.get("success"):
                 await safe_callback_answer(event, 
                     "❌ Server 2 is temporarily unavailable. Please try again later.",
@@ -3857,9 +3865,9 @@ async def callback_handler(event):
 
             await event.edit("⏳ Reserving a number from Server 2...")
 
-            order_response = await vnh_server.place_order(country_code)
+            order_response = await server2_server.place_order(country_code)
 
-            if not vnh_server.ok(order_response):
+            if not server2_server.ok(order_response):
                 # Never expose supplier/provider errors to customers.
                 # This also covers insufficient supplier balance.
                 logging.error(
@@ -3873,7 +3881,7 @@ async def callback_handler(event):
                     {"user_id": user_id},
                     {"$inc": {"balance": retail_price}},
                 )
-                await rollback_franchise_sale(finance_reservation, reason="vnh_supplier_failed")
+                await rollback_franchise_sale(finance_reservation, reason="server2_supplier_failed")
                 user_states.pop(user_id, None)
 
                 await event.edit(
@@ -3898,11 +3906,11 @@ async def callback_handler(event):
                     {"user_id": user_id},
                     {"$inc": {"balance": retail_price}},
                 )
-                await rollback_franchise_sale(finance_reservation, reason="vnh_missing_number")
+                await rollback_franchise_sale(finance_reservation, reason="server2_missing_number")
                 user_states.pop(user_id, None)
 
                 logging.error(
-                    "VNH order returned success without a number: %s",
+                    "Server 2 order returned success without a number: %s",
                     order_response,
                 )
 
@@ -3923,14 +3931,14 @@ async def callback_handler(event):
                 "amount": retail_price,
                 "wholesale_amount": wholesale_inr,
                 "supplier_price": pricing["supplier_price"],
-                "source": "vnh",
+                "source": "server2",
                 "franchise_finance": finance_reservation,
                 "status": "waiting_otp",
                 "created_at": now_ist(),
             })
 
             order_id = str(inserted.inserted_id)
-            await commit_franchise_sale(finance_reservation, source="server2_vnh", order_id=order_id)
+            await commit_franchise_sale(finance_reservation, source="server2", order_id=order_id)
             user_states.pop(user_id, None)
 
             await event.edit(
@@ -3943,7 +3951,7 @@ async def callback_handler(event):
                     [
                         Button.inline(
                             "🔐 Get OTP",
-                            f"vnh_otp_{order_id}".encode(),
+                            f"server2_otp_{order_id}".encode(),
                             style="success",
                         )
                     ],
@@ -3985,8 +3993,8 @@ async def callback_handler(event):
             await safe_callback_answer(event, "✅ Number reserved!", alert=True)
             return
 
-        if data.startswith("vnh_otp_"):
-            order_id = data.split("vnh_otp_", 1)[1].strip()
+        if data.startswith("server2_otp_"):
+            order_id = data.split("server2_otp_", 1)[1].strip()
 
             try:
                 oid = ObjectId(order_id)
@@ -4001,7 +4009,7 @@ async def callback_handler(event):
 
             if not order:
                 logging.warning(
-                    f"VNH OTP order not found: order_id={order_id}, user_id={user_id}"
+                    f"Server 2 OTP order not found: order_id={order_id}, user_id={user_id}"
                 )
                 await safe_callback_answer(event, "❌ Order not found. Please contact admin.", alert=True)
                 return
@@ -4010,7 +4018,7 @@ async def callback_handler(event):
             stored_uid = order.get("user_id")
             if str(stored_uid) != str(user_id):
                 logging.warning(
-                    f"VNH OTP ownership mismatch: order_id={order_id}, "
+                    f"Server 2 OTP ownership mismatch: order_id={order_id}, "
                     f"stored_uid={stored_uid}, callback_uid={user_id}"
                 )
                 await safe_callback_answer(event, "❌ This order does not belong to you.", alert=True)
@@ -4019,17 +4027,17 @@ async def callback_handler(event):
             # Keep compatibility with orders created before the `source` field
             # was added. Reject only when a different source is explicitly set.
             order_source = order.get("source")
-            if order_source not in (None, "", "vnh"):
+            if order_source not in (None, "", "server2", "vnh"):
                 logging.warning(
-                    f"VNH OTP source mismatch: order_id={order_id}, source={order_source}"
+                    f"Server 2 OTP source mismatch: order_id={order_id}, source={order_source}"
                 )
                 await safe_callback_answer(event, "❌ Invalid order type.", alert=True)
                 return
 
             phone = order.get("phone", "")
-            otp_response = await vnh_server.get_code(phone)
+            otp_response = await server2_server.get_code(phone)
 
-            if not vnh_server.ok(otp_response):
+            if not server2_server.ok(otp_response):
                 logging.warning(
                     "Server 2 OTP fetch failed for order=%s phone=%s response=%r",
                     order_id,
@@ -4078,7 +4086,7 @@ async def callback_handler(event):
                     [
                         Button.inline(
                             "🔄 Refresh OTP",
-                            f"vnh_otp_{order_id}".encode(),
+                            f"server2_otp_{order_id}".encode(),
                             style="primary",
                         )
                     ],
@@ -5303,7 +5311,7 @@ async def callback_handler(event):
                 # their own retail markup on top of it.
                 btns = [
                     [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
-                    [Button.inline("🌐 Set Server 2 Markup", b"admin_vnh_markup", style="primary")],
+                    [Button.inline("🌐 Set Server 2 Markup", b"admin_server2_markup", style="primary")],
                     [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
                 ]
                 await event.edit(
@@ -5320,7 +5328,7 @@ async def callback_handler(event):
                 [Button.inline("📦 Add Accounts to Stock", b"admin_add_stock", style="success")],
                 [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
                 [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
-                [Button.inline("🌐 Set Server 2 Markup", b"admin_vnh_markup", style="primary")],
+                [Button.inline("🌐 Set Server 2 Markup", b"admin_server2_markup", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("📦 **Accounts & Stock**", buttons=btns)
@@ -5349,19 +5357,19 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
-        if data == "admin_vnh_markup":
+        if data == "admin_server2_markup":
             if not await is_admin(user_id):
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
                 return
 
-            current_markup = await vnh_server.get_markup_percent()
+            current_markup = await server2_server.get_markup_percent()
 
             api_status = "🔴 API key not configured"
             balance_line = ""
 
-            if vnh_server.configured:
-                check = await vnh_server.check()
-                if vnh_server.ok(check):
+            if server2_server.configured:
+                check = await server2_server.check()
+                if server2_server.ok(check):
                     api_status = "🟢 API connected"
                     supplier_balance = (check.get("user") or {}).get("balance")
                     if supplier_balance is not None:
@@ -5370,7 +5378,7 @@ async def callback_handler(event):
                     api_status = "🟠 API unavailable"
 
             user_states[user_id] = {
-                "action": "set_vnh_markup",
+                "action": "set_server2_markup",
                 "step": "await_value",
             }
 
@@ -8532,10 +8540,10 @@ async def handle_message(event):
                                  buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]])
             user_states.pop(user_id, None)
 
-    elif action == "vnh_search_country":
+    elif action == "server2_search_country":
         if state.get("step") == "await_query":
             query = event.message.text.strip()
-            countries = await vnh_server.available_countries(force=True)
+            countries = await server2_server.available_countries(force=True)
 
             q = query.casefold()
             matches = []
@@ -8549,23 +8557,23 @@ async def handle_message(event):
                 await event.respond(
                     f"❌ No country found for `{query}`.",
                     buttons=[
-                        [Button.inline("🔎 Search Again", b"vnh_search_country", style="success")],
+                        [Button.inline("🔎 Search Again", b"server2_search_country", style="success")],
                         [Button.inline("📋 All Countries", b"server2", style="primary")],
                     ],
                 )
                 return
 
             user_states[user_id] = {
-                "action": "vnh_search_results",
+                "action": "server2_search_results",
                 "query": query,
                 "matches": matches,
             }
 
-            msg, buttons = await build_vnh_search_results_menu(user_id, 0)
+            msg, buttons = await build_server2_search_results_menu(user_id, 0)
             await event.respond(msg, buttons=buttons)
             return
 
-    elif action == "set_vnh_markup":
+    elif action == "set_server2_markup":
         if state.get("step") == "await_value":
             try:
                 value = float(event.message.text.strip())
@@ -8586,7 +8594,7 @@ async def handle_message(event):
                 )
                 return
 
-            await vnh_server.set_markup_percent(value)
+            await server2_server.set_markup_percent(value)
             await event.respond(
                 f"✅ Server 2 markup set to {value}%.",
                 buttons=[
