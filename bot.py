@@ -8,6 +8,7 @@ import shutil
 import asyncio
 import logging
 import random
+import secrets
 import time
 import aiohttp
 from datetime import datetime, timezone, timedelta
@@ -66,6 +67,7 @@ SERVER2_MARKUP_PERCENT = float(os.getenv("SERVER2_MARKUP_PERCENT", os.getenv("VN
 SERVER3_API_KEY = os.getenv("SERVER3_API_KEY", "").strip()
 SERVER3_API_BASE = os.getenv("SERVER3_API_BASE", "https://hearttgstoreapi.duckdns.org/api").strip()
 SERVER3_MARKUP_PERCENT = float(os.getenv("SERVER3_MARKUP_PERCENT", "20").strip())
+SESSION_READER_BOT_USERNAME = os.getenv("SESSION_READER_BOT_USERNAME", "").strip()
 
 # ---------- RAZORPAY (auto-approved UPI QR deposits) ----------
 # Optional. If a Razorpay Key ID + Key Secret are configured (via .env for the
@@ -106,6 +108,18 @@ if PUBLIC_LOG_CHANNEL_ID:
         logging.warning("PUBLIC_LOG_CHANNEL_ID is not a valid integer, public logs disabled.")
 else:
     PUBLIC_LOG_CHANNEL_ID = None
+
+# Optional dedicated stock-announcement channel. If unset, stock announcements
+# use PUBLIC_LOG_CHANNEL_ID so existing deployments keep working unchanged.
+_ANNOUNCEMENT_CHANNEL_RAW = os.getenv("ANNOUNCEMENT_CHANNEL_ID", "").strip()
+if _ANNOUNCEMENT_CHANNEL_RAW:
+    try:
+        ANNOUNCEMENT_CHANNEL_ID = int(_ANNOUNCEMENT_CHANNEL_RAW)
+    except ValueError:
+        ANNOUNCEMENT_CHANNEL_ID = PUBLIC_LOG_CHANNEL_ID
+        logging.warning("ANNOUNCEMENT_CHANNEL_ID is invalid; falling back to PUBLIC_LOG_CHANNEL_ID.")
+else:
+    ANNOUNCEMENT_CHANNEL_ID = PUBLIC_LOG_CHANNEL_ID
 
 # ---------- FRANCHISE MODE ----------
 # Leave FRANCHISE_ID empty to run this bot as the MASTER (source of stock/SMM API,
@@ -355,6 +369,7 @@ balance_adjustments_col = ScopedCollection(db['balance_adjustments'])
 bot_clones_col = db['bot_clones']                # master-only, intentionally NOT scoped
 clone_finance_audit_col = db['clone_finance_audit']  # immutable-ish finance/audit trail
 clone_withdrawals_col = db['clone_withdrawals']      # clone margin withdrawal requests
+stock_deeplinks_col = db['stock_deeplinks']      # public announcement -> exact Server 1 stock
 
 # ---------- BOT INSTANCE ----------
 import hashlib
@@ -472,6 +487,46 @@ async def set_support_link(link: str):
         {"$set": {"value": normalized, "updated_at": now_ist()}},
         upsert=True
     )
+
+
+def normalize_session_reader_bot_username(value: str | None) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^https?://t\.me/", "", raw, flags=re.I)
+    raw = re.sub(r"^t\.me/", "", raw, flags=re.I)
+    raw = raw.lstrip("@").split("?", 1)[0].split("/", 1)[0].strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw):
+        return None
+    if not raw.lower().endswith("bot"):
+        return None
+    return raw
+
+
+async def get_session_reader_bot_username() -> str | None:
+    setting = await settings_col.find_one({"key": "session_reader_bot_username"})
+    if setting:
+        raw = setting.get("value")
+    elif not ctx()['is_franchise']:
+        raw = SESSION_READER_BOT_USERNAME
+    else:
+        raw = None
+    return normalize_session_reader_bot_username(raw)
+
+
+async def set_session_reader_bot_username(value: str):
+    normalized = normalize_session_reader_bot_username(value)
+    if not normalized:
+        raise ValueError("Invalid Telegram bot username")
+    await settings_col.update_one(
+        {"key": "session_reader_bot_username"},
+        {"$set": {"value": normalized, "updated_at": now_ist()}},
+        upsert=True
+    )
+
+
+async def clear_session_reader_bot_username():
+    await settings_col.delete_one({"key": "session_reader_bot_username"})
 
 async def get_upi_id() -> str:
     setting = await settings_col.find_one({"key": "upi_id"})
@@ -885,6 +940,158 @@ async def public_log_event(text: str):
         )
     except Exception as e:
         logging.error("Failed to send public log: %s", e)
+
+async def _get_or_create_stock_deeplink(country: str, wholesale_price: float) -> tuple[str | None, str | None]:
+    """Create/reuse a short /start token for an exact Server 1 country+price row.
+
+    The token is stored in MongoDB instead of encoding country names into the
+    Telegram deep-link payload, so spaces/symbols/long country labels are safe.
+    """
+    try:
+        source_username = await get_source_bot_username()
+        bot_username = source_username.lstrip("@").strip()
+        if not bot_username or bot_username == "UnknownBot":
+            return None, None
+
+        scope_id = ctx()["scope_id"]
+        price = float(wholesale_price)
+        existing = await stock_deeplinks_col.find_one({
+            "scope_id": scope_id,
+            "country": str(country),
+            "price": price,
+            "bot_username": bot_username,
+        })
+        if existing and existing.get("token"):
+            token = str(existing["token"])
+        else:
+            # Telegram start payload allows A-Z/a-z/0-9/_/-. token_urlsafe is
+            # compact and stays well below the 64-char payload limit.
+            token = secrets.token_urlsafe(9).rstrip("=")
+            await stock_deeplinks_col.insert_one({
+                "token": token,
+                "scope_id": scope_id,
+                "country": str(country),
+                "price": price,
+                "bot_username": bot_username,
+                "created_at": now_ist(),
+            })
+
+        return f"https://t.me/{bot_username}?start=stk_{token}", source_username
+    except Exception as e:
+        logging.error("Could not create stock deep link: %s", e)
+        return None, None
+
+
+async def announce_stock_update(country: str, wholesale_price: float, added: int):
+    """Post one clean stock announcement with a Buy Now deep-link button."""
+    if not ANNOUNCEMENT_CHANNEL_ID or int(added or 0) <= 0:
+        return
+
+    try:
+        price = float(wholesale_price)
+        added = int(added)
+        markup = await get_account_markup()
+        retail_price = round(price * markup, 2)
+        total_stock = await accounts_col.count_documents({
+            "country": str(country),
+            "status": "available",
+            "price": price,
+        })
+        deep_link, source_username = await _get_or_create_stock_deeplink(country, price)
+
+        text = (
+            "📦 **Stock Updated!**\n\n"
+            f"🌍 Country: **{country}**\n"
+            f"➕ New Stock Added: **{added}**\n"
+            f"📦 Available Now: **{total_stock}**\n"
+            f"💰 Price: **₹{retail_price}**\n"
+            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        )
+        if source_username:
+            text += f"\n\n🤖 **Bot:** {source_username}"
+
+        buttons = None
+        if deep_link:
+            buttons = [[Button.url("🛒 Buy This Stock", deep_link)]]
+
+        await bot.send_message(
+            ANNOUNCEMENT_CHANNEL_ID,
+            text,
+            buttons=buttons,
+            parse_mode="markdown",
+        )
+    except Exception as e:
+        logging.error("Failed to send stock announcement: %s", e)
+
+
+async def open_server1_stock_deeplink(event, user_id: int, payload: str) -> bool:
+    """Resolve stk_<token> and open that exact Server 1 stock row for buying."""
+    if not payload.startswith("stk_"):
+        return False
+
+    token = payload[4:].strip()
+    if not token:
+        return False
+
+    link_doc = await stock_deeplinks_col.find_one({"token": token})
+    if not link_doc or link_doc.get("scope_id") != ctx()["scope_id"]:
+        await event.respond(
+            "❌ This stock link is invalid or belongs to another bot.",
+            buttons=[[Button.inline("🛒 Browse Stock", b"buy", style="primary")]],
+        )
+        return True
+
+    country = str(link_doc.get("country") or "").strip()
+    try:
+        price = float(link_doc.get("price"))
+    except Exception:
+        price = 0.0
+
+    if not country or price <= 0:
+        await event.respond(
+            "❌ This stock link is no longer valid.",
+            buttons=[[Button.inline("🛒 Browse Stock", b"buy", style="primary")]],
+        )
+        return True
+
+    stock = await accounts_col.count_documents({
+        "country": country,
+        "status": "available",
+        "price": price,
+    })
+    if stock <= 0:
+        await event.respond(
+            f"❌ **{country}** stock at this price is currently sold out.\n\n"
+            "You can browse the latest available stock below.",
+            buttons=[[Button.inline("🛒 Browse Stock", b"buy", style="primary")]],
+            parse_mode="markdown",
+        )
+        return True
+
+    acct_markup = await get_account_markup()
+    retail_price = round(price * acct_markup, 2)
+    user_states[user_id] = {
+        "action": "awaiting_confirmation",
+        "country": country,
+        "price": price,
+        "retail_price": retail_price,
+    }
+
+    confirm_text = (
+        "🔥 **Stock Opened From Announcement**\n\n"
+        f"🌏 Country: **{country}**\n"
+        f"💰 Price: **₹{retail_price}**\n"
+        f"📦 Stock: **{stock}**\n\n"
+        "Tap below to continue with your purchase."
+    )
+    buttons = [[Button.inline("✅ Buy 1 Account", b"confirm_purchase", style="success")]]
+    if stock >= 2:
+        buttons.append([Button.inline("📦 Bulk Buy", b"bulk_setup", style="primary")])
+    buttons.append([Button.inline("❌ Cancel", b"cancel_purchase", style="danger")])
+
+    await event.respond(confirm_text, buttons=buttons, parse_mode="markdown")
+    return True
+
 
 async def get_display_name(user_id: int) -> str:
     """Fetch a readable 'Name (@username)' string for logs, falling back to the raw ID."""
@@ -1923,6 +2130,12 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
 
     # Session ZIP mode: deliver all session files + 2FA manifest in one package.
     try:
+        reader_username = await get_session_reader_bot_username()
+        reader_line = (
+            f"\n\n🤖 Read OTP / Manage Sessions: **@{reader_username}**"
+            if reader_username else
+            ""
+        )
         await ctx()["client"].send_file(
             int(user_id),
             zip_path,
@@ -1932,6 +2145,7 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
                 f"📦 Accounts: **{quantity}**\n"
                 f"💰 Total: **₹{total_retail}**\n\n"
                 "The ZIP contains one `.session` file per number plus `accounts.txt` with each number and its 2FA password."
+                f"{reader_line}"
             ),
             parse_mode="markdown",
         )
@@ -1968,13 +2182,23 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
             )
             cleanup_note = "\n⚠️ Session handoff completed; internal cleanup is pending for some accounts."
 
+        success_reader_line = (
+            f"\n🤖 Reader Bot: **@{reader_username}**"
+            if reader_username else
+            ""
+        )
+        success_buttons = []
+        if reader_username:
+            success_buttons.append([Button.url("🤖 Open Reader Bot", f"https://t.me/{reader_username}")])
+        success_buttons.append([Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")])
         await event.edit(
             "✅ **Bulk Session ZIP Delivered**\n\n"
             f"📦 {quantity} accounts\n"
             f"💰 Charged: ₹{total_retail}\n"
             f"🔐 Main bot session copies removed: **{removed_sessions}/{quantity}**"
+            f"{success_reader_line}"
             f"{cleanup_note}",
-            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+            buttons=success_buttons,
         )
         await log_event(
             f"📦 **Server 1 Bulk Purchase**\n"
@@ -2663,6 +2887,22 @@ SMM_PLATFORMS = ["Telegram", "Instagram", "Facebook", "Other"]
 _SMM_PLATFORM_EMOJI = {
     "Telegram": "✈️", "Instagram": "📸", "Facebook": "📘", "Other": "🌐",
 }
+
+def _smm_customer_rate_per_1k(raw_rate, usd: float, markup: float) -> float:
+    """Return the customer-facing INR rate per 1000 with a silent ₹1 floor.
+
+    Supplier/wholesale accounting still uses the real upstream rate; only the
+    customer-facing retail rate is floored so no SMM service is sold below ₹1/1k.
+    """
+    rate = float(raw_rate) * float(usd) * float(markup)
+    return round(max(1.0, rate), 4)
+
+
+def _smm_customer_charge(raw_rate, qty: int, usd: float, markup: float) -> float:
+    """Calculate final customer charge and silently enforce a ₹1 minimum order."""
+    rate_per_1k = _smm_customer_rate_per_1k(raw_rate, usd, markup)
+    return round(max(1.0, (rate_per_1k / 1000.0) * int(qty)), 2)
+
 
 def classify_smm_platform(cat: str) -> str:
     c = (cat or "").lower()
@@ -4267,7 +4507,7 @@ async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float
     markup = await get_smm_markup(cat_name)
     lines = [f"📋 **{cat_name}**  ({page+1}/{tp})\n"]
     for svc in chunk:
-        rate = round(float(svc["rate"]) * usd * markup, 4)
+        rate = _smm_customer_rate_per_1k(svc["rate"], usd, markup)
         lines.append(
             f"🆔 `{svc['service']}`\n"
             f"📦 {svc['name']}\n"
@@ -4306,7 +4546,7 @@ async def build_smm_search_results(query: str, usd: float):
     lines = [f"🔍 **Search results for:** `{query}` ({len(matches)} shown)\n"]
     for svc in matches:
         markup = await get_smm_markup(svc.get("category", ""))
-        rate = round(float(svc["rate"]) * usd * markup, 4)
+        rate = _smm_customer_rate_per_1k(svc["rate"], usd, markup)
         lines.append(
             f"🆔 `{svc['service']}`\n"
             f"📦 {svc['name']}\n"
@@ -6946,6 +7186,18 @@ async def callback_handler(event):
                 f"💰 Charged: ₹{charge}{wallet_note} | 👛 Balance After: ₹{new_bal}\n"
                 f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
+            try:
+                await public_log_event(
+                    f"🚀 **New SMM Order**\n\n"
+                    f"👤 User: **{smm_buyer_name}** (`{mask_user_id(user_id)}`)\n"
+                    f"📦 Service: **{service['name']}**\n"
+                    f"🆔 Service ID: `{service['service']}`\n"
+                    f"📊 Quantity: **{quantity}**\n"
+                    f"💰 Amount: **₹{charge}**\n"
+                    f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+                )
+            except Exception as e:
+                logging.error("SMM public log failed: %s", e)
             await event.edit(
                 f"✅ **Order placed!**\n\n"
                 f"🆔 Order ID: `{result['order']}`\n"
@@ -7378,6 +7630,7 @@ async def callback_handler(event):
                     [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
                     [Button.inline("🌐 Set Server 2 Markup", b"admin_server2_markup", style="primary")],
                     [Button.inline("🛰️ Set Server 3 Markup", b"admin_server3_markup", style="primary")],
+                    [Button.inline("🤖 Session Reader Bot", b"admin_reader_bot", style="primary")],
                     [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
                 ]
                 await event.edit(
@@ -7396,10 +7649,32 @@ async def callback_handler(event):
                 [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
                 [Button.inline("🌐 Set Server 2 Markup", b"admin_server2_markup", style="primary")],
                 [Button.inline("🛰️ Set Server 3 Markup", b"admin_server3_markup", style="primary")],
+                [Button.inline("🤖 Session Reader Bot", b"admin_reader_bot", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("📦 **Accounts & Stock**", buttons=btns)
             await safe_callback_answer(event, )
+            return
+
+        if data == "admin_reader_bot":
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+            current = await get_session_reader_bot_username()
+            current_text = f"@{current}" if current else "Not set"
+            user_states[user_id] = {
+                "action": "set_session_reader_bot_username",
+                "step": "await_value",
+            }
+            await event.edit(
+                "🤖 **Session Reader Bot**\n\n"
+                f"Current: **{current_text}**\n\n"
+                "Send the reader bot username, for example `@MyReaderBot` or "
+                "`https://t.me/MyReaderBot`.\n\n"
+                "Send `remove` to clear it.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]],
+            )
+            await safe_callback_answer(event)
             return
 
         if data == "admin_account_markup":
@@ -8950,14 +9225,7 @@ async def process_phone_otp_step(event):
             f"➕ Added: 1\n"
             f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
         )
-        await public_log_event(
-            f"📦 **Stock Update**\n"
-            f"📱 Number: `{mask_public_phone(phone)}`\n"
-            f"🌍 Country: **{country}**\n"
-            f"💰 Price: **₹{price}**\n"
-            f"✅ New Stock Added: **1**\n"
-            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-        )
+        await announce_stock_update(country, price, 1)
 
         user_states.pop(user_id, None)
 
@@ -9079,14 +9347,7 @@ async def process_session_step(event):
             f"➕ Added: 1\n"
             f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
         )
-        await public_log_event(
-            f"📦 **Stock Update**\n"
-            f"📱 Number: `{mask_public_phone(phone)}`\n"
-            f"🌍 Country: **{country}**\n"
-            f"💰 Price: **₹{price}**\n"
-            f"✅ New Stock Added: **1**\n"
-            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-        )
+        await announce_stock_update(country, price, 1)
 
         user_states.pop(user_id, None)
 
@@ -9221,13 +9482,7 @@ async def process_add_stock_step(event):
         f"➕ Added: {added} | ♻️ Duplicates: {duplicates} | ❌ Failed: {failed}\n"
         f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
     )
-    await public_log_event(
-        f"📦 **Stock Update**\n"
-        f"🌍 Country: **{country}**\n"
-        f"💰 Price: **₹{price}**\n"
-        f"✅ New Stock Added: **{added}**\n"
-        f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
-    )
+    await announce_stock_update(country, price, added)
     user_states.pop(user_id, None)
 
 
@@ -10824,6 +11079,33 @@ async def handle_message(event):
             await event.respond(msg, buttons=buttons)
             return
 
+    elif action == "set_session_reader_bot_username":
+        if state.get("step") == "await_value":
+            raw = (event.message.text or "").strip()
+            if raw.casefold() in {"remove", "clear", "off", "none"}:
+                await clear_session_reader_bot_username()
+                await event.respond(
+                    "✅ Session reader bot username cleared.",
+                    buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]],
+                )
+                user_states.pop(user_id, None)
+                return
+            normalized = normalize_session_reader_bot_username(raw)
+            if not normalized:
+                await event.respond(
+                    "❌ Invalid bot username. Send something like `@MyReaderBot`. "
+                    "The username must end in `bot`.",
+                    buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]],
+                )
+                return
+            await set_session_reader_bot_username(normalized)
+            await event.respond(
+                f"✅ Session reader bot set to **@{normalized}**.",
+                buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]],
+            )
+            user_states.pop(user_id, None)
+            return
+
     elif action == "set_server3_markup":
         if state.get("step") == "await_value":
             try:
@@ -11253,7 +11535,7 @@ async def handle_message(event):
 
             usd = await get_usd_inr()
             markup = await get_smm_markup(service.get("category", ""))
-            charge = round((float(service["rate"]) / 1000) * qty * usd * markup, 2)
+            charge = _smm_customer_charge(service["rate"], qty, usd, markup)
             wholesale_cost = round((float(service["rate"]) / 1000) * qty * usd, 2)
 
             user = await users_col.find_one({"user_id": user_id})
@@ -11388,10 +11670,11 @@ async def start_cmd(event):
     set_ctx_from_event(event)
     user_id = event.sender_id
     args = event.message.text.split()
+    start_payload = args[1].strip() if len(args) > 1 else ""
     referrer_id = None
-    if len(args) > 1 and args[1].startswith('ref'):
+    if start_payload.startswith('ref'):
         try:
-            referrer_id = int(args[1][3:])
+            referrer_id = int(start_payload[3:])
         except:
             pass
     sender = await event.get_sender()
@@ -11425,6 +11708,10 @@ async def start_cmd(event):
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
+
+    if start_payload.startswith("stk_"):
+        if await open_server1_stock_deeplink(event, user_id, start_payload):
+            return
 
     await show_welcome_menu(event, user_id)
 

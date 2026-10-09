@@ -121,3 +121,24 @@ After a Session ZIP is successfully delivered to the buyer, the main bot now:
 - does **not** call Telegram logout/revoke, so the delivered `.session` file remains valid.
 
 If ZIP delivery fails, this cleanup is not run and the existing refund/stock-release flow remains intact.
+
+
+## Stock announcement deep links
+
+Every successful Server 1 stock addition now posts a public stock announcement with:
+
+- country;
+- newly added quantity;
+- current available quantity at that exact stock price;
+- the current customer selling price after account markup;
+- a **Buy This Stock** URL button.
+
+The button uses a short Mongo-backed Telegram `/start` token, so country names with spaces or symbols are supported. Clicking it opens that exact Server 1 country + price row directly in the bot and shows **Buy 1 Account** / **Bulk Buy** when stock is available. If that row has sold out, the user is sent to the latest stock browser instead.
+
+Set a dedicated channel with:
+
+```env
+ANNOUNCEMENT_CHANNEL_ID=-1001234567890
+```
+
+If it is left blank, stock announcements use `PUBLIC_LOG_CHANNEL_ID`. The posting bot must be able to send messages/buttons in that channel.
