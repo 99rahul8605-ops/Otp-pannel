@@ -1,325 +1,100 @@
-# OTP Panel - Updated Build
+# OTP Bot — latest source with Server 3
 
-This package contains the latest cumulative bot updates.
+This package contains the current OTP bot source plus the new Heart TG Store integration as **Server 3**.
 
-## Important
+## Files
 
-- Main entry point: `bot.py`
-- Existing private/admin logs are preserved.
-- Public masked logs are supported through `PUBLIC_LOG_CHANNEL_ID`.
-- Clone/Franchise security, Margin Wallet, Margin-to-Master transfer, and 2-step margin withdrawal confirmation are included.
-- Before production deployment, test payment, clone, purchase, deposit, and withdrawal flows on a small test clone.
+- `bot.py` — main Telegram bot
+- `account_manager.py` — existing account/session manager used by `bot.py`
+- `server2_server.py` — existing Server 2 integration
+- `server3_server.py` — new Server 3 integration
+- `requirements.txt`
+- `.env.example`
 
-## Clone Fraud Protection Notes
+## Server 3 naming
 
-CLONE / FRANCHISE FRAUD PROTECTION PATCH
+The external API exposes two upstream pools. The bot never shows the supplier's internal names to customers:
 
-Default mode: MASTER MANAGED
-- Master/platform handles clone customer deposits.
-- Clone owner cannot manually add customer balance.
-- Successful sale margin is collected in clone earnings_wallet.
-- Clone owner can request margin withdrawal.
+- supplier `server: 1` / Main Server → **Provider 1**
+- supplier `server: 2` → **Provider 2**
 
-OWN PAYMENT mode
-- Clone owner must first lock the required security deposit from their personal master-bot balance.
-- Security remains locked and is not automatically returned on clone removal.
-- Every clone-customer deposit additionally locks the SAME amount from the clone owner's free master-bot balance.
-- If free backing is insufficient, that deposit is rejected.
+Top-level customer flow is therefore:
 
-Example:
-Owner master balance: Rs 2,000
-Security requirement: Rs 1,000
-After switching to OWN PAYMENT:
-  Security locked: Rs 1,000
-  Free balance: Rs 1,000
+`Buy Account → Server 3 → Provider 1 / Provider 2`
 
-Customer deposits Rs 1,000:
-  Customer backing locked: Rs 1,000
-  Owner free balance: Rs 0
-
-So the owner cannot accept the customer's deposit and then spend its backing on the master bot.
-
-Other protections:
-- approved own-payment deposits become customer_funds_locked / owner_backed_balance
-- cancelled/rejected/expired reservations release backing
-- sale failures roll back finance reservations
-- clone referral rewards are funded by clone, not master
-- manual customer balance adjustment is blocked for clone admin
-- low security falls back to master-managed protection
-- clone closure notifies users and freezes deposits
-- clones with liabilities enter CLOSING instead of being erased
-- historical clone/users/deposits/orders/audit records remain available to master
-- master admin can inspect clone users, balances, backing, deposits, orders and finance audit
-- security deposit stays locked on removal
-
-Environment fallback:
-CLONE_SECURITY_DEPOSIT_MIN=1000
-
-Static validation:
-bot.py: PASS
-account_manager.py: PASS
-vnh_server.py: PASS
-audit_referrals.py: PASS
-
-No live Telegram/Razorpay/MongoDB integration test was performed.
-
----
-
-## Margin Wallet Update
-
-MARGIN WALLET UPDATE
-
-Added for clone owner/admin only:
-
-Main Menu:
-- 💵 Margin Wallet
-- 🏢 Franchise Finance
-
-Margin Wallet shows:
-- Available Margin
-- Total Margin Earned
-- Master Bot Wallet balance
-
-Actions:
-1. 💸 Withdraw Margin
-   - Existing admin-approved withdrawal request flow.
-
-2. 💰 Transfer to Wallet
-   - Clone owner enters amount.
-   - Amount is atomically reserved/deducted from earnings_wallet.
-   - Same amount is instantly credited to owner's MASTER-bot personal balance.
-   - No withdrawal approval required.
-   - Finance audit event is written.
-   - If the master-wallet credit throws an error, Margin Wallet deduction is rolled back.
-
-The button is shown only when:
-- current bot is a franchise/clone, AND
-- current user is that clone's owner/admin.
-
-Existing clone fraud/security protections remain intact.
-
-Syntax:
-- bot.py PASS
-- account_manager.py PASS
-- vnh_server.py PASS
-
----
-
-## Margin Withdraw Payment Confirm
-
-CLONE MARGIN WITHDRAWAL - PAYMENT CONFIRMATION UPDATE
-
-New flow:
-
-1. Clone owner requests Margin Withdrawal
-   -> amount is reserved from Margin Wallet
-   -> request status = pending
-
-2. Master admin presses "Approve"
-   -> request status = payout_pending
-   -> withdrawal is NOT finalized yet
-   -> admin sees:
-      [✅ Payment Sent]
-      [❌ Cancel & Restore Margin]
-
-3. Admin actually sends the external payment.
-
-4. Admin presses "Payment Sent"
-   -> request status = approved
-   -> payment_sent_at / payment_sent_by saved
-   -> clone owner gets "Margin Withdrawal Paid" message
-   -> audit event saved
-   -> admin message becomes PAID / COMPLETED
-
-If admin changes mind before sending payment:
-- "Cancel & Restore Margin" restores the reserved amount exactly once.
-
-Initial Reject:
-- Reject still restores Margin Wallet exactly once.
-
-This prevents an accidental Approve click from closing a withdrawal before
-the real external payment has actually been sent.
-
-Syntax checks:
-- bot.py PASS
-- account_manager.py PASS
-- vnh_server.py PASS
-
----
-
-## Patch Notes Latest Cumulative
-
-Original/full bot cumulative patch
-
-Base:
-Otp-pannel_ORIGINAL_FULL_SOLD_INVALID_NO_REPEAT.zip
-
-Added:
-1. Support URL safety
-   - Invalid stored support links no longer crash /start.
-   - @username and t.me/username normalize to https://t.me/username.
-   - Invalid admin input is rejected.
-
-2. Telegram callback/transient RPC resilience
-   - 244 explicit event.answer() calls now use safe_callback_answer().
-   - QueryIdInvalidError from expired callbacks is ignored safely.
-   - Temporary Telegram ServerError/RPC -500 errors retry on force-join checks.
-   - Asyncio background callback/server errors are handled more cleanly.
-
-3. Referral reward one-time atomic claim
-   - Prevents duplicate reward from concurrent manual/Razorpay approvals.
-   - First approved deposit consumes the reward opportunity exactly once.
-   - Adds referral audit metadata.
-   - Historical duplicates are NOT automatically reversed.
-
-Preserved original/full features:
-- Server 1
-- Server 2 / VNH
-- clone / franchise
-- Razorpay / auto-payment
-- SMM
-- inactive Replace/Remove
-- stock Telegram names
-- OTP received time
-- sold status preservation
-- sold invalid no-repeat cleanup
-
----
-
-## Public Log Channel Update
-
-PUBLIC LOG CHANNEL UPDATE
-
-Add to .env:
-PUBLIC_LOG_CHANNEL_ID=-1001234567890
-
-The master bot must be able to post in that public channel.
-
-Public events added:
-1. Account Sale / Purchase
-   - Server 1 and Server 2
-   - masked Telegram user ID
-   - masked phone number
-   - country
-   - retail amount
-   - timestamp
-   - "Thank you for your purchase!"
-   - source bot username footer
-
-2. Deposit Approved
-   - masked Telegram user ID
-   - amount
-   - approved status
-   - timestamp
-   - source bot username footer
-
-3. Stock Added
-   - country
-   - price
-   - quantity added
-   - timestamp
-   - source bot username footer
-
-Privacy:
-- Public logs do NOT expose full phone numbers.
-- Public logs do NOT expose full Telegram user IDs.
-- Supplier/wholesale cost is NOT shown in the public sale log.
-- Deposit transaction/reference IDs are NOT shown publicly.
-- Existing private/admin logs stay unchanged and still contain their original details.
-
-Source bot footer:
-- Username is fetched live from Telegram using get_me() for the current master/clone.
-- The public log itself is sent through the master bot to the configured public channel,
-  so clone bots do not each need channel admin permission.
-
-Syntax checks:
-- bot.py PASS
-- account_manager.py PASS
-- vnh_server.py PASS
-
----
-
-## Readme
-
-Redeploy sold-status fix:
-- Invalid session + status=available -> inactive, with Replace/Remove buttons.
-- Invalid session + status=sold -> stays sold.
-- Already inactive/other historical records keep their current status.
-
-Sold invalid-session no-repeat fix:
-- Sold records stay status=sold.
-- If a sold session is invalid on startup, session_string is removed and monitor_disabled=true is stored.
-- load_all() excludes those sold records on future restarts.
-- Therefore the same sold invalid account is not rechecked/notified on every restart.
-
----
-
-## Readme Feature Update
-
-Original full bot feature update
-
-Added without removing existing Server 2/VNH, clone/franchise, Razorpay, SMM or other original features:
-1. Inactive Server 1 stock notifications now include Replace Session and Remove From Stock buttons.
-2. Replace validates a fresh Telethon StringSession and returns the same record to available stock.
-3. Stock/admin account list shows Telegram profile name. New single/bulk additions save name/user-id/username; older loaded sessions are backfilled when viewed.
-4. Buyer OTP message shows exact Telegram-arrival date/time in IST. Admin OTP notification uses the same timestamp. last_otp_received_at is stored.
-5. Startup invalid-session notifications also include the quick-action buttons when the DB account can be resolved.
-
-Syntax checked: bot.py, account_manager.py, vnh_server.py.
-
-## Public Log Channel Setup
-
-Add this to `.env`:
+## Environment
 
 ```env
-PUBLIC_LOG_CHANNEL_ID=-1001234567890
+SERVER3_API_KEY=your_api_key
+SERVER3_API_BASE=https://hearttgstoreapi.duckdns.org/api
+SERVER3_MARKUP_PERCENT=20
 ```
 
-The master bot must be able to post in that channel.
+Authentication is sent as `X-API-Key`.
 
-Public logs currently include:
-- Stock added
-- Deposit approved
-- Server 1 purchase
-- Server 2 purchase
+`SERVER3_MARKUP_PERCENT` is this bot's own markup on the supplier's actual cost. Supplier fields such as `sell_price`, `your_price`, `margin`, and `your_inr` are intentionally ignored for customer pricing.
 
-Sensitive details such as full Telegram user IDs, full phone numbers, wholesale/supplier cost, and deposit references are not shown publicly.
+The markup can also be changed live from:
 
-## Validation
+`Admin → Accounts & Stock → Set Server 3 Markup`
 
-Latest package syntax-check status:
-- `bot.py` — PASS
-- `account_manager.py` — PASS
-- `vnh_server.py` — PASS
+The setting is scoped per master/franchise bot, the same way the existing settings collection is scoped.
 
+## Provider 1
 
-## Force-Join Manager Update
+Useful API flow implemented:
 
-Force-Join channels/groups are now managed individually.
+1. `GET /stock?server=1` — account categories, real stock/counts.
+2. `POST /buy/account` with `test_mode:true` — current supplier cost preview.
+3. `POST /buy/account` — quote + 120-second `confirm_token`.
+4. Second `POST /buy/account` with `confirm_token` — purchase.
+5. `POST /order/otp` — starts the OTP window.
+6. `GET /order/status` — polled at 5+ second intervals.
 
-- `Add Channel / Group` appends one new entry.
-- Existing IDs/usernames remain saved automatically.
-- You no longer need to re-enter old channel/group IDs when adding another.
-- `Remove One` shows buttons for existing entries and removes only the selected one.
-- `Clear All` is still available.
-- Duplicate entries are prevented.
-- New entries are checked with Telegram before being saved.
+Only OTP delivery is exposed to customers. Session-only categories are filtered out.
 
+The bot does **not** automatically fetch `/order/session`, because fetching a waiting Provider 1 session can mark the order delivered and remove the supplier's automatic refund eligibility.
 
-## Public Log Formatting Fix
+### Provider 1 refund handling
 
-Fixed literal `\\n\\n` showing before the bot username. Public logs now use real line breaks.
+The first OTP window is supplier-refundable. The bot continues monitoring a pending order in the background so a supplier `refunded` status is mirrored back to the customer's bot wallet even if the customer does not press another button.
 
+A confirmed supplier refund also reverses the corresponding franchise finance/margin entry exactly once.
 
-## Single Account Stock Log Fix
+A second/new OTP request is never opened silently. If the first listener/window ends, the customer gets a `Request New OTP` button.
 
-Public/private stock logs now trigger for all stock-add methods:
-- Add account by phone number + OTP
-- Add account by session string
-- Bulk stock add
+## Provider 2
 
-Single-account public logs show the phone number masked and `New Stock Added: 1`.
+Useful API flow implemented:
 
-## FIFO Stock Selection
-Server 1 now sells the oldest matching available account first using MongoDB `_id` ascending order. Warranty replacement selection also prefers the oldest account within the existing price priority.
+1. `GET /stock?server=2` — country list only.
+2. `POST /buy/server2` with `delivery:"otp", test_mode:true` — live cheapest-price preview for the selected country.
+3. Actual `POST /buy/server2` with the previewed exact `price` and `delivery:"otp"` — avoids silently jumping to a more expensive tier.
+4. `POST /order/otp` + `GET /order/status` — OTP retrieval.
 
+The bot does not call the per-country price-list endpoint for all 197 countries. That avoids wasting the supplier's limited price-check quota. A live price is fetched only after the customer selects a country.
+
+## Error safety
+
+Supplier failures are branched using the machine `code`, not human `error` text.
+
+Important behaviors:
+
+- `success:false` purchase responses → customer reservation is rolled back/refunded; supplier docs state these are not charged.
+- `PRICE_CHANGED`, `PRICE_UNAVAILABLE`, `STOCK_TAKEN` → no automatic higher-price purchase.
+- `SERVER_BUSY`, rate/listener limits → retry timing is respected; no tight loop.
+- `PURCHASE_UNCERTAIN` → never auto-retried.
+- `ORDER_REFUNDED` / status `refunded` → customer wallet refund is applied once and franchise finance is reversed once.
+- a supplier **success** response missing phone/order details is treated as an admin-review case rather than automatically refunding the customer, because a successful supplier purchase may already have been charged.
+
+## Existing Server 2 compatibility
+
+The previous Server 2 integration remains unchanged. Preferred env names remain:
+
+```env
+SERVER2_API_KEY=...
+SERVER2_API_BASE=https://api.vnhotp.com
+SERVER2_MARKUP_PERCENT=20
+```
+
+Legacy VNH env fallbacks remain in `bot.py` for older deployments.

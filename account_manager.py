@@ -1,23 +1,12 @@
 import re
 import logging
-from datetime import timezone, timedelta
 from telethon import TelegramClient, events, Button, functions
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(
-        self,
-        accounts_col,
-        bot_client,
-        api_id,
-        api_hash,
-        pending_requests,
-        admin_ids=None,
-        client_resolver=None,
-        otp_sent_notifier=None,
-    ):
+    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None, client_resolver=None):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
@@ -25,7 +14,6 @@ class AccountManager:
         self.clients = {}
         self.pending_requests = pending_requests
         self.admin_ids = admin_ids or []
-        self.otp_sent_notifier = otp_sent_notifier
         # Optional callable: scope_id (str, "master" or a franchise_id) -> TelegramClient.
         # Lets OTPs be delivered via the SAME bot the customer actually bought
         # the account through, instead of always the master bot.
@@ -58,107 +46,31 @@ class AccountManager:
             return False
 
         if not authorized:
-            # Session is expired/invalid/logged-out. Do not start interactive login.
-            logging.error(
-                f"❌ Session for {phone} is invalid/expired — skipping this client."
-            )
+            # Session is expired/invalid/logged-out. Never call client.start()
+            # here without credentials — Telethon falls back to an interactive
+            # input() prompt for phone/bot_token, which hangs a headless server.
+            logging.error(f"❌ Session for {phone} is invalid/expired — skipping this account. "
+                           f"Re-add it with a fresh session string.")
             await client.disconnect()
-
-            # IMPORTANT:
-            # SOLD accounts are history, not available stock. A restart/redeploy
-            # must never turn a sold record into `inactive`.
-            account_doc = None
             try:
-                account_doc = await self.accounts_col.find_one(
-                    {"phone": phone, "session_string": session_str},
-                    sort=[("sold_at", -1), ("created_at", -1), ("_id", -1)]
+                await self.accounts_col.update_one(
+                    {"phone": phone},
+                    {"$set": {"status": "inactive"}}
                 )
             except Exception as e:
-                logging.error(f"Could not inspect account status for {phone}: {e}")
+                logging.error(f"Could not flag {phone} as inactive: {e}")
 
-            current_status = (account_doc or {}).get("status")
-
-            if current_status == "available":
+            for admin in self.admin_ids:
                 try:
-                    await self.accounts_col.update_one(
-                        {"_id": account_doc["_id"], "status": "available"},
-                        {"$set": {
-                            "status": "inactive",
-                            "inactive_reason": "session_invalid_on_startup",
-                        }}
+                    await self.bot.send_message(
+                        admin,
+                        f"⚠️ **Invalid Stock Detected on Startup!**\n"
+                        f"📱 Phone: `{phone}`\n"
+                        f"❌ Session is invalid/expired (logged out or revoked).\n"
+                        f"🔄 Status: Marked as `inactive` in DB — replace this account's session."
                     )
-                except Exception as e:
-                    logging.error(f"Could not mark available stock {phone} inactive: {e}")
-
-                acc_id = account_doc.get("_id")
-                tg_name = account_doc.get("tg_name", "Unknown")
-                buttons = None
-                if acc_id:
-                    buttons = [
-                        [Button.inline("♻️ Replace Session", f"inactive_replace_{acc_id}")],
-                        [Button.inline("🗑️ Remove From Stock", f"inactive_remove_{acc_id}")],
-                    ]
-
-                for admin in self.admin_ids:
-                    try:
-                        await self.bot.send_message(
-                            admin,
-                            f"⚠️ **Invalid Stock Detected on Startup!**\n"
-                            f"📱 Phone: `{phone}`\n"
-                            f"👤 Name: **{tg_name}**\n"
-                            f"❌ Session is invalid/expired (logged out or revoked).\n"
-                            f"🔄 Status: Marked as `inactive` in DB.",
-                            buttons=buttons,
-                        )
-                    except Exception:
-                        pass
-
-            elif current_status == "sold":
-                logging.warning(
-                    f"Sold account {phone} has an invalid session; "
-                    f"removing dead session from future monitoring."
-                )
-
-                try:
-                    await self.accounts_col.update_one(
-                        {"_id": account_doc["_id"], "status": "sold"},
-                        {
-                            "$set": {
-                                "monitor_disabled": True,
-                                "sold_session_invalid": True,
-                                "sold_session_invalid_reason": "session_not_authorized",
-                            },
-                            "$unset": {
-                                "session_string": "",
-                            },
-                        }
-                    )
-                except Exception as e:
-                    logging.error(
-                        f"Could not disable dead sold session monitoring for {phone}: {e}"
-                    )
-
-                for admin in self.admin_ids:
-                    try:
-                        await self.bot.send_message(
-                            admin,
-                            f"ℹ️ **Sold Account Session Removed From Monitoring**\n"
-                            f"📱 Phone: `{phone}`\n"
-                            f"👤 Name: **{account_doc.get('tg_name', 'Unknown')}**\n"
-                            f"📦 Sale record remains: `sold`\n"
-                            f"❌ Dead/invalid session removed from monitoring.\n\n"
-                            f"It will **not show again on every restart**."
-                        )
-                    except Exception:
-                        pass
-
-            else:
-                # Preserve inactive/other historical states as-is.
-                logging.warning(
-                    f"Session invalid for {phone}; preserving existing status "
-                    f"{current_status!r}."
-                )
-
+                except Exception:
+                    pass
             return False
 
         self.clients[phone] = client
@@ -172,27 +84,12 @@ class AccountManager:
             if code_match:
                 otp = code_match.group(1)
 
-                # IMPORTANT SECURITY BINDING:
-                # Forward OTP only when THIS exact monitored session is the one
-                # that was sold. If the same phone number was returned/re-added
-                # with a NEW session, an OTP from that new session must never be
-                # forwarded to an older buyer from a previous sale.
+                # 🔧 Always get the most recent buyer
                 buyer_doc = await self.accounts_col.find_one(
-                    {
-                        "phone": phone,
-                        "session_string": session_str,
-                        "status": "sold",
-                    },
+                    {"phone": phone, "status": "sold"},
                     sort=[("sold_at", -1)]
                 )
                 buyer_id = buyer_doc["buyer_id"] if buyer_doc else None
-
-                if not buyer_doc:
-                    logging.info(
-                        f"Ignored OTP for {phone}: current monitored session is "
-                        f"not bound to an active sold record."
-                    )
-                    return
 
                 if buyer_id:
                     key = (buyer_id, phone)
@@ -200,40 +97,14 @@ class AccountManager:
 
                     # First OTP after purchase delivers automatically. Every
                     # OTP after that only goes out if the buyer explicitly
-                    # clicked "Request New OTP".
+                    # clicked "Request New OTP" — otherwise it's silently
+                    # dropped (still consumed from Telegram, just not forwarded).
                     if not is_first_otp and key not in self.pending_requests:
-                        logging.info(
-                            f"Suppressed unrequested OTP for {buyer_id} / {phone} "
-                            f"(no pending request on file)."
-                        )
+                        logging.info(f"Suppressed unrequested OTP for {buyer_id} / {phone} "
+                                     f"(no pending request on file).")
                         return
 
-                    # If Re-Request was clicked after an OTP was already sent,
-                    # never send the same old code again. Keep waiting until
-                    # Telegram sends a genuinely different OTP.
-                    last_otp_sent = str(buyer_doc.get("last_otp_sent", "")).strip()
-                    if (
-                        not is_first_otp
-                        and key in self.pending_requests
-                        and last_otp_sent == str(otp)
-                    ):
-                        logging.info(
-                            f"Ignored duplicate old OTP for {buyer_id} / {phone}; "
-                            f"still waiting for a new code."
-                        )
-                        return
-
-                    otp_dt = event.message.date
-                    if otp_dt.tzinfo is None:
-                        otp_dt = otp_dt.replace(tzinfo=timezone.utc)
-                    otp_ist = otp_dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
-                    otp_received_at = otp_ist.strftime("%d/%m/%Y %I:%M:%S %p")
-
-                    msg = (
-                        f"📞 **Phone Number:** `{phone}`\n"
-                        f"📩 **OTP:** `{otp}`\n"
-                        f"🗓️ **Received:** `{otp_received_at} IST`"
-                    )
+                    msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
                     twofa_password = buyer_doc.get("twofa_password")
                     if twofa_password:
                         msg += f"\n🔐 **Password:** `{twofa_password}`"
@@ -247,76 +118,22 @@ class AccountManager:
 
                     sold_via = buyer_doc.get("sold_via_franchise_id", "master")
                     deliver_client = self._resolve_client(sold_via)
-                    otp_delivered = False
                     try:
                         await deliver_client.send_message(buyer_id, msg, buttons=buttons)
-                        otp_delivered = True
                     except Exception as e:
                         logging.error(f"Failed to send OTP to {buyer_id} via {sold_via}: {e}")
 
-                    if otp_delivered and self.otp_sent_notifier:
-                        try:
-                            await self.otp_sent_notifier(
-                                scope_id=sold_via,
-                                buyer_id=buyer_id,
-                                phone=phone,
-                                otp=otp,
-                                server_name="Server 1",
-                                country=buyer_doc.get("country", "N/A"),
-                                is_refresh=not is_first_otp,
-                                received_at=otp_received_at,
-                            )
-                        except Exception as e:
-                            logging.error(
-                                f"Failed to send OTP-owner notification for {buyer_id} / {phone}: {e}"
-                            )
-
-                    if otp_delivered:
-                        update_fields = {
-                            "last_otp_sent": str(otp),
-                            "last_otp_received_at": otp_ist,
-                        }
-                        if is_first_otp:
-                            update_fields["first_otp_sent"] = True
-
+                    if is_first_otp:
                         await self.accounts_col.update_one(
                             {"_id": buyer_doc["_id"]},
-                            {"$set": update_fields}
+                            {"$set": {"first_otp_sent": True}}
                         )
 
-                        # Clear the pending request only after a NEW OTP
-                        # was actually delivered successfully.
-                        if key in self.pending_requests:
-                            del self.pending_requests[key]
-                            logging.info(
-                                f"Cleared pending OTP request after new OTP delivery "
-                                f"for {buyer_id} / {phone}"
-                            )
+                    if key in self.pending_requests:
+                        del self.pending_requests[key]
+                        logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
 
         logging.info(f"✅ Client started for {phone}")
-
-    async def validate_client(self, phone):
-        """Strong health check used immediately before sale and while waiting
-        for the first OTP. Returns (ok, reason)."""
-        client = self.clients.get(phone)
-        if not client:
-            return False, "client_not_loaded"
-
-        try:
-            if not client.is_connected():
-                await client.connect()
-
-            if not await client.is_user_authorized():
-                return False, "session_not_authorized"
-
-            me = await client.get_me()
-            if not me:
-                return False, "telegram_account_unavailable"
-
-            return True, None
-        except Exception as e:
-            logging.warning(f"Session health check failed for {phone}: {e}")
-            return False, str(e)[:180]
 
     async def get_authorizations(self, phone):
         """Fetch the list of active device sessions (Authorization objects) for this account."""
@@ -386,21 +203,7 @@ class AccountManager:
         self.clients.clear()
 
     async def load_all(self):
-        # Keep available stock online AND keep freshly sold accounts online
-        # until their first OTP has been delivered. This makes the OTP flow
-        # survive a bot/process restart.
-        query = {
-            "$or": [
-                {"status": "available"},
-                {
-                    "status": "sold",
-                    "first_otp_sent": {"$ne": True},
-                    "monitor_disabled": {"$ne": True},
-                    "session_string": {"$exists": True, "$nin": [None, ""]},
-                },
-            ]
-        }
-        async for acc in self.accounts_col.find(query):
+        async for acc in self.accounts_col.find({"status": "available"}):
             try:
                 await self.add_client(acc["phone"], acc["session_string"])
             except Exception as e:

@@ -1,5 +1,6 @@
-aiohttp
-telethon 
-motor 
-python-dotenv 
-qrcode[pil]
+aiohttp>=3.10,<4
+motor>=3.7,<4
+pymongo>=4.9,<5
+python-dotenv>=1.0,<2
+Telethon>=1.36,<2
+qrcode[pil]>=7.4,<9

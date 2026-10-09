@@ -34,6 +34,7 @@ from aiohttp import web
 from bson import ObjectId
 from account_manager import AccountManager
 from server2_server import Server2Server
+from server3_server import Server3Server
 
 # ---------- .env LOAD ----------
 load_dotenv()
@@ -55,6 +56,13 @@ CLONE_SECURITY_DEPOSIT_MIN = float(os.getenv("CLONE_SECURITY_DEPOSIT_MIN", "1000
 SERVER2_API_KEY = os.getenv("SERVER2_API_KEY", os.getenv("VNH_API_KEY", "")).strip()
 SERVER2_API_BASE = os.getenv("SERVER2_API_BASE", os.getenv("VNH_API_BASE", "https://api.vnhotp.com")).strip()
 SERVER2_MARKUP_PERCENT = float(os.getenv("SERVER2_MARKUP_PERCENT", os.getenv("VNH_MARKUP_PERCENT", "20")).strip())
+
+# ---------- SERVER 3 / HEART TG STORE API ----------
+# Supplier-internal naming is intentionally hidden from customers:
+# supplier server=1 -> Provider 1, supplier server=2 -> Provider 2.
+SERVER3_API_KEY = os.getenv("SERVER3_API_KEY", "").strip()
+SERVER3_API_BASE = os.getenv("SERVER3_API_BASE", "https://hearttgstoreapi.duckdns.org/api").strip()
+SERVER3_MARKUP_PERCENT = float(os.getenv("SERVER3_MARKUP_PERCENT", "20").strip())
 
 # ---------- RAZORPAY (auto-approved UPI QR deposits) ----------
 # Optional. If a Razorpay Key ID + Key Secret are configured (via .env for the
@@ -2078,6 +2086,21 @@ server2_server = Server2Server(
 )
 
 
+# ---------- SERVER 3 INSTANCE ----------
+server3_server = Server3Server(
+    api_key=SERVER3_API_KEY,
+    base_url=SERVER3_API_BASE,
+    settings_col=settings_col,
+    get_usd_inr=get_usd_inr,
+    now_ist=now_ist,
+    default_markup_percent=SERVER3_MARKUP_PERCENT,
+)
+
+# Temporary per-user browse cache; all purchase/order truth is persisted in MongoDB.
+server3_menu_cache = {}
+server3_monitor_tasks = {}
+
+
 
 def _server2_trim_label(text_value: str, max_len: int = 20) -> str:
     text_value = str(text_value or "").strip()
@@ -2213,6 +2236,1053 @@ async def build_server2_search_results_menu(user_id: int, page: int = 0):
         f"Page {page+1}/{total_pages}"
     )
     return text_msg, buttons
+
+
+
+def _server3_trim_label(value: str, limit: int = 24) -> str:
+    value = str(value or "").strip()
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _server3_display_label(row: dict) -> str:
+    flag = str(row.get("flag") or "").strip()
+    label = str(
+        row.get("label")
+        or row.get("country_name")
+        or row.get("country")
+        or row.get("key")
+        or "Unknown"
+    ).strip()
+    return f"{flag} {label}".strip()
+
+
+async def _server3_stock_row_price(row: dict) -> float | None:
+    try:
+        base_inr = row.get("base_inr")
+        if base_inr is not None:
+            return (await server3_server.calculate_price_inr(float(base_inr)))["retail_inr"]
+        base_price = row.get("base_price")
+        if base_price is not None:
+            return (await server3_server.calculate_price_usd(float(base_price)))["retail_inr"]
+    except Exception:
+        pass
+    return None
+
+
+async def build_server3_provider1_menu(user_id: int, page: int = 0):
+    items = await server3_server.provider1_stock()
+    if not items:
+        return None, None
+
+    server3_menu_cache.setdefault(user_id, {})["p1_items"] = items
+    per_page = 8
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = items[start:start + per_page]
+
+    buttons = [[
+        Button.inline("🌍 Account", b"server3_noop", style="primary"),
+        Button.inline("💰 Price", b"server3_noop", style="primary"),
+        Button.inline("📦 Stock", b"server3_noop", style="primary"),
+    ]]
+    for offset, item in enumerate(chunk):
+        idx = start + offset
+        retail = await _server3_stock_row_price(item)
+        price_text = f"₹{retail}" if retail is not None else "₹--"
+        qty = int(item.get("quantity", 0) or 0)
+        cb = f"server3_p1_item_{idx}".encode()
+        buttons.append([
+            Button.inline(_server3_trim_label(_server3_display_label(item), 22), cb, style="primary"),
+            Button.inline(price_text, cb, style="primary"),
+            Button.inline(f"[{qty}]✅", cb, style="primary"),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"server3_p1_page_{page-1}".encode(), style="primary"))
+    if page < total_pages - 1:
+        nav.append(Button.inline("Next ➡️", f"server3_p1_page_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
+
+    text = (
+        "🛰️ **Server 3 — Provider 1**\n\n"
+        "Choose an account category. Prices shown are your bot's current selling prices.\n"
+        f"Page {page+1}/{total_pages}"
+    )
+    return text, buttons
+
+
+async def build_server3_provider2_menu(user_id: int, page: int = 0):
+    countries = await server3_server.provider2_countries()
+    if not countries:
+        return None, None
+
+    server3_menu_cache.setdefault(user_id, {})["p2_countries"] = countries
+    per_page = 10
+    total_pages = max(1, (len(countries) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = countries[page * per_page:(page + 1) * per_page]
+
+    buttons = []
+    for row in chunk:
+        code = str(row.get("country") or "").upper()
+        if not code:
+            continue
+        label = _server3_display_label(row)
+        buttons.append([
+            Button.inline(
+                _server3_trim_label(label, 40),
+                f"server3_p2_country_{code}".encode(),
+                style="primary",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"server3_p2_page_{page-1}".encode(), style="primary"))
+    if page < total_pages - 1:
+        nav.append(Button.inline("Next ➡️", f"server3_p2_page_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
+
+    text = (
+        "🛰️ **Server 3 — Provider 2**\n\n"
+        "Choose a country. Live price is checked only after you select it.\n"
+        f"Page {page+1}/{total_pages}"
+    )
+    return text, buttons
+
+
+async def _server3_restore_preorder_money(
+    user_id: int,
+    retail_price: float,
+    withdrawable_deducted: float,
+    finance_reservation: dict | None,
+    reason: str,
+):
+    update = {"$inc": {"balance": float(retail_price)}}
+    if withdrawable_deducted > 0:
+        update["$inc"]["withdrawable_balance"] = float(withdrawable_deducted)
+    await users_col.update_one({"user_id": int(user_id)}, update)
+    await rollback_franchise_sale(finance_reservation, reason=reason)
+
+
+async def _server3_refund_committed_order(order: dict, reason: str) -> bool:
+    """Refund customer exactly once after the supplier confirms an order refund."""
+    if not order or not order.get("_id"):
+        return False
+
+    scope_id = ctx()["scope_id"]
+    result = await orders_col._col.update_one(
+        {
+            "_id": order["_id"],
+            "franchise_id": scope_id,
+            "customer_refunded": {"$ne": True},
+        },
+        {
+            "$set": {
+                "customer_refunded": True,
+                "customer_refunded_at": now_ist(),
+                "refund_reason": str(reason or "supplier_refund"),
+                "status": "refunded",
+            }
+        },
+    )
+    if result.modified_count == 0:
+        return False
+
+    amount = float(order.get("amount", 0) or 0)
+    withdrawable_refund = float(order.get("withdrawable_deducted", 0) or 0)
+    inc = {"balance": amount}
+    if withdrawable_refund > 0:
+        inc["withdrawable_balance"] = withdrawable_refund
+    await users_col.update_one({"user_id": int(order["user_id"])}, {"$inc": inc})
+    await reverse_committed_franchise_sale(
+        order.get("franchise_finance"),
+        reason=f"server3_{reason or 'supplier_refund'}",
+    )
+
+    try:
+        await log_event(
+            "💸 **Server 3 Order Refunded**\n"
+            f"👤 User: `{order.get('user_id')}`\n"
+            f"📱 Number: `{order.get('phone', 'N/A')}`\n"
+            f"🛰️ Provider: **Provider {order.get('server3_provider', '?')}**\n"
+            f"💰 Customer refund: **₹{amount}**\n"
+            f"🧾 Reason: `{reason or 'supplier_refund'}`"
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def _server3_get_order(local_order_id: str, user_id: int):
+    try:
+        oid = ObjectId(str(local_order_id))
+    except Exception:
+        return None
+    order = await orders_col._col.find_one({"_id": oid})
+    if not order:
+        return None
+    if str(order.get("user_id")) != str(user_id):
+        return None
+    if order.get("franchise_id") != ctx()["scope_id"]:
+        return None
+    if order.get("source") != "server3":
+        return None
+    return order
+
+
+async def _server3_show_refund(event, order: dict, reason: str):
+    refunded_now = await _server3_refund_committed_order(order, reason)
+    amount = float(order.get("amount", 0) or 0)
+    suffix = (
+        f"\n\n₹{amount} has been returned to your bot balance."
+        if refunded_now or order.get("customer_refunded")
+        else ""
+    )
+    await event.edit(
+        "❌ **OTP could not be completed.**\n\n"
+        "This order was refunded." + suffix,
+        buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+    )
+
+
+async def _server3_deliver_otp(event, order: dict, local_order_id: str, status_data: dict):
+    otp = str(status_data.get("otp") or "").strip()
+    if not otp:
+        return False
+
+    twofa = str(status_data.get("twofa") or order.get("twofa") or "").strip()
+    old_count = int(order.get("otp_received_count", 0) or 0)
+    await orders_col._col.update_one(
+        {"_id": order["_id"], "franchise_id": ctx()["scope_id"]},
+        {
+            "$set": {
+                "status": "otp_received",
+                "otp_received_at": now_ist(),
+                "last_otp": otp,
+                "twofa": twofa or None,
+            },
+            "$inc": {"otp_received_count": 1},
+        },
+    )
+
+    msg = (
+        "✅ **OTP Received**\n\n"
+        f"📱 Number: `{order.get('phone', '')}`\n"
+        f"🔐 OTP: `{otp}`"
+    )
+    if twofa:
+        msg += f"\n🔒 2FA: `{twofa}`"
+    msg += "\n\nKeep these details private."
+
+    await event.edit(
+        msg,
+        buttons=[
+            [Button.inline("🔄 Request New OTP", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+            [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+        ],
+    )
+
+    try:
+        await notify_otp_sent_to_owner(
+            scope_id=order.get("franchise_id", ctx()["scope_id"]),
+            buyer_id=order["user_id"],
+            phone=order.get("phone", ""),
+            otp=otp,
+            server_name=f"Server 3 / Provider {order.get('server3_provider', '?')}",
+            country=order.get("country", "N/A"),
+            is_refresh=old_count > 0,
+        )
+    except Exception as exc:
+        logging.error("Server 3 owner OTP notification failed: %s", exc)
+    return True
+
+
+class _Server3MessageEditor:
+    def __init__(self, client, chat_id, message_id):
+        self.client = client
+        self.chat_id = chat_id
+        self.message_id = message_id
+
+    async def edit(self, text, buttons=None):
+        try:
+            return await self.client.edit_message(
+                self.chat_id,
+                self.message_id,
+                text,
+                buttons=buttons,
+                parse_mode="markdown",
+            )
+        except MessageNotModifiedError:
+            return None
+
+
+async def _server3_background_monitor(local_order_id: str, user_id: int, captured_ctx: dict, client, chat_id, message_id):
+    key = f"{captured_ctx.get('scope_id')}:{local_order_id}"
+    token = current_ctx.set(captured_ctx)
+    editor = _Server3MessageEditor(client, chat_id, message_id)
+    try:
+        listener_false_count = 0
+        # Provider 1's first refundable window is 5 minutes. Monitor slightly
+        # beyond it so a supplier-side automatic refund is mirrored to the
+        # customer's bot balance without requiring another button press.
+        for _ in range(75):
+            order = await _server3_get_order(local_order_id, user_id)
+            if not order:
+                return
+            if order.get("status") in {"otp_received", "refunded"}:
+                return
+
+            response = await server3_server.order_status(str(order.get("provider_order_id") or ""))
+            if not server3_server.ok(response):
+                code = server3_server.code(response)
+                if code == "ORDER_REFUNDED":
+                    await _server3_show_refund(editor, order, "order_refunded")
+                    return
+                delay = int(response.get("retry_after") or 5)
+                await asyncio.sleep(max(5, min(delay, 15)))
+                continue
+
+            status = str(response.get("status") or "").lower()
+            if status == "refunded":
+                await _server3_show_refund(editor, order, str(response.get("reason") or "supplier_refund"))
+                return
+            if status == "delivered":
+                if await _server3_deliver_otp(editor, order, local_order_id, response):
+                    return
+                await editor.edit(
+                    "⚠️ **Order completed but no OTP was returned.**\n\nPlease contact admin.",
+                    buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+                )
+                return
+
+            if status == "waiting" and int(order.get("server3_provider", 0) or 0) == 1:
+                if response.get("window_ended") is True:
+                    await editor.edit(
+                        "⏳ **No OTP received yet.**\n\nTap below to request a new OTP window.",
+                        buttons=[
+                            [Button.inline("🔄 Request New OTP", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+                            [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                        ],
+                    )
+                    return
+                if response.get("listening") is False:
+                    listener_false_count += 1
+                    if listener_false_count >= 3:
+                        await editor.edit(
+                            "⏳ **OTP connection needs a retry.**\n\nTap below to continue waiting for a new code.",
+                            buttons=[
+                                [Button.inline("🔄 Retry OTP", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+                                [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                            ],
+                        )
+                        return
+                else:
+                    listener_false_count = 0
+
+            delay = int(response.get("retry_after") or 5)
+            await asyncio.sleep(max(5, min(delay, 15)))
+
+        await editor.edit(
+            "⏳ **OTP is still pending.**\n\nTap below to check again.",
+            buttons=[
+                [Button.inline("🔄 Check OTP", f"server3_checkotp_{local_order_id}".encode(), style="primary")],
+                [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+            ],
+        )
+    except Exception as exc:
+        logging.error("Server 3 background monitor failed order=%s: %s", local_order_id, exc)
+    finally:
+        current_ctx.reset(token)
+        server3_monitor_tasks.pop(key, None)
+
+
+def _server3_schedule_monitor(event, order: dict, local_order_id: str):
+    try:
+        captured_ctx = dict(ctx())
+        key = f"{captured_ctx.get('scope_id')}:{local_order_id}"
+        existing = server3_monitor_tasks.get(key)
+        if existing and not existing.done():
+            return
+        client = captured_ctx.get("client") or getattr(event, "client", None)
+        chat_id = getattr(event, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if message_id is None:
+            message_id = getattr(getattr(event, "query", None), "msg_id", None)
+        if chat_id is None:
+            chat_id = getattr(getattr(event, "message", None), "chat_id", None)
+        if not client or chat_id is None or message_id is None:
+            return
+        task = asyncio.create_task(
+            _server3_background_monitor(
+                local_order_id,
+                int(order["user_id"]),
+                captured_ctx,
+                client,
+                chat_id,
+                message_id,
+            )
+        )
+        server3_monitor_tasks[key] = task
+    except Exception as exc:
+        logging.warning("Could not start Server 3 background monitor: %s", exc)
+
+
+async def _server3_poll_order_status(event, order: dict, local_order_id: str, attempts: int = 6):
+    provider_order_id = str(order.get("provider_order_id") or "")
+    provider_no = int(order.get("server3_provider", 0) or 0)
+    if not provider_order_id:
+        await event.edit(
+            "❌ **Order details are incomplete. Please contact admin.**",
+            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+        )
+        return
+
+    for attempt in range(max(1, attempts)):
+        status_data = await server3_server.order_status(provider_order_id)
+        if not server3_server.ok(status_data):
+            code = server3_server.code(status_data)
+            if code == "ORDER_REFUNDED":
+                await _server3_show_refund(event, order, "order_refunded")
+                return
+            if code in server3_server.TEMPORARY_CODES or code in {"TIMEOUT", "CONNECTION_ERROR"}:
+                if attempt + 1 < attempts:
+                    delay = int(status_data.get("retry_after") or 5)
+                    await asyncio.sleep(max(5, min(delay, 15)))
+                    continue
+                await event.edit(
+                    "⏳ **Waiting for OTP...**\n\nPlease check again in a few seconds.",
+                    buttons=[
+                        [Button.inline("🔄 Check OTP", f"server3_checkotp_{local_order_id}".encode(), style="primary")],
+                        [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                    ],
+                )
+                _server3_schedule_monitor(event, order, local_order_id)
+                return
+
+            logging.error(
+                "Server 3 status failed local=%s provider_order=%s response=%r",
+                local_order_id,
+                provider_order_id,
+                status_data,
+            )
+            await event.edit(
+                "❌ **Could not check this order right now.**\n\nPlease contact admin if the issue continues.",
+                buttons=[
+                    [Button.inline("🔄 Try Again", f"server3_checkotp_{local_order_id}".encode(), style="primary")],
+                    [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                ],
+            )
+            return
+
+        status = str(status_data.get("status") or "").lower()
+        if status == "refunded":
+            await _server3_show_refund(event, order, str(status_data.get("reason") or "supplier_refund"))
+            return
+
+        if status == "delivered":
+            if await _server3_deliver_otp(event, order, local_order_id, status_data):
+                return
+            await event.edit(
+                "⚠️ **Order completed but no OTP was returned.**\n\nPlease contact admin.",
+                buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+            )
+            return
+
+        if status == "ready":
+            await event.edit(
+                "📱 **Number is ready.**\n\nTap below when you are ready to request the login code.",
+                buttons=[
+                    [Button.inline("🔐 Get OTP", f"server3_startotp_{local_order_id}".encode(), style="success")],
+                    [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                ],
+            )
+            return
+
+        # Provider 1 exposes connection/window state. Never silently open a
+        # second non-refundable OTP window when its first listener stops.
+        if status == "waiting" and provider_no == 1:
+            if status_data.get("window_ended") is True:
+                await event.edit(
+                    "⏳ **No OTP received yet.**\n\nTap below to request a new OTP window.",
+                    buttons=[
+                        [Button.inline("🔄 Request New OTP", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+                        [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                    ],
+                )
+                return
+            if status_data.get("listening") is False:
+                # A listener can briefly report false while reconnecting. Give it
+                # at least two status cycles before offering a new OTP window.
+                if attempt < 2 and attempt + 1 < attempts:
+                    await asyncio.sleep(5)
+                    continue
+                await event.edit(
+                    "⏳ **OTP connection needs a retry.**\n\nTap below to continue waiting for a new code.",
+                    buttons=[
+                        [Button.inline("🔄 Retry OTP", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+                        [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                    ],
+                )
+                return
+
+        if attempt + 1 < attempts:
+            delay = int(status_data.get("retry_after") or 5)
+            await asyncio.sleep(max(5, min(delay, 15)))
+            continue
+
+        await event.edit(
+            "⏳ **Waiting for OTP...**\n\nRequest the Telegram login code, then check again.",
+            buttons=[
+                [Button.inline("🔄 Check OTP", f"server3_checkotp_{local_order_id}".encode(), style="primary")],
+                [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+            ],
+        )
+        _server3_schedule_monitor(event, order, local_order_id)
+        return
+
+
+async def _server3_start_otp(event, order: dict, local_order_id: str):
+    provider_order_id = str(order.get("provider_order_id") or "")
+    response = await server3_server.request_otp(provider_order_id)
+    if not server3_server.ok(response):
+        code = server3_server.code(response)
+        if code == "ORDER_REFUNDED":
+            await _server3_show_refund(event, order, "order_refunded")
+            return
+        if code in {"LISTENER_FAILED", "LISTENER_LIMIT", "SERVER_BUSY", "RATE_LIMIT_EXCEEDED", "TIMEOUT", "CONNECTION_ERROR"}:
+            await event.edit(
+                "⏳ **OTP request is temporarily unavailable.**\n\nPlease try again shortly.",
+                buttons=[
+                    [Button.inline("🔄 Retry OTP", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+                    [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+                ],
+            )
+            return
+        logging.error("Server 3 OTP request failed order=%s response=%r", provider_order_id, response)
+        await event.edit(
+            "❌ **Could not start OTP request.**\n\nPlease contact admin if the issue continues.",
+            buttons=[
+                [Button.inline("🔄 Try Again", f"server3_restartotp_{local_order_id}".encode(), style="primary")],
+                [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+            ],
+        )
+        return
+
+    await orders_col._col.update_one(
+        {"_id": order["_id"], "franchise_id": ctx()["scope_id"]},
+        {
+            "$set": {
+                "status": "waiting_otp",
+                "last_otp_request_at": now_ist(),
+                "otp_window_refundable": response.get("refundable"),
+                "otp_window_seconds": response.get("window_seconds"),
+            },
+            "$inc": {"otp_request_count": 1},
+        },
+    )
+
+    await event.edit(
+        "⏳ **Waiting for OTP...**\n\nPlease request the Telegram login code now.",
+        buttons=[[Button.inline("🔄 Check OTP", f"server3_checkotp_{local_order_id}".encode(), style="primary")]],
+    )
+    # Poll at the supplier-recommended cadence for a short foreground window.
+    order = await _server3_get_order(local_order_id, int(order["user_id"])) or order
+    await _server3_poll_order_status(event, order, local_order_id, attempts=6)
+
+
+async def handle_server3_callback(event, data: str, user_id: int) -> bool:
+    """Handle every Server 3 callback. Returns True when the callback belongs here."""
+    if not data.startswith("server3"):
+        return False
+
+    if data == "server3_noop":
+        await safe_callback_answer(event, "Select a row.", alert=False)
+        return True
+
+    if data == "server3":
+        if not server3_server.configured:
+            await safe_callback_answer(event, "❌ Server 3 is not configured.", alert=True)
+            return True
+        await event.edit(
+            "🛰️ **Server 3**\n\nChoose a provider:\n\n"
+            "🔵 **Provider 1** — curated account categories with live stock\n"
+            "🟣 **Provider 2** — large country pool with live rates\n\n"
+            "Both providers deliver Telegram login numbers and OTPs.",
+            buttons=[
+                [Button.inline("🔵 Provider 1", b"server3_p1", style="primary")],
+                [Button.inline("🟣 Provider 2", b"server3_p2", style="success")],
+                [Button.inline("🔙 Servers", b"buy", style="primary")],
+            ],
+        )
+        await safe_callback_answer(event)
+        return True
+
+    if data == "server3_p1":
+        msg, buttons = await build_server3_provider1_menu(user_id, 0)
+        if not buttons:
+            await safe_callback_answer(event, "❌ Provider 1 is temporarily unavailable.", alert=True)
+            return True
+        await event.edit(msg, buttons=buttons)
+        await safe_callback_answer(event)
+        return True
+
+    if data.startswith("server3_p1_page_"):
+        try:
+            page = int(data.rsplit("_", 1)[1])
+        except Exception:
+            page = 0
+        msg, buttons = await build_server3_provider1_menu(user_id, page)
+        if not buttons:
+            await safe_callback_answer(event, "❌ Provider 1 is temporarily unavailable.", alert=True)
+            return True
+        await event.edit(msg, buttons=buttons)
+        await safe_callback_answer(event)
+        return True
+
+    if data.startswith("server3_p1_item_"):
+        try:
+            idx = int(data.rsplit("_", 1)[1])
+        except Exception:
+            await safe_callback_answer(event, "Invalid selection.", alert=True)
+            return True
+        items = (server3_menu_cache.get(user_id) or {}).get("p1_items") or await server3_server.provider1_stock()
+        if idx < 0 or idx >= len(items):
+            await safe_callback_answer(event, "Selection expired. Open Provider 1 again.", alert=True)
+            return True
+        item = items[idx]
+        item_key = str(item.get("key") or "")
+        preview = await server3_server.provider1_preview(item_key)
+        if not server3_server.ok(preview) or preview.get("sufficient_balance") is False:
+            logging.warning("Server 3 Provider 1 preview failed key=%s response=%r", item_key, preview)
+            await safe_callback_answer(event, "❌ This account is temporarily unavailable.", alert=True)
+            return True
+        try:
+            supplier_price = float(preview.get("would_charge"))
+        except Exception:
+            await safe_callback_answer(event, "❌ Live price unavailable.", alert=True)
+            return True
+        pricing = await server3_server.calculate_price_usd(supplier_price)
+        label = str(item.get("label") or item.get("country_name") or item_key)
+        country = str(item.get("country_name") or item.get("country") or label)
+        user_states[user_id] = {
+            "action": "server3_p1_confirmation",
+            "item_key": item_key,
+            "label": label,
+            "country": country,
+            "supplier_price": supplier_price,
+            "wholesale_inr": pricing["wholesale_inr"],
+            "retail_price": pricing["retail_inr"],
+        }
+        await event.edit(
+            "🔵 **Provider 1**\n\n"
+            f"🌍 Account: **{label}**\n"
+            f"📦 Available: **{int(preview.get('available', item.get('quantity', 0)) or 0)}**\n"
+            f"💰 Price: **₹{pricing['retail_inr']}**\n\n"
+            "After confirmation, a Telegram login number will be reserved for you.\n"
+            "Proceed only when you are ready to use the number.",
+            buttons=[
+                [Button.inline("✅ Confirm Purchase", b"server3_p1_confirm", style="success")],
+                [Button.inline("❌ Cancel", b"server3_p1", style="danger")],
+            ],
+        )
+        await safe_callback_answer(event)
+        return True
+
+    if data == "server3_p1_confirm":
+        state = user_states.get(user_id) or {}
+        if state.get("action") != "server3_p1_confirmation":
+            await safe_callback_answer(event, "Session expired. Please start again.", alert=True)
+            return True
+
+        quote = await server3_server.provider1_quote(state["item_key"])
+        if not server3_server.ok(quote):
+            logging.warning("Server 3 Provider 1 quote failed user=%s response=%r", user_id, quote)
+            await safe_callback_answer(event, "❌ Account unavailable. Please refresh stock.", alert=True)
+            return True
+        q = quote.get("quote") or {}
+        token = str(quote.get("confirm_token") or "")
+        try:
+            supplier_price = float(q.get("price"))
+        except Exception:
+            supplier_price = -1
+        if not token or supplier_price < 0:
+            logging.error("Server 3 Provider 1 bad quote: %r", quote)
+            await safe_callback_answer(event, "❌ Could not prepare purchase.", alert=True)
+            return True
+        pricing = await server3_server.calculate_price_usd(supplier_price)
+        retail_price = pricing["retail_inr"]
+        wholesale_inr = pricing["wholesale_inr"]
+
+        if abs(float(state.get("retail_price", 0)) - retail_price) > 0.01:
+            state.update({
+                "supplier_price": supplier_price,
+                "wholesale_inr": wholesale_inr,
+                "retail_price": retail_price,
+            })
+            user_states[user_id] = state
+            await event.edit(
+                "🔄 **Live price updated**\n\n"
+                f"🌍 Account: **{state.get('label', state['item_key'])}**\n"
+                f"💰 New Price: **₹{retail_price}**\n\n"
+                "Tap confirm again if you want to continue at the updated price.",
+                buttons=[
+                    [Button.inline("✅ Confirm New Price", b"server3_p1_confirm", style="success")],
+                    [Button.inline("❌ Cancel", b"server3_p1", style="danger")],
+                ],
+            )
+            await safe_callback_answer(event, "Price refreshed.", alert=True)
+            return True
+
+        user = await users_col.find_one({"user_id": user_id})
+        if not user or float(user.get("balance", 0) or 0) < retail_price:
+            await safe_callback_answer(event, f"❌ Insufficient balance. Required ₹{retail_price}", alert=True)
+            return True
+        finance = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
+        if not finance:
+            await notify_franchise_low_balance(wholesale_inr)
+            await safe_callback_answer(event, "⚠️ Server temporarily unavailable. Please try later.", alert=True)
+            return True
+
+        old_w = float(user.get("withdrawable_balance", 0) or 0)
+        withdrawable_deducted = min(old_w, retail_price)
+        deducted = await users_col.update_one(
+            {"user_id": user_id, "balance": {"$gte": retail_price}},
+            {
+                "$inc": {"balance": -retail_price},
+                "$set": {"withdrawable_balance": max(0.0, old_w - retail_price)},
+            },
+        )
+        if deducted.modified_count == 0:
+            await rollback_franchise_sale(finance, reason="server3_buyer_balance_changed")
+            await safe_callback_answer(event, "❌ Balance changed. Please try again.", alert=True)
+            return True
+
+        await safe_callback_answer(event, "Processing purchase...", alert=False)
+        await event.edit("⏳ Reserving a number from Provider 1...")
+        result = await server3_server.provider1_confirm(token)
+        if not server3_server.ok(result):
+            await _server3_restore_preorder_money(
+                user_id, retail_price, withdrawable_deducted, finance,
+                f"provider1_{server3_server.code(result).lower() or 'failed'}",
+            )
+            logging.error("Server 3 Provider 1 confirm failed user=%s response=%r", user_id, result)
+            user_states.pop(user_id, None)
+            await event.edit(
+                "❌ **Purchase could not be completed.**\n\n"
+                f"₹{retail_price} has been returned to your bot balance. Please refresh and try again.",
+                buttons=[[Button.inline("🔙 Provider 1", b"server3_p1", style="primary")]],
+            )
+            return True
+
+        provider_order_id = str(result.get("order_id") or "").strip()
+        data_obj = result.get("data") or {}
+        phone = str(data_obj.get("phone") or "").strip()
+        twofa = str(data_obj.get("twofa") or "").strip()
+        charged = float(result.get("charged", supplier_price) or supplier_price)
+        actual_pricing = await server3_server.calculate_price_usd(charged)
+        # Provider confirmed at the quoted price. Store actual supplier cost for audit.
+        incomplete = not provider_order_id or not phone
+        inserted = await orders_col.insert_one({
+            "user_id": user_id,
+            "phone": phone or "N/A",
+            "country": state.get("country") or state.get("label") or "N/A",
+            "country_code": str(data_obj.get("country") or ""),
+            "amount": retail_price,
+            "wholesale_amount": actual_pricing["wholesale_inr"],
+            "supplier_price": charged,
+            "source": "server3",
+            "server3_provider": 1,
+            "provider_order_id": provider_order_id,
+            "twofa": twofa or None,
+            "franchise_finance": finance,
+            "withdrawable_deducted": withdrawable_deducted,
+            "status": "provider_response_incomplete" if incomplete else str(result.get("otp_status") or "ready"),
+            "created_at": now_ist(),
+        })
+        local_id = str(inserted.inserted_id)
+        await commit_franchise_sale(finance, source="server3_provider1", order_id=local_id)
+        user_states.pop(user_id, None)
+
+        if incomplete:
+            logging.critical("Server 3 Provider 1 success but missing order/phone: %r", result)
+            await event.edit(
+                "⚠️ **Purchase needs admin review.**\n\n"
+                "The provider accepted the order but returned incomplete delivery details. Please contact admin.",
+                buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+            )
+            return True
+
+        await event.edit(
+            "✅ **Number Reserved!**\n\n"
+            f"🌍 Account: **{state.get('label', 'Provider 1')}**\n"
+            f"📱 Number: `{phone}`\n"
+            f"💰 Charged: **₹{retail_price}**\n\n"
+            "Login to Telegram with this number, then tap **Get OTP**.",
+            buttons=[
+                [Button.inline("🔐 Get OTP", f"server3_startotp_{local_id}".encode(), style="success")],
+                [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+            ],
+        )
+        try:
+            buyer_name = await get_display_name(user_id)
+            await log_event(
+                "🛒 **New Account Purchase**\n"
+                "🖥️ Server: **Server 3**\n"
+                "🛰️ Provider: **Provider 1**\n"
+                f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
+                f"📱 Phone: `{phone}`\n"
+                f"🌍 Account: {state.get('label', 'N/A')}\n"
+                f"💰 Retail: ₹{retail_price}\n"
+                f"🧾 Supplier cost: ₹{actual_pricing['wholesale_inr']}"
+            )
+            await public_log_event(
+                "🛒 **New Purchase**\n"
+                "🖥️ Server: **Server 3**\n"
+                "🛰️ Provider: **Provider 1**\n"
+                f"👤 User ID: `{mask_user_id(user_id)}`\n"
+                f"📱 Number: `{mask_public_phone(phone)}`\n"
+                f"💰 Amount: **₹{retail_price}**\n\n"
+                "💙 **Thank you for your purchase!**"
+            )
+        except Exception:
+            pass
+        return True
+
+    if data == "server3_p2":
+        msg, buttons = await build_server3_provider2_menu(user_id, 0)
+        if not buttons:
+            await safe_callback_answer(event, "❌ Provider 2 is temporarily unavailable.", alert=True)
+            return True
+        await event.edit(msg, buttons=buttons)
+        await safe_callback_answer(event)
+        return True
+
+    if data.startswith("server3_p2_page_"):
+        try:
+            page = int(data.rsplit("_", 1)[1])
+        except Exception:
+            page = 0
+        msg, buttons = await build_server3_provider2_menu(user_id, page)
+        if not buttons:
+            await safe_callback_answer(event, "❌ Provider 2 is temporarily unavailable.", alert=True)
+            return True
+        await event.edit(msg, buttons=buttons)
+        await safe_callback_answer(event)
+        return True
+
+    if data.startswith("server3_p2_country_"):
+        country_code = data.split("server3_p2_country_", 1)[1].upper()
+        countries = (server3_menu_cache.get(user_id) or {}).get("p2_countries") or await server3_server.provider2_countries()
+        row = next((x for x in countries if str(x.get("country") or "").upper() == country_code), None)
+        country_name = str((row or {}).get("country_name") or (row or {}).get("label") or country_code)
+        preview = await server3_server.provider2_preview(country_code)
+        if not server3_server.ok(preview) or preview.get("sufficient_balance") is False:
+            logging.warning("Server 3 Provider 2 preview failed country=%s response=%r", country_code, preview)
+            await safe_callback_answer(event, "❌ This country is temporarily unavailable.", alert=True)
+            return True
+        try:
+            supplier_price = float(preview.get("would_charge"))
+        except Exception:
+            await safe_callback_answer(event, "❌ Live price unavailable.", alert=True)
+            return True
+        pricing = await server3_server.calculate_price_usd(supplier_price)
+        user_states[user_id] = {
+            "action": "server3_p2_confirmation",
+            "country_code": country_code,
+            "country": country_name,
+            "supplier_price": supplier_price,
+            "wholesale_inr": pricing["wholesale_inr"],
+            "retail_price": pricing["retail_inr"],
+        }
+        await event.edit(
+            "🟣 **Provider 2**\n\n"
+            f"🌍 Country: **{country_name} ({country_code})**\n"
+            f"📦 Available: **{int(preview.get('available', 0) or 0)}**\n"
+            f"💰 Price: **₹{pricing['retail_inr']}**\n\n"
+            "Live stock can move quickly. Your bot will never accept a higher provider tier without a fresh confirmation.",
+            buttons=[
+                [Button.inline("✅ Confirm Purchase", b"server3_p2_confirm", style="success")],
+                [Button.inline("❌ Cancel", b"server3_p2", style="danger")],
+            ],
+        )
+        await safe_callback_answer(event)
+        return True
+
+    if data == "server3_p2_confirm":
+        state = user_states.get(user_id) or {}
+        if state.get("action") != "server3_p2_confirmation":
+            await safe_callback_answer(event, "Session expired. Please start again.", alert=True)
+            return True
+        preview = await server3_server.provider2_preview(state["country_code"])
+        if not server3_server.ok(preview) or preview.get("sufficient_balance") is False:
+            await safe_callback_answer(event, "❌ Live stock unavailable. Please refresh.", alert=True)
+            return True
+        try:
+            supplier_price = float(preview.get("would_charge"))
+        except Exception:
+            await safe_callback_answer(event, "❌ Live price unavailable.", alert=True)
+            return True
+        pricing = await server3_server.calculate_price_usd(supplier_price)
+        retail_price = pricing["retail_inr"]
+        wholesale_inr = pricing["wholesale_inr"]
+        if abs(float(state.get("retail_price", 0)) - retail_price) > 0.01:
+            state.update({
+                "supplier_price": supplier_price,
+                "wholesale_inr": wholesale_inr,
+                "retail_price": retail_price,
+            })
+            user_states[user_id] = state
+            await event.edit(
+                "🔄 **Live price updated**\n\n"
+                f"🌍 Country: **{state.get('country')} ({state.get('country_code')})**\n"
+                f"💰 New Price: **₹{retail_price}**\n\n"
+                "Tap confirm again if you want to continue at the updated price.",
+                buttons=[
+                    [Button.inline("✅ Confirm New Price", b"server3_p2_confirm", style="success")],
+                    [Button.inline("❌ Cancel", b"server3_p2", style="danger")],
+                ],
+            )
+            await safe_callback_answer(event, "Price refreshed.", alert=True)
+            return True
+
+        user = await users_col.find_one({"user_id": user_id})
+        if not user or float(user.get("balance", 0) or 0) < retail_price:
+            await safe_callback_answer(event, f"❌ Insufficient balance. Required ₹{retail_price}", alert=True)
+            return True
+        finance = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
+        if not finance:
+            await notify_franchise_low_balance(wholesale_inr)
+            await safe_callback_answer(event, "⚠️ Server temporarily unavailable. Please try later.", alert=True)
+            return True
+        old_w = float(user.get("withdrawable_balance", 0) or 0)
+        withdrawable_deducted = min(old_w, retail_price)
+        deducted = await users_col.update_one(
+            {"user_id": user_id, "balance": {"$gte": retail_price}},
+            {
+                "$inc": {"balance": -retail_price},
+                "$set": {"withdrawable_balance": max(0.0, old_w - retail_price)},
+            },
+        )
+        if deducted.modified_count == 0:
+            await rollback_franchise_sale(finance, reason="server3_buyer_balance_changed")
+            await safe_callback_answer(event, "❌ Balance changed. Please try again.", alert=True)
+            return True
+
+        await safe_callback_answer(event, "Processing purchase...", alert=False)
+        await event.edit("⏳ Reserving a number from Provider 2...")
+        result = await server3_server.provider2_buy(state["country_code"], price=supplier_price)
+        if not server3_server.ok(result):
+            await _server3_restore_preorder_money(
+                user_id, retail_price, withdrawable_deducted, finance,
+                f"provider2_{server3_server.code(result).lower() or 'failed'}",
+            )
+            logging.error("Server 3 Provider 2 purchase failed user=%s response=%r", user_id, result)
+            user_states.pop(user_id, None)
+            await event.edit(
+                "❌ **Purchase could not be completed.**\n\n"
+                f"₹{retail_price} has been returned to your bot balance. Please refresh and try again.",
+                buttons=[[Button.inline("🔙 Provider 2", b"server3_p2", style="primary")]],
+            )
+            return True
+
+        provider_order_id = str(result.get("order_id") or "").strip()
+        data_obj = result.get("data") or {}
+        phone = str(data_obj.get("phone") or "").strip()
+        charged = float(result.get("charged", supplier_price) or supplier_price)
+        actual_pricing = await server3_server.calculate_price_usd(charged)
+        incomplete = not provider_order_id or not phone
+        inserted = await orders_col.insert_one({
+            "user_id": user_id,
+            "phone": phone or "N/A",
+            "country": state.get("country") or state.get("country_code"),
+            "country_code": state.get("country_code"),
+            "amount": retail_price,
+            "wholesale_amount": actual_pricing["wholesale_inr"],
+            "supplier_price": charged,
+            "source": "server3",
+            "server3_provider": 2,
+            "provider_order_id": provider_order_id,
+            "franchise_finance": finance,
+            "withdrawable_deducted": withdrawable_deducted,
+            "status": "provider_response_incomplete" if incomplete else str(result.get("otp_status") or "waiting"),
+            "created_at": now_ist(),
+        })
+        local_id = str(inserted.inserted_id)
+        await commit_franchise_sale(finance, source="server3_provider2", order_id=local_id)
+        user_states.pop(user_id, None)
+
+        if incomplete:
+            logging.critical("Server 3 Provider 2 success but missing order/phone: %r", result)
+            await event.edit(
+                "⚠️ **Purchase needs admin review.**\n\n"
+                "The provider accepted the order but returned incomplete delivery details. Please contact admin.",
+                buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+            )
+            return True
+
+        await event.edit(
+            "✅ **Number Reserved!**\n\n"
+            f"🌍 Country: **{state.get('country')}**\n"
+            f"📱 Number: `{phone}`\n"
+            f"💰 Charged: **₹{retail_price}**\n\n"
+            "Login to Telegram with this number, then tap **Get OTP**.",
+            buttons=[
+                [Button.inline("🔐 Get OTP", f"server3_startotp_{local_id}".encode(), style="success")],
+                [Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")],
+            ],
+        )
+        try:
+            buyer_name = await get_display_name(user_id)
+            await log_event(
+                "🛒 **New Account Purchase**\n"
+                "🖥️ Server: **Server 3**\n"
+                "🛰️ Provider: **Provider 2**\n"
+                f"👤 Buyer: {buyer_name} (`{user_id}`)\n"
+                f"📱 Phone: `{phone}`\n"
+                f"🌍 Country: {state.get('country')} ({state.get('country_code')})\n"
+                f"💰 Retail: ₹{retail_price}\n"
+                f"🧾 Supplier cost: ₹{actual_pricing['wholesale_inr']}"
+            )
+            await public_log_event(
+                "🛒 **New Purchase**\n"
+                "🖥️ Server: **Server 3**\n"
+                "🛰️ Provider: **Provider 2**\n"
+                f"👤 User ID: `{mask_user_id(user_id)}`\n"
+                f"📱 Number: `{mask_public_phone(phone)}`\n"
+                f"🌍 Country: **{state.get('country')}**\n"
+                f"💰 Amount: **₹{retail_price}**\n\n"
+                "💙 **Thank you for your purchase!**"
+            )
+        except Exception:
+            pass
+        return True
+
+    for prefix, mode in (
+        ("server3_startotp_", "start"),
+        ("server3_restartotp_", "restart"),
+        ("server3_checkotp_", "check"),
+    ):
+        if data.startswith(prefix):
+            local_id = data[len(prefix):].strip()
+            order = await _server3_get_order(local_id, user_id)
+            if not order:
+                await safe_callback_answer(event, "❌ Order not found.", alert=True)
+                return True
+            await safe_callback_answer(event, "Checking OTP...", alert=False)
+            if mode == "check":
+                await _server3_poll_order_status(event, order, local_id, attempts=6)
+            else:
+                await _server3_start_otp(event, order, local_id)
+            return True
+
+    return False
 
 
 async def build_smm_platform_menu():
@@ -3622,6 +4692,11 @@ async def callback_handler(event):
                     Button.inline("Server 2", b"server2", style="success")
                 ])
 
+            if server3_server.configured:
+                buttons.append([
+                    Button.inline("Server 3", b"server3", style="primary")
+                ])
+
             buttons.append([Button.inline("🔙 Back", b"main", style="primary")])
 
             if len(buttons) == 1:
@@ -3643,6 +4718,10 @@ async def callback_handler(event):
                 "• More countries and stock may be available\n"
                 "• Price depends on live server rates\n"
                 "• Third-party terms apply\n\n"
+                "🔵 **Server 3 — Multi Provider**\n"
+                "• Provider 1 + Provider 2 inside one server\n"
+                "• Live stock and live pricing\n"
+                "• OTP delivery with automatic refund handling where supported\n\n"
                 "Select a server below to continue.",
                 buttons=buttons,
             )
@@ -4115,6 +5194,10 @@ async def callback_handler(event):
 
             await safe_callback_answer(event, "✅ OTP received!")
             return
+
+        if data.startswith("server3"):
+            if await handle_server3_callback(event, data, user_id):
+                return
 
         if data.startswith("country_"):
             country = data.split("_", 1)[1]
@@ -5312,6 +6395,7 @@ async def callback_handler(event):
                 btns = [
                     [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
                     [Button.inline("🌐 Set Server 2 Markup", b"admin_server2_markup", style="primary")],
+                    [Button.inline("🛰️ Set Server 3 Markup", b"admin_server3_markup", style="primary")],
                     [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
                 ]
                 await event.edit(
@@ -5329,6 +6413,7 @@ async def callback_handler(event):
                 [Button.inline("📋 Accounts (List)", b"admin_accounts", style="primary")],
                 [Button.inline("📈 Set Manual Stock Markup", b"admin_account_markup", style="primary")],
                 [Button.inline("🌐 Set Server 2 Markup", b"admin_server2_markup", style="primary")],
+                [Button.inline("🛰️ Set Server 3 Markup", b"admin_server3_markup", style="primary")],
                 [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
             ]
             await event.edit("📦 **Accounts & Stock**", buttons=btns)
@@ -5399,6 +6484,39 @@ async def callback_handler(event):
                 ],
             )
             await safe_callback_answer(event, )
+            return
+
+        if data == "admin_server3_markup":
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            current_markup = await server3_server.get_markup_percent()
+            api_status = "🔴 API key not configured"
+            balance_line = ""
+            if server3_server.configured:
+                check = await server3_server.stock(1)
+                if server3_server.ok(check):
+                    api_status = "🟢 API connected"
+                    if check.get("balance") is not None:
+                        balance_line = f"\nSupplier balance: `${check.get('balance')}`"
+                else:
+                    api_status = "🟠 API unavailable"
+
+            user_states[user_id] = {
+                "action": "set_server3_markup",
+                "step": "await_value",
+            }
+            await event.edit(
+                f"🛰️ **Server 3 Settings**\n\n"
+                f"Status: {api_status}{balance_line}\n"
+                f"Current markup: **{current_markup}%**\n\n"
+                "This markup is applied by our bot to Provider 1 and Provider 2 actual supplier cost.\n"
+                "The supplier's own resale margin fields are ignored.\n\n"
+                "Send markup percentage, e.g. `20`.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]],
+            )
+            await safe_callback_answer(event)
             return
 
         if data == "admin_cat_finance":
@@ -8606,6 +9724,26 @@ async def handle_message(event):
                         )
                     ]
                 ],
+            )
+            user_states.pop(user_id, None)
+
+    elif action == "set_server3_markup":
+        if state.get("step") == "await_value":
+            try:
+                value = float(event.message.text.strip())
+                if value < 0 or value > 500:
+                    raise ValueError
+            except Exception:
+                await event.respond(
+                    "❌ Invalid markup. Send percentage like `20` (0 to 500).",
+                    buttons=[[Button.inline("🔙 Cancel", b"admin_cat_accounts", style="danger")]],
+                )
+                return
+
+            await server3_server.set_markup_percent(value)
+            await event.respond(
+                f"✅ Server 3 markup set to {value}% for Provider 1 and Provider 2.",
+                buttons=[[Button.inline("🔙 Accounts Menu", b"admin_cat_accounts", style="primary")]],
             )
             user_states.pop(user_id, None)
 
