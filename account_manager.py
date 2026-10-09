@@ -6,7 +6,17 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 
 class AccountManager:
-    def __init__(self, accounts_col, bot_client, api_id, api_hash, pending_requests, admin_ids=None, client_resolver=None):
+    def __init__(
+        self,
+        accounts_col,
+        bot_client,
+        api_id,
+        api_hash,
+        pending_requests,
+        admin_ids=None,
+        client_resolver=None,
+        otp_sent_notifier=None,
+    ):
         self.accounts_col = accounts_col
         self.bot = bot_client
         self.api_id = api_id
@@ -18,6 +28,9 @@ class AccountManager:
         # Lets OTPs be delivered via the SAME bot the customer actually bought
         # the account through, instead of always the master bot.
         self.client_resolver = client_resolver
+        # Optional async callback invoked only after an OTP was successfully
+        # delivered to the buyer. Kept optional for backwards compatibility.
+        self.otp_sent_notifier = otp_sent_notifier
 
     def _resolve_client(self, scope_id):
         if self.client_resolver:
@@ -118,18 +131,38 @@ class AccountManager:
 
                     sold_via = buyer_doc.get("sold_via_franchise_id", "master")
                     deliver_client = self._resolve_client(sold_via)
+                    delivered = False
                     try:
                         await deliver_client.send_message(buyer_id, msg, buttons=buttons)
+                        delivered = True
                     except Exception as e:
                         logging.error(f"Failed to send OTP to {buyer_id} via {sold_via}: {e}")
 
-                    if is_first_otp:
+                    # Notify the correct bot owner/admin only after the buyer
+                    # actually received the OTP message.
+                    if delivered and self.otp_sent_notifier:
+                        try:
+                            await self.otp_sent_notifier(
+                                scope_id=sold_via,
+                                buyer_id=buyer_id,
+                                phone=phone,
+                                otp=otp,
+                                server_name="Server 1",
+                                country=buyer_doc.get("country", "N/A"),
+                                is_refresh=not is_first_otp,
+                            )
+                        except Exception as e:
+                            logging.error(
+                                f"OTP owner notification failed for {buyer_id} / {phone}: {e}"
+                            )
+
+                    if is_first_otp and delivered:
                         await self.accounts_col.update_one(
                             {"_id": buyer_doc["_id"]},
                             {"$set": {"first_otp_sent": True}}
                         )
 
-                    if key in self.pending_requests:
+                    if delivered and key in self.pending_requests:
                         del self.pending_requests[key]
                         logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
 
