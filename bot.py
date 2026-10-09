@@ -1024,6 +1024,23 @@ async def announce_stock_update(country: str, wholesale_price: float, added: int
         logging.error("Failed to send stock announcement: %s", e)
 
 
+async def show_insufficient_balance(event, required=None, back_data=b"buy", back_label="🔙 Back"):
+    """Replace the current purchase screen with a direct Deposit action."""
+    required_line = f"\n💰 Required: **₹{required}**" if required is not None else ""
+    await event.edit(
+        "❌ **Insufficient Balance**\n\n"
+        "Your wallet balance is not enough to complete this purchase."
+        f"{required_line}\n\n"
+        "Add funds and then try the purchase again.",
+        buttons=[
+            [Button.inline("💳 Deposit Now", b"deposit", style="success")],
+            [Button.inline(back_label, back_data, style="primary")],
+        ],
+        parse_mode="markdown",
+    )
+    await safe_callback_answer(event, "Insufficient balance.", alert=True)
+
+
 async def open_server1_stock_deeplink(event, user_id: int, payload: str) -> bool:
     """Resolve stk_<token> and open that exact Server 1 stock row for buying."""
     if not payload.startswith("stk_"):
@@ -1087,7 +1104,7 @@ async def open_server1_stock_deeplink(event, user_id: int, payload: str) -> bool
     buttons = [[Button.inline("✅ Buy 1 Account", b"confirm_purchase", style="success")]]
     if stock >= 2:
         buttons.append([Button.inline("📦 Bulk Buy", b"bulk_setup", style="primary")])
-    buttons.append([Button.inline("❌ Cancel", b"cancel_purchase", style="danger")])
+    buttons.append([Button.inline("🔙 Back", b"buy", style="primary")])
 
     await event.respond(confirm_text, buttons=buttons, parse_mode="markdown")
     return True
@@ -1976,10 +1993,11 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
 
     user = await users_col.find_one({"user_id": int(user_id)}) or {}
     if float(user.get("balance", 0) or 0) < total_retail:
-        await safe_callback_answer(
+        await show_insufficient_balance(
             event,
-            f"Insufficient balance. Required ₹{total_retail}",
-            alert=True,
+            required=total_retail,
+            back_data=b"buy_manual",
+            back_label="🔙 Back to Server 1",
         )
         return False
 
@@ -4072,7 +4090,12 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
 
         user = await users_col.find_one({"user_id": user_id})
         if not user or float(user.get("balance", 0) or 0) < retail_price:
-            await safe_callback_answer(event, f"❌ Insufficient balance. Required ₹{retail_price}", alert=True)
+            await show_insufficient_balance(
+                event,
+                required=retail_price,
+                back_data=b"server3_p1",
+                back_label="🔙 Back to Provider 1",
+            )
             return True
         finance = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
         if not finance:
@@ -4317,7 +4340,12 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
 
         user = await users_col.find_one({"user_id": user_id})
         if not user or float(user.get("balance", 0) or 0) < retail_price:
-            await safe_callback_answer(event, f"❌ Insufficient balance. Required ₹{retail_price}", alert=True)
+            await show_insufficient_balance(
+                event,
+                required=retail_price,
+                back_data=b"server3_p2",
+                back_label="🔙 Back to Provider 2",
+            )
             return True
         finance = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
         if not finance:
@@ -6069,9 +6097,11 @@ async def callback_handler(event):
 
             user = await users_col.find_one({"user_id": user_id})
             if not user or float(user.get("balance", 0)) < retail_price:
-                await safe_callback_answer(event, 
-                    f"❌ Insufficient balance. Required ₹{retail_price}",
-                    alert=True,
+                await show_insufficient_balance(
+                    event,
+                    required=retail_price,
+                    back_data=b"server2",
+                    back_label="🔙 Back to Server 2",
                 )
                 return
 
@@ -6489,7 +6519,12 @@ async def callback_handler(event):
             user = await users_col.find_one({"user_id": user_id})
             balance = user["balance"] if user else 0
             if balance < retail_price:
-                await safe_callback_answer(event, "❌ Insufficient balance!", alert=True)
+                await show_insufficient_balance(
+                    event,
+                    required=retail_price,
+                    back_data=b"buy_manual",
+                    back_label="🔙 Back to Server 1",
+                )
                 return
 
             cursor = accounts_col.find({"country": country, "status": "available", "price": price}).sort("_id", 1)
@@ -6561,7 +6596,12 @@ async def callback_handler(event):
                     {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
                 )
                 await rollback_franchise_sale(finance_reservation, reason="buyer_balance_changed")
-                await safe_callback_answer(event, "❌ Insufficient balance! Please deposit and try again.", alert=True)
+                await show_insufficient_balance(
+                    event,
+                    required=retail_price,
+                    back_data=b"buy_manual",
+                    back_label="🔙 Back to Server 1",
+                )
                 return
 
             withdrawable_deducted = max(0, old_withdrawable - new_withdrawable)
@@ -7022,7 +7062,7 @@ async def callback_handler(event):
             user_states[user_id] = {"action": "smm_search", "step": "query"}
             await event.edit(
                 "🔍 Send a keyword to search services (e.g. `views`, `members`, `reaction`, `Instagram`):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]]
             )
             await safe_callback_answer(event, )
             return
@@ -7031,7 +7071,7 @@ async def callback_handler(event):
             user_states[user_id] = {"action": "smm_order", "step": "service_id"}
             await event.edit(
                 "🆔 Enter the **Service ID** you want to order (shown above each service):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]]
             )
             await safe_callback_answer(event, )
             return
@@ -7090,8 +7130,13 @@ async def callback_handler(event):
                 {"$inc": {"balance": -charge}}
             )
             if deduct_result.modified_count == 0:
-                await safe_callback_answer(event, "❌ Insufficient balance.", alert=True)
                 user_states.pop(user_id, None)
+                await show_insufficient_balance(
+                    event,
+                    required=charge,
+                    back_data=b"smm_services",
+                    back_label="🔙 Back to SMM",
+                )
                 return
 
             finance_reservation = await reserve_franchise_sale(wholesale_cost, charge, user_id)
@@ -7212,8 +7257,11 @@ async def callback_handler(event):
 
         if data == "smm_cancel_order":
             user_states.pop(user_id, None)
-            await event.edit("❌ Order cancelled.", buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
-            await safe_callback_answer(event, )
+            if not _smm_categorized:
+                await fetch_smm_services()
+            text, btns = await build_smm_platform_menu()
+            await event.edit(text, buttons=btns)
+            await safe_callback_answer(event)
             return
 
         # ---------- ADMIN PANEL ----------
@@ -11469,7 +11517,7 @@ async def handle_message(event):
             query = event.message.text.strip()
             if len(query) < 2:
                 await event.respond("❌ Please send at least 2 characters to search.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                                     buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 return
             usd = await get_usd_inr()
             text, btns = await build_smm_search_results(query, usd)
@@ -11484,7 +11532,7 @@ async def handle_message(event):
             sid_text = event.message.text.strip()
             if not sid_text.isdigit():
                 await event.respond("❌ Invalid Service ID. Send numeric ID only.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                                     buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 return
             sid = int(sid_text)
             if not _smm_all_services:
@@ -11492,7 +11540,7 @@ async def handle_message(event):
             service = next((s for s in _smm_all_services if str(s.get("service")) == str(sid)), None)
             if not service:
                 await event.respond("❌ Service ID not found.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                                     buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 return
             state["service"] = service
             state["step"] = "link"
@@ -11500,7 +11548,7 @@ async def handle_message(event):
                 f"📦 **{service['name']}**\n"
                 f"Min: {service['min']} | Max: {service['max']}\n\n"
                 "🔗 Now send the **link** (post/profile/video URL) for this order:",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]]
             )
             return
 
@@ -11508,14 +11556,14 @@ async def handle_message(event):
             link = event.message.text.strip()
             if not link.startswith("http"):
                 await event.respond("❌ Please send a valid link starting with http/https.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                                     buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 return
             state["link"] = link
             state["step"] = "quantity"
             service = state["service"]
             await event.respond(
                 f"📊 Send the **quantity** you want (Min: {service['min']}, Max: {service['max']}):",
-                buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]]
+                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]]
             )
             return
 
@@ -11525,12 +11573,12 @@ async def handle_message(event):
                 qty = int(event.message.text.strip())
             except:
                 await event.respond("❌ Invalid quantity. Send a number.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                                     buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 return
             min_q, max_q = int(float(service["min"])), int(float(service["max"]))
             if qty < min_q or qty > max_q:
                 await event.respond(f"❌ Quantity must be between {min_q} and {max_q}.",
-                                     buttons=[[Button.inline("🔙 Cancel", b"smm_services", style="danger")]])
+                                     buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]])
                 return
 
             usd = await get_usd_inr()
@@ -11557,7 +11605,7 @@ async def handle_message(event):
                    else "❌ Insufficient balance — please deposit first.")
             )
             buttons = [[Button.inline("✅ Confirm Order", b"smm_confirm_order", style="success")],
-                       [Button.inline("❌ Cancel", b"smm_cancel_order", style="danger")]]
+                       [Button.inline("🔙 Back", b"smm_cancel_order", style="primary")]]
             await event.respond(text, buttons=buttons)
             return
 
