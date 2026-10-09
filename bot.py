@@ -2315,17 +2315,43 @@ async def _build_server3_provider1_rows(items: list[dict], start_index: int):
         Button.inline("💰 Price", b"server3_noop", style="primary"),
         Button.inline("📦 Stock", b"server3_noop", style="primary"),
     ]]
+    page_lines = []
     for offset, item in enumerate(items):
         idx = start_index + offset
         retail = await _server3_stock_row_price(item)
         price_text = f"₹{retail}" if retail is not None else "₹--"
         qty = int(item.get("quantity", 0) or 0)
         cb = f"server3_p1_item_{idx}".encode()
+        label = _server3_display_label(item)
         buttons.append([
-            Button.inline(_server3_trim_label(_server3_display_label(item), 22), cb, style="primary"),
+            Button.inline(_server3_trim_label(label, 22), cb, style="primary"),
             Button.inline(price_text, cb, style="primary"),
             Button.inline(f"[{qty}]✅", cb, style="primary"),
         ])
+        page_lines.append(f"{offset + 1}. {label} — {price_text} — Stock: {qty}")
+    return buttons, page_lines
+
+
+def _build_server3_provider2_grid(chunk: list[dict]):
+    buttons = []
+    row_buf = []
+    for row in chunk:
+        code = str(row.get("country") or "").upper()
+        if not code:
+            continue
+        label = _server3_trim_label(_server3_display_label(row), 24)
+        row_buf.append(
+            Button.inline(
+                label,
+                f"server3_p2_country_{code}".encode(),
+                style="primary",
+            )
+        )
+        if len(row_buf) == 2:
+            buttons.append(row_buf)
+            row_buf = []
+    if row_buf:
+        buttons.append(row_buf)
     return buttons
 
 
@@ -2344,7 +2370,7 @@ async def build_server3_provider1_menu(user_id: int, page: int = 0):
     start = page * per_page
     chunk = items[start:start + per_page]
 
-    buttons = await _build_server3_provider1_rows(chunk, start)
+    buttons, page_lines = await _build_server3_provider1_rows(chunk, start)
 
     nav = []
     if page > 0:
@@ -2357,11 +2383,13 @@ async def build_server3_provider1_menu(user_id: int, page: int = 0):
     buttons.append([Button.inline("🔎 Search Country", b"server3_p1_search_country", style="success")])
     buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
 
+    details_text = "\n".join(page_lines) if page_lines else "No items on this page."
     text_msg = (
         "🛰️ **Server 3 — Provider 1**\n\n"
         "Choose an account category.\n"
         "💰 Sorted by price: **Low → High**\n"
-        f"Page {page+1}/{total_pages}"
+        f"📄 Page {page+1}/{total_pages}\n\n"
+        f"{details_text}"
     )
     return text_msg, buttons
 
@@ -2383,7 +2411,7 @@ async def build_server3_provider1_search_results(user_id: int, page: int = 0):
     start = page * per_page
     chunk = items[start:start + per_page]
 
-    buttons = await _build_server3_provider1_rows(chunk, start)
+    buttons, page_lines = await _build_server3_provider1_rows(chunk, start)
 
     nav = []
     if page > 0:
@@ -2399,10 +2427,12 @@ async def build_server3_provider1_search_results(user_id: int, page: int = 0):
     ])
     buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
 
+    details_text = "\n".join(page_lines) if page_lines else "No items on this page."
     text_msg = (
         f"🔎 **Provider 1 Search** — `{query}`\n\n"
         "💰 Sorted by price: **Low → High**\n"
-        f"Page {page+1}/{total_pages}"
+        f"📄 Page {page+1}/{total_pages}\n\n"
+        f"{details_text}"
     )
     return text_msg, buttons
 
@@ -2422,24 +2452,12 @@ async def build_server3_provider2_menu(user_id: int, page: int = 0):
     )
     server3_menu_cache.setdefault(user_id, {})["p2_countries"] = countries
 
-    per_page = 10
+    per_page = 18
     total_pages = max(1, (len(countries) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     chunk = countries[page * per_page:(page + 1) * per_page]
 
-    buttons = []
-    for row in chunk:
-        code = str(row.get("country") or "").upper()
-        if not code:
-            continue
-        label = _server3_display_label(row)
-        buttons.append([
-            Button.inline(
-                _server3_trim_label(label, 40),
-                f"server3_p2_country_{code}".encode(),
-                style="primary",
-            )
-        ])
+    buttons = _build_server3_provider2_grid(chunk)
 
     nav = []
     if page > 0:
@@ -2455,6 +2473,7 @@ async def build_server3_provider2_menu(user_id: int, page: int = 0):
     text_msg = (
         "🛰️ **Server 3 — Provider 2**\n\n"
         "Choose a country. Live price is checked after you select it.\n"
+        "📋 Two-column country list\n"
         f"Page {page+1}/{total_pages}"
     )
     return text_msg, buttons
@@ -2476,23 +2495,12 @@ async def build_server3_provider2_search_results(user_id: int, page: int = 0):
     )
     server3_menu_cache.setdefault(user_id, {})["p2_countries"] = countries
 
-    per_page = 10
+    per_page = 18
     total_pages = max(1, (len(countries) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     chunk = countries[page * per_page:(page + 1) * per_page]
 
-    buttons = []
-    for row in chunk:
-        code = str(row.get("country") or "").upper()
-        if not code:
-            continue
-        buttons.append([
-            Button.inline(
-                _server3_trim_label(_server3_display_label(row), 40),
-                f"server3_p2_country_{code}".encode(),
-                style="primary",
-            )
-        ])
+    buttons = _build_server3_provider2_grid(chunk)
 
     nav = []
     if page > 0:
@@ -2511,6 +2519,7 @@ async def build_server3_provider2_search_results(user_id: int, page: int = 0):
     text_msg = (
         f"🔎 **Provider 2 Search** — `{query}`\n\n"
         "Choose a country to continue.\n"
+        "📋 Two-column country list\n"
         f"Page {page+1}/{total_pages}"
     )
     return text_msg, buttons
@@ -3052,7 +3061,44 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         item_key = str(item.get("key") or "")
         preview = await server3_server.provider1_preview(item_key)
         if not server3_server.ok(preview) or preview.get("sufficient_balance") is False:
-            logging.warning("Server 3 Provider 1 preview failed key=%s response=%r", item_key, preview)
+            code = server3_server.code(preview)
+
+            if code in {"NO_DELIVERABLE_STOCK", "OUT_OF_STOCK"}:
+                # /stock may still show quantity while the supplier's live Telegram
+                # verification says there is no actually usable account. This is
+                # expected stock churn, not an application error.
+                server3_server.mark_provider1_unavailable(item_key, ttl_seconds=90)
+                logging.info(
+                    "Server 3 Provider 1 item temporarily hidden after live stock check: key=%s code=%s",
+                    item_key,
+                    code,
+                )
+
+                msg, buttons = await build_server3_provider1_menu(user_id, 0)
+                if buttons:
+                    await event.edit(
+                        msg + "\n\n⚠️ The selected account just became unavailable. List refreshed.",
+                        buttons=buttons,
+                    )
+                else:
+                    await event.edit(
+                        "❌ **Provider 1 stock is temporarily unavailable.**\n\n"
+                        "Please try again in a moment.",
+                        buttons=[[Button.inline("🔙 Providers", b"server3", style="primary")]],
+                    )
+                await safe_callback_answer(
+                    event,
+                    "Stock changed. List refreshed.",
+                    alert=True,
+                )
+                return True
+
+            logging.warning(
+                "Server 3 Provider 1 preview failed key=%s code=%s response=%r",
+                item_key,
+                code,
+                preview,
+            )
             await safe_callback_answer(event, "❌ This account is temporarily unavailable.", alert=True)
             return True
         try:

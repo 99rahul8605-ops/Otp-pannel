@@ -46,6 +46,7 @@ class Server3Server:
         self.default_markup_percent = float(default_markup_percent)
         self._p1_cache = {"ts": 0.0, "items": [], "balance": None}
         self._p2_cache = {"ts": 0.0, "items": [], "balance": None}
+        self._p1_unavailable_until = {}
 
     @property
     def configured(self) -> bool:
@@ -181,6 +182,13 @@ class Server3Server:
             key = str(row.get("key") or "").strip()
             if not key:
                 continue
+
+            unavailable_until = float(self._p1_unavailable_until.get(key, 0) or 0)
+            if unavailable_until > now:
+                continue
+            if unavailable_until:
+                self._p1_unavailable_until.pop(key, None)
+
             items.append(dict(row))
 
         self._p1_cache = {
@@ -220,6 +228,16 @@ class Server3Server:
             "balance": result.get("balance"),
         }
         return list(items)
+
+    def mark_provider1_unavailable(self, item_key: str, ttl_seconds: int = 90):
+        """Temporarily hide a Provider 1 row that failed the live deliverability check."""
+        key = str(item_key or "").strip()
+        if not key:
+            return
+        self._p1_unavailable_until[key] = time.time() + max(15, int(ttl_seconds))
+        # Drop cached stock so next menu build re-filters immediately.
+        self._p1_cache["ts"] = 0.0
+        self._p1_cache["items"] = []
 
     async def provider1_preview(self, item_key: str):
         return await self._request(
