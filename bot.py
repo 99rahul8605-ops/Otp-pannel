@@ -917,21 +917,36 @@ async def get_source_bot_username() -> str:
     return "@UnknownBot"
 
 
+async def get_master_bot_username() -> str:
+    """Return only the master bot username for public activity logs.
+
+    Public logs are shared across master + clones, so never expose a clone
+    username there. Clone/source usernames remain available internally for
+    routing and stock deep-links where the correct source bot is required.
+    """
+    try:
+        me = await bot.get_me()
+        if me and getattr(me, "username", None):
+            return f"@{me.username}"
+    except Exception as e:
+        logging.warning("Could not fetch master bot username for public log: %s", e)
+    return "@UnknownBot"
+
+
 async def public_log_event(text: str):
     """Send privacy-safe public activity logs through the master bot.
 
-    The source bot/clone username is fetched live from Telegram and appended
-    to every message. PUBLIC_LOG_CHANNEL_ID must be set and the master bot
-    must be able to post in that channel.
+    All public logs show the master bot username only. A purchase made through
+    a clone must not expose that clone's username in the shared public channel.
     """
     if not PUBLIC_LOG_CHANNEL_ID:
         return
 
     try:
-        source_username = await get_source_bot_username()
+        master_username = await get_master_bot_username()
         final_text = (
             text.rstrip()
-            + f"\n\n🤖 **Bot:** {source_username}"
+            + f"\n\n🤖 **Bot:** {master_username}"
         )
         await bot.send_message(
             PUBLIC_LOG_CHANNEL_ID,
@@ -4693,18 +4708,23 @@ async def show_welcome_menu(event, user_id):
         "🌍 **Multiple Countries & Prices** – Choose country, see price‑wise stock.\n\n"
         "Use the buttons below to get started."
     )
+    # Main actions stay prominent: Buy first, SMM second.
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
-        [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
+        [Button.inline("🛒 Buy Account", b"buy", style="success")],
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
+        [
+            Button.inline("💰 My Balance", b"balance", style="primary"),
+            Button.inline("💳 Deposit", b"deposit", style="primary"),
+        ],
     ]
-    row3 = []
+
+    history_row = [Button.inline("📜 Order History", b"orders", style="primary")]
     if await is_referral_enabled():
-        row3.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
+        history_row.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
+    buttons.append(history_row)
+
     if await is_admin(user_id):
-        row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
-    if row3:
-        buttons.append(row3)
+        buttons.append([Button.inline("⚙️ Admin Panel", b"admin", style="primary")])
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([
             Button.inline("💵 Margin Wallet", b"clone_margin_wallet", style="success"),
@@ -4731,18 +4751,23 @@ async def show_welcome_menu(event, user_id):
 
 # ---------- MAIN MENU ----------
 async def _build_main_menu(user_id):
+    # Keep the two primary products as full-width top actions.
     buttons = [
-        [Button.inline("🛒 Buy Account", b"buy", style="success"), Button.inline("💰 My Balance", b"balance", style="primary")],
-        [Button.inline("💳 Deposit", b"deposit", style="primary"), Button.inline("📜 Order History", b"orders", style="primary")],
+        [Button.inline("🛒 Buy Account", b"buy", style="success")],
         [Button.inline("🚀 SMM Services", b"smm_services", style="success")],
+        [
+            Button.inline("💰 My Balance", b"balance", style="primary"),
+            Button.inline("💳 Deposit", b"deposit", style="primary"),
+        ],
     ]
-    row3 = []
+
+    history_row = [Button.inline("📜 Order History", b"orders", style="primary")]
     if await is_referral_enabled():
-        row3.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
+        history_row.append(Button.inline("👥 Referral Program", b"referral_info", style="primary"))
+    buttons.append(history_row)
+
     if await is_admin(user_id):
-        row3.append(Button.inline("⚙️ Admin Panel", b"admin", style="primary"))
-    if row3:
-        buttons.append(row3)
+        buttons.append([Button.inline("⚙️ Admin Panel", b"admin", style="primary")])
     if ctx()['is_franchise'] and ctx()['owner_id'] and user_id == ctx()['owner_id']:
         buttons.append([
             Button.inline("💵 Margin Wallet", b"clone_margin_wallet", style="success"),
