@@ -2269,25 +2269,54 @@ async def _server3_stock_row_price(row: dict) -> float | None:
     return None
 
 
-async def build_server3_provider1_menu(user_id: int, page: int = 0):
-    items = await server3_server.provider1_stock()
-    if not items:
-        return None, None
+async def _server3_sort_provider1_items(items: list[dict]) -> list[dict]:
+    """Sort Provider 1 stock by the customer's final bot price, low -> high."""
+    priced = []
+    for row in items:
+        retail = await _server3_stock_row_price(row)
+        priced.append((float(retail) if retail is not None else float("inf"), _server3_display_label(row).casefold(), row))
+    priced.sort(key=lambda x: (x[0], x[1]))
+    return [row for _, _, row in priced]
 
-    server3_menu_cache.setdefault(user_id, {})["p1_items"] = items
-    per_page = 8
-    total_pages = max(1, (len(items) + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    chunk = items[start:start + per_page]
 
+def _server3_provider1_matches(items: list[dict], query: str) -> list[dict]:
+    q = str(query or "").strip().casefold()
+    if not q:
+        return []
+    matches = []
+    for row in items:
+        haystack = " ".join(
+            str(row.get(k) or "")
+            for k in ("label", "country_name", "country", "key")
+        ).casefold()
+        if q in haystack:
+            matches.append(row)
+    return matches
+
+
+def _server3_provider2_matches(items: list[dict], query: str) -> list[dict]:
+    q = str(query or "").strip().casefold()
+    if not q:
+        return []
+    matches = []
+    for row in items:
+        haystack = " ".join(
+            str(row.get(k) or "")
+            for k in ("label", "country_name", "country", "key")
+        ).casefold()
+        if q in haystack:
+            matches.append(row)
+    return matches
+
+
+async def _build_server3_provider1_rows(items: list[dict], start_index: int):
     buttons = [[
         Button.inline("🌍 Account", b"server3_noop", style="primary"),
         Button.inline("💰 Price", b"server3_noop", style="primary"),
         Button.inline("📦 Stock", b"server3_noop", style="primary"),
     ]]
-    for offset, item in enumerate(chunk):
-        idx = start + offset
+    for offset, item in enumerate(items):
+        idx = start_index + offset
         retail = await _server3_stock_row_price(item)
         price_text = f"₹{retail}" if retail is not None else "₹--"
         qty = int(item.get("quantity", 0) or 0)
@@ -2297,6 +2326,25 @@ async def build_server3_provider1_menu(user_id: int, page: int = 0):
             Button.inline(price_text, cb, style="primary"),
             Button.inline(f"[{qty}]✅", cb, style="primary"),
         ])
+    return buttons
+
+
+async def build_server3_provider1_menu(user_id: int, page: int = 0):
+    items = await server3_server.provider1_stock()
+    if not items:
+        return None, None
+
+    # Always show Provider 1 from cheapest to most expensive using our bot price.
+    items = await _server3_sort_provider1_items(items)
+    server3_menu_cache.setdefault(user_id, {})["p1_items"] = items
+
+    per_page = 8
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = items[start:start + per_page]
+
+    buttons = await _build_server3_provider1_rows(chunk, start)
 
     nav = []
     if page > 0:
@@ -2305,14 +2353,58 @@ async def build_server3_provider1_menu(user_id: int, page: int = 0):
         nav.append(Button.inline("Next ➡️", f"server3_p1_page_{page+1}".encode(), style="primary"))
     if nav:
         buttons.append(nav)
+
+    buttons.append([Button.inline("🔎 Search Country", b"server3_p1_search_country", style="success")])
     buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
 
-    text = (
+    text_msg = (
         "🛰️ **Server 3 — Provider 1**\n\n"
-        "Choose an account category. Prices shown are your bot's current selling prices.\n"
+        "Choose an account category.\n"
+        "💰 Sorted by price: **Low → High**\n"
         f"Page {page+1}/{total_pages}"
     )
-    return text, buttons
+    return text_msg, buttons
+
+
+async def build_server3_provider1_search_results(user_id: int, page: int = 0):
+    state = user_states.get(user_id, {})
+    query = str(state.get("query", "")).strip()
+    items = list(state.get("matches") or [])
+    if not items:
+        return None, None
+
+    # Search results retain the same low -> high price ordering.
+    items = await _server3_sort_provider1_items(items)
+    server3_menu_cache.setdefault(user_id, {})["p1_items"] = items
+
+    per_page = 8
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = items[start:start + per_page]
+
+    buttons = await _build_server3_provider1_rows(chunk, start)
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"server3_p1_search_page_{page-1}".encode(), style="primary"))
+    if page < total_pages - 1:
+        nav.append(Button.inline("Next ➡️", f"server3_p1_search_page_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([
+        Button.inline("🔎 New Search", b"server3_p1_search_country", style="success"),
+        Button.inline("📋 All", b"server3_p1", style="primary"),
+    ])
+    buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
+
+    text_msg = (
+        f"🔎 **Provider 1 Search** — `{query}`\n\n"
+        "💰 Sorted by price: **Low → High**\n"
+        f"Page {page+1}/{total_pages}"
+    )
+    return text_msg, buttons
 
 
 async def build_server3_provider2_menu(user_id: int, page: int = 0):
@@ -2320,7 +2412,16 @@ async def build_server3_provider2_menu(user_id: int, page: int = 0):
     if not countries:
         return None, None
 
+    # Alphabetical list makes the full list predictable; search is available below.
+    countries = sorted(
+        countries,
+        key=lambda row: (
+            str(row.get("country_name") or row.get("label") or row.get("country") or "").casefold(),
+            str(row.get("country") or "").casefold(),
+        ),
+    )
     server3_menu_cache.setdefault(user_id, {})["p2_countries"] = countries
+
     per_page = 10
     total_pages = max(1, (len(countries) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
@@ -2347,14 +2448,72 @@ async def build_server3_provider2_menu(user_id: int, page: int = 0):
         nav.append(Button.inline("Next ➡️", f"server3_p2_page_{page+1}".encode(), style="primary"))
     if nav:
         buttons.append(nav)
+
+    buttons.append([Button.inline("🔎 Search Country", b"server3_p2_search_country", style="success")])
     buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
 
-    text = (
+    text_msg = (
         "🛰️ **Server 3 — Provider 2**\n\n"
-        "Choose a country. Live price is checked only after you select it.\n"
+        "Choose a country. Live price is checked after you select it.\n"
         f"Page {page+1}/{total_pages}"
     )
-    return text, buttons
+    return text_msg, buttons
+
+
+async def build_server3_provider2_search_results(user_id: int, page: int = 0):
+    state = user_states.get(user_id, {})
+    query = str(state.get("query", "")).strip()
+    countries = list(state.get("matches") or [])
+    if not countries:
+        return None, None
+
+    countries = sorted(
+        countries,
+        key=lambda row: (
+            str(row.get("country_name") or row.get("label") or row.get("country") or "").casefold(),
+            str(row.get("country") or "").casefold(),
+        ),
+    )
+    server3_menu_cache.setdefault(user_id, {})["p2_countries"] = countries
+
+    per_page = 10
+    total_pages = max(1, (len(countries) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = countries[page * per_page:(page + 1) * per_page]
+
+    buttons = []
+    for row in chunk:
+        code = str(row.get("country") or "").upper()
+        if not code:
+            continue
+        buttons.append([
+            Button.inline(
+                _server3_trim_label(_server3_display_label(row), 40),
+                f"server3_p2_country_{code}".encode(),
+                style="primary",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", f"server3_p2_search_page_{page-1}".encode(), style="primary"))
+    if page < total_pages - 1:
+        nav.append(Button.inline("Next ➡️", f"server3_p2_search_page_{page+1}".encode(), style="primary"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([
+        Button.inline("🔎 New Search", b"server3_p2_search_country", style="success"),
+        Button.inline("📋 All Countries", b"server3_p2", style="primary"),
+    ])
+    buttons.append([Button.inline("🔙 Providers", b"server3", style="primary")])
+
+    text_msg = (
+        f"🔎 **Provider 2 Search** — `{query}`\n\n"
+        "Choose a country to continue.\n"
+        f"Page {page+1}/{total_pages}"
+    )
+    return text_msg, buttons
 
 
 async def _server3_restore_preorder_money(
@@ -2824,6 +2983,39 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         await safe_callback_answer(event)
         return True
 
+    if data == "server3_p1_search_country":
+        if not server3_server.configured:
+            await safe_callback_answer(event, "❌ Server 3 is not configured.", alert=True)
+            return True
+        user_states[user_id] = {
+            "action": "server3_p1_search_country",
+            "step": "await_query",
+        }
+        await event.edit(
+            "🔎 **Provider 1 — Search Country**\n\n"
+            "Send country name, country code, or account label.\n"
+            "Examples: `India`, `IND`, `Colombia`",
+            buttons=[
+                [Button.inline("📋 Back to All", b"server3_p1", style="primary")],
+                [Button.inline("🔙 Providers", b"server3", style="danger")],
+            ],
+        )
+        await safe_callback_answer(event)
+        return True
+
+    if data.startswith("server3_p1_search_page_"):
+        try:
+            page = int(data.rsplit("_", 1)[1])
+        except Exception:
+            page = 0
+        msg, buttons = await build_server3_provider1_search_results(user_id, page)
+        if not buttons:
+            await safe_callback_answer(event, "❌ Search results expired. Search again.", alert=True)
+            return True
+        await event.edit(msg, buttons=buttons)
+        await safe_callback_answer(event)
+        return True
+
     if data == "server3_p1":
         msg, buttons = await build_server3_provider1_menu(user_id, 0)
         if not buttons:
@@ -3053,6 +3245,39 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             )
         except Exception:
             pass
+        return True
+
+    if data == "server3_p2_search_country":
+        if not server3_server.configured:
+            await safe_callback_answer(event, "❌ Server 3 is not configured.", alert=True)
+            return True
+        user_states[user_id] = {
+            "action": "server3_p2_search_country",
+            "step": "await_query",
+        }
+        await event.edit(
+            "🔎 **Provider 2 — Search Country**\n\n"
+            "Send country name or 2-letter country code.\n"
+            "Examples: `India`, `IN`, `Bangladesh`, `BD`",
+            buttons=[
+                [Button.inline("📋 Back to All Countries", b"server3_p2", style="primary")],
+                [Button.inline("🔙 Providers", b"server3", style="danger")],
+            ],
+        )
+        await safe_callback_answer(event)
+        return True
+
+    if data.startswith("server3_p2_search_page_"):
+        try:
+            page = int(data.rsplit("_", 1)[1])
+        except Exception:
+            page = 0
+        msg, buttons = await build_server3_provider2_search_results(user_id, page)
+        if not buttons:
+            await safe_callback_answer(event, "❌ Search results expired. Search again.", alert=True)
+            return True
+        await event.edit(msg, buttons=buttons)
+        await safe_callback_answer(event)
         return True
 
     if data == "server3_p2":
@@ -9726,6 +9951,57 @@ async def handle_message(event):
                 ],
             )
             user_states.pop(user_id, None)
+
+    elif action == "server3_p1_search_country":
+        if state.get("step") == "await_query":
+            query = (event.message.text or "").strip()
+            items = await server3_server.provider1_stock(force=True)
+            matches = _server3_provider1_matches(items, query)
+
+            if not matches:
+                await event.respond(
+                    f"❌ No Provider 1 country/account found for `{query}`.",
+                    buttons=[
+                        [Button.inline("🔎 Search Again", b"server3_p1_search_country", style="success")],
+                        [Button.inline("📋 All", b"server3_p1", style="primary")],
+                    ],
+                )
+                return
+
+            matches = await _server3_sort_provider1_items(matches)
+            user_states[user_id] = {
+                "action": "server3_p1_search_results",
+                "query": query,
+                "matches": matches,
+            }
+            msg, buttons = await build_server3_provider1_search_results(user_id, 0)
+            await event.respond(msg, buttons=buttons)
+            return
+
+    elif action == "server3_p2_search_country":
+        if state.get("step") == "await_query":
+            query = (event.message.text or "").strip()
+            countries = await server3_server.provider2_countries(force=True)
+            matches = _server3_provider2_matches(countries, query)
+
+            if not matches:
+                await event.respond(
+                    f"❌ No Provider 2 country found for `{query}`.",
+                    buttons=[
+                        [Button.inline("🔎 Search Again", b"server3_p2_search_country", style="success")],
+                        [Button.inline("📋 All Countries", b"server3_p2", style="primary")],
+                    ],
+                )
+                return
+
+            user_states[user_id] = {
+                "action": "server3_p2_search_results",
+                "query": query,
+                "matches": matches,
+            }
+            msg, buttons = await build_server3_provider2_search_results(user_id, 0)
+            await event.respond(msg, buttons=buttons)
+            return
 
     elif action == "set_server3_markup":
         if state.get("step") == "await_value":
