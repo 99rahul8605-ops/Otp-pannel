@@ -1482,6 +1482,69 @@ async def _server1_reserve_bulk_accounts(
     return selected
 
 
+async def _server1_detach_zip_sessions_from_main(accounts: list[dict], *, bulk_id):
+    """
+    After a Session-ZIP has been successfully delivered, disconnect the main
+    bot's live Telethon client and remove the reusable session credential from
+    the main database.
+
+    IMPORTANT: this does NOT call Telegram logout/revoke. The delivered .session
+    file therefore stays valid for the buyer; only the main bot loses its copy.
+    """
+    removed = 0
+    failures = []
+
+    for acc in accounts:
+        phone = str(acc.get("phone") or "")
+        acc_id = acc.get("_id")
+
+        # Disconnect only. Never log_out() here, because that would revoke the
+        # same Telegram authorization exported into the buyer's ZIP.
+        try:
+            await acc_mgr.remove_client(phone)
+        except Exception as exc:
+            logging.warning(
+                "Could not disconnect transferred Server 1 client phone=%s bulk=%s: %s",
+                phone,
+                bulk_id,
+                exc,
+            )
+
+        try:
+            result = await accounts_col.update_one(
+                {
+                    "_id": acc_id,
+                    "bulk_order_id": str(bulk_id),
+                    "bulk_mode": "session_zip",
+                },
+                {
+                    "$unset": {"session_string": ""},
+                    "$set": {
+                        "session_transferred": True,
+                        "session_transferred_at": now_ist(),
+                        "session_removed_from_main": True,
+                        "bulk_active": False,
+                    },
+                },
+            )
+            # matched_count means the intended sold record was found. A zero
+            # modified_count can simply mean it had already been detached.
+            if getattr(result, "matched_count", 0) > 0:
+                removed += 1
+            else:
+                failures.append(phone or str(acc_id))
+        except Exception as exc:
+            failures.append(phone or str(acc_id))
+            logging.error(
+                "Could not remove transferred Server 1 session from DB phone=%s bulk=%s: %s",
+                phone,
+                bulk_id,
+                exc,
+            )
+
+    return removed, failures
+
+
 async def _server1_finalize_bulk_accounts(
     accounts: list[dict], *, buyer_id: int, bulk_id, mode: str
 ):
@@ -1872,19 +1935,45 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
             ),
             parse_mode="markdown",
         )
+        # Package reached the buyer. Now detach the main bot from every
+        # transferred account: disconnect its listener and delete session_string
+        # from the main DB WITHOUT revoking the Telegram authorization.
+        removed_sessions, cleanup_failures = await _server1_detach_zip_sessions_from_main(
+            selected,
+            bulk_id=bulk_id,
+        )
+
         await bulk_orders_col.update_one(
             {"_id": bulk_id},
-            {"$set": {"status": "completed", "completed_at": now_ist()}},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": now_ist(),
+                    "main_sessions_removed": removed_sessions,
+                    "main_session_cleanup_failures": cleanup_failures,
+                }
+            },
         )
-        for acc in selected:
-            try:
-                await acc_mgr.remove_client(str(acc.get("phone") or ""))
-            except Exception:
-                pass
+
+        cleanup_note = ""
+        if cleanup_failures:
+            # Delivery is already successful, so never refund/release the sold
+            # accounts here. Keep an audit trail and alert admins for cleanup.
+            logging.critical(
+                "Bulk ZIP delivered but %s main session credential(s) could not be removed; "
+                "bulk=%s failures=%r",
+                len(cleanup_failures),
+                bulk_id,
+                cleanup_failures,
+            )
+            cleanup_note = "\n⚠️ Session handoff completed; internal cleanup is pending for some accounts."
+
         await event.edit(
             "✅ **Bulk Session ZIP Delivered**\n\n"
             f"📦 {quantity} accounts\n"
-            f"💰 Charged: ₹{total_retail}",
+            f"💰 Charged: ₹{total_retail}\n"
+            f"🔐 Main bot session copies removed: **{removed_sessions}/{quantity}**"
+            f"{cleanup_note}",
             buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
         )
         await log_event(

@@ -108,3 +108,16 @@ Server 1 price confirmation now includes **Bulk Buy** with two delivery modes:
 - **Session ZIP + 2FA:** all selected accounts are packaged into one ZIP as Telethon SQLite `.session` files plus `accounts.txt` mapping each phone to its 2FA password.
 
 Bulk quantity defaults to a maximum of 20 and can be configured with `BULK_BUY_MAX_QTY`. Stock is FIFO and every selected session is live-validated before checkout.
+
+
+## Server 1 bulk Session ZIP handoff
+
+After a Session ZIP is successfully delivered to the buyer, the main bot now:
+
+- disconnects its live OTP-monitoring client for every transferred number;
+- removes `session_string` from the main MongoDB account record;
+- keeps the account/order record as sold for history and finance;
+- marks the account with `session_transferred`, `session_transferred_at`, and `session_removed_from_main`;
+- does **not** call Telegram logout/revoke, so the delivered `.session` file remains valid.
+
+If ZIP delivery fails, this cleanup is not run and the existing refund/stock-release flow remains intact.
