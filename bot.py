@@ -3,6 +3,8 @@ import re
 import sys
 import io
 import tempfile
+import zipfile
+import shutil
 import asyncio
 import logging
 import random
@@ -18,7 +20,7 @@ def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, SQLiteSession
 from telethon.errors import (
     SessionPasswordNeededError,
     UserNotParticipantError,
@@ -51,6 +53,7 @@ REFERRAL_BONUS_PERCENT = float(os.getenv("REFERRAL_BONUS_PERCENT", "10").strip()
 REFERRAL_BONUS_MAX = float(os.getenv("REFERRAL_BONUS_MAX", "5").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
 CLONE_SECURITY_DEPOSIT_MIN = float(os.getenv("CLONE_SECURITY_DEPOSIT_MIN", "1000").strip())
+BULK_BUY_MAX_QTY = max(2, int(os.getenv("BULK_BUY_MAX_QTY", "20").strip()))
 
 # ---------- SERVER 2 TELEGRAM API ----------
 SERVER2_API_KEY = os.getenv("SERVER2_API_KEY", os.getenv("VNH_API_KEY", "")).strip()
@@ -343,6 +346,7 @@ class ScopedCollection:
 accounts_col = db['accounts']  # shared wholesale stock pool — intentionally NOT scoped
 users_col = ScopedCollection(db['users'])
 orders_col = ScopedCollection(db['orders'])
+bulk_orders_col = ScopedCollection(db['bulk_orders'])
 deposits_col = ScopedCollection(db['deposits'])
 settings_col = ScopedCollection(db['settings'])
 withdrawals_col = ScopedCollection(db['withdrawals'])
@@ -998,6 +1002,22 @@ async def notify_otp_sent_to_owner(
                     )
                 except Exception:
                     pass
+
+        # Direct-OTP bulk mode advances only after the FIRST OTP for the
+        # current Server 1 number was successfully delivered to the buyer.
+        if server_name == "Server 1" and not is_refresh:
+            try:
+                await advance_server1_bulk_after_otp(
+                    buyer_id=int(buyer_id),
+                    phone=str(phone),
+                )
+            except Exception as e:
+                logging.exception(
+                    "Could not advance Server 1 bulk OTP queue for %s / %s: %s",
+                    buyer_id,
+                    phone,
+                    e,
+                )
     finally:
         current_ctx.reset(token)
 
@@ -1362,6 +1382,549 @@ async def monitor_server1_purchase_until_first_otp(
     finally:
         current_ctx.reset(token)
 
+
+# ---------- SERVER 1 BULK BUY ----------
+
+def _bulk_mode_label(mode: str) -> str:
+    return "Direct OTP (one by one)" if mode == "direct_otp" else "Session ZIP + 2FA"
+
+
+async def _server1_release_bulk_accounts(accounts: list[dict], bulk_id=None):
+    """Release only accounts reserved by this unfinished bulk purchase."""
+    for acc in accounts or []:
+        filt = {"_id": acc["_id"]}
+        if bulk_id is not None:
+            filt["bulk_order_id"] = str(bulk_id)
+        await accounts_col.update_one(
+            filt,
+            {
+                "$set": {"status": "available"},
+                "$unset": {
+                    "buyer_id": "",
+                    "sold_at": "",
+                    "sold_via_franchise_id": "",
+                    "bulk_order_id": "",
+                    "bulk_mode": "",
+                    "bulk_index": "",
+                    "bulk_total": "",
+                    "bulk_active": "",
+                    "first_otp_sent": "",
+                },
+            },
+        )
+
+
+async def _server1_reserve_bulk_accounts(
+    *,
+    country: str,
+    price: float,
+    quantity: int,
+    buyer_id: int,
+    bulk_id,
+    mode: str,
+):
+    """FIFO-reserve and live-validate Server 1 stock for a bulk order."""
+    cursor = accounts_col.find(
+        {"country": country, "status": "available", "price": price}
+    ).sort("_id", 1)
+    candidates = await cursor.to_list(length=None)
+    selected = []
+
+    for acc in candidates:
+        claimed = await accounts_col.find_one_and_update(
+            {"_id": acc["_id"], "status": "available"},
+            {
+                "$set": {
+                    "status": "bulk_reserving",
+                    "buyer_id": int(buyer_id),
+                    "sold_via_franchise_id": ctx()["scope_id"],
+                    "bulk_order_id": str(bulk_id),
+                    "bulk_mode": mode,
+                }
+            },
+        )
+        if claimed is None:
+            continue
+
+        phone = acc.get("phone")
+        valid, health_error = await acc_mgr.validate_client(phone)
+        if not valid:
+            reason = str(health_error or "session_unavailable")[:180]
+            await accounts_col.update_one(
+                {"_id": acc["_id"]},
+                {
+                    "$set": {
+                        "status": "inactive",
+                        "inactive_reason": reason,
+                        "inactive_at": now_ist(),
+                    },
+                    "$unset": {
+                        "buyer_id": "",
+                        "bulk_order_id": "",
+                        "bulk_mode": "",
+                        "sold_via_franchise_id": "",
+                    },
+                },
+            )
+            inactive_doc = dict(acc)
+            inactive_doc["status"] = "inactive"
+            await send_inactive_account_admin_notice(inactive_doc, reason)
+            continue
+
+        selected.append(acc)
+        if len(selected) >= quantity:
+            break
+
+    if len(selected) < quantity:
+        await _server1_release_bulk_accounts(selected, bulk_id)
+        return []
+
+    return selected
+
+
+async def _server1_finalize_bulk_accounts(
+    accounts: list[dict], *, buyer_id: int, bulk_id, mode: str
+):
+    total = len(accounts)
+    sold_at = now_ist()
+    for idx, acc in enumerate(accounts):
+        await accounts_col.update_one(
+            {"_id": acc["_id"], "status": "bulk_reserving", "bulk_order_id": str(bulk_id)},
+            {
+                "$set": {
+                    "status": "sold",
+                    "buyer_id": int(buyer_id),
+                    "sold_at": sold_at,
+                    "sold_via_franchise_id": ctx()["scope_id"],
+                    "first_otp_sent": False,
+                    "bulk_order_id": str(bulk_id),
+                    "bulk_mode": mode,
+                    "bulk_index": idx + 1,
+                    "bulk_total": total,
+                    "bulk_active": bool(mode == "direct_otp" and idx == 0),
+                }
+            },
+        )
+
+
+async def _server1_create_bulk_orders(
+    accounts: list[dict], *, buyer_id: int, country: str, wholesale: float,
+    retail: float, bulk_id, mode: str
+):
+    entries = []
+    for idx, acc in enumerate(accounts):
+        order_result = await orders_col.insert_one({
+            "user_id": int(buyer_id),
+            "account_id": str(acc["_id"]),
+            "phone": acc.get("phone"),
+            "country": country,
+            "amount": retail,
+            "wholesale_amount": wholesale,
+            "status": "bulk_waiting_otp" if mode == "direct_otp" else "bulk_session_delivered",
+            "bulk_order_id": str(bulk_id),
+            "bulk_mode": mode,
+            "bulk_index": idx + 1,
+            "bulk_total": len(accounts),
+            "replacement_count": 0,
+            "created_at": now_ist(),
+        })
+        entries.append({
+            "account_id": str(acc["_id"]),
+            "order_id": str(order_result.inserted_id),
+            "phone": acc.get("phone"),
+            "twofa_password": acc.get("twofa_password"),
+            "index": idx + 1,
+        })
+    return entries
+
+
+def _export_string_session_sqlite(session_string: str, output_base: str) -> str:
+    """Convert a Telethon StringSession into a normal SQLite .session file."""
+    source = StringSession(session_string)
+    destination = SQLiteSession(output_base)
+    destination.set_dc(source.dc_id, source.server_address, source.port)
+    destination.auth_key = source.auth_key
+    destination.save()
+    try:
+        destination.close()
+    except Exception:
+        pass
+    return output_base if output_base.endswith(".session") else output_base + ".session"
+
+
+def _build_bulk_session_zip(accounts: list[dict], country: str, bulk_id) -> str:
+    temp_dir = tempfile.mkdtemp(prefix="otp_bulk_sessions_")
+    zip_path = os.path.join(temp_dir, f"bulk_{str(bulk_id)[-8:]}.zip")
+    manifest_lines = [
+        "Bulk Session Delivery",
+        f"Country: {country}",
+        f"Accounts: {len(accounts)}",
+        "",
+        "PHONE | 2FA",
+    ]
+
+    session_paths = []
+    for acc in accounts:
+        phone = re.sub(r"[^0-9+]", "", str(acc.get("phone") or "unknown"))
+        safe_phone = re.sub(r"[^0-9]", "", phone) or "account"
+        base = os.path.join(temp_dir, safe_phone)
+        session_path = _export_string_session_sqlite(str(acc.get("session_string") or ""), base)
+        session_paths.append((session_path, f"{safe_phone}.session"))
+        twofa = str(acc.get("twofa_password") or "Not set")
+        manifest_lines.append(f"{phone} | {twofa}")
+
+    manifest_path = os.path.join(temp_dir, "accounts.txt")
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(manifest_lines) + "\n")
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for session_path, arcname in session_paths:
+            zf.write(session_path, arcname)
+        zf.write(manifest_path, "accounts.txt")
+
+    return zip_path
+
+
+async def _send_bulk_direct_number(bulk_doc: dict, index: int, *, edit_event=None):
+    accounts = list(bulk_doc.get("accounts") or [])
+    if index < 0 or index >= len(accounts):
+        return False
+    item = accounts[index]
+    phone = str(item.get("phone") or "")
+    twofa = item.get("twofa_password")
+
+    # Make sure this sold account has a live OTP listener, including after restart.
+    account_doc = await accounts_col.find_one({"_id": ObjectId(item["account_id"])})
+    if account_doc and phone not in acc_mgr.clients:
+        session_string = account_doc.get("session_string")
+        if session_string:
+            await acc_mgr.add_client(phone, session_string)
+
+    await accounts_col.update_one(
+        {"_id": ObjectId(item["account_id"])},
+        {"$set": {"bulk_active": True}},
+    )
+
+    total = len(accounts)
+    msg = (
+        f"📦 **Bulk OTP — Number {index + 1}/{total}**\n\n"
+        f"📱 Number: `{phone}`\n"
+    )
+    if twofa:
+        msg += f"🔒 2FA Password: `{twofa}`\n"
+    msg += (
+        "\nLogin to Telegram with this number.\n"
+        "As soon as its OTP is received, the next number will be sent automatically."
+    )
+    buttons = [[Button.inline("🔄 Request New OTP", f"resend_{phone}", style="primary")]]
+    if edit_event is not None:
+        await edit_event.edit(msg, buttons=buttons)
+    else:
+        await ctx()["client"].send_message(
+            int(bulk_doc["user_id"]), msg, buttons=buttons, parse_mode="markdown"
+        )
+    return True
+
+
+async def advance_server1_bulk_after_otp(*, buyer_id: int, phone: str):
+    """For Direct OTP bulk orders, OTP N unlocks and sends number N+1."""
+    bulk_doc = await bulk_orders_col.find_one({
+        "user_id": int(buyer_id),
+        "mode": "direct_otp",
+        "status": "active",
+        "accounts.phone": str(phone),
+    })
+    if not bulk_doc:
+        return
+
+    accounts = list(bulk_doc.get("accounts") or [])
+    current_index = int(bulk_doc.get("current_index", 0) or 0)
+    if current_index >= len(accounts):
+        return
+    current = accounts[current_index]
+    if str(current.get("phone")) != str(phone):
+        return
+
+    await accounts_col.update_one(
+        {"_id": ObjectId(current["account_id"])},
+        {"$set": {"bulk_active": False, "bulk_otp_completed": True}},
+    )
+    await orders_col.update_one(
+        {"_id": ObjectId(current["order_id"])},
+        {"$set": {"status": "otp_received", "otp_received_at": now_ist()}},
+    )
+
+    next_index = current_index + 1
+    if next_index >= len(accounts):
+        await bulk_orders_col.update_one(
+            {"_id": bulk_doc["_id"]},
+            {"$set": {"status": "completed", "current_index": next_index, "completed_at": now_ist()}},
+        )
+        await ctx()["client"].send_message(
+            int(buyer_id),
+            f"✅ **Bulk OTP Completed**\n\nAll **{len(accounts)}** numbers have completed OTP delivery.",
+            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+            parse_mode="markdown",
+        )
+        return
+
+    await bulk_orders_col.update_one(
+        {"_id": bulk_doc["_id"]},
+        {"$set": {"current_index": next_index, "updated_at": now_ist()}},
+    )
+    bulk_doc["current_index"] = next_index
+    await _send_bulk_direct_number(bulk_doc, next_index)
+
+
+
+async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
+    country = str(state.get("country") or "")
+    price = float(state.get("price", 0) or 0)
+    retail = float(state.get("retail_price", 0) or 0)
+    quantity = int(state.get("quantity", 0) or 0)
+    mode = str(state.get("mode") or "")
+
+    if mode not in {"direct_otp", "session_zip"} or quantity < 2:
+        await safe_callback_answer(event, "Bulk setup expired. Please start again.", alert=True)
+        return False
+
+    total_retail = round(retail * quantity, 2)
+    total_wholesale = round(price * quantity, 2)
+
+    stock = await accounts_col.count_documents({
+        "country": country,
+        "status": "available",
+        "price": price,
+    })
+    if stock < quantity:
+        await safe_callback_answer(
+            event,
+            f"Only {stock} accounts are available now. Please choose a smaller quantity.",
+            alert=True,
+        )
+        return False
+
+    user = await users_col.find_one({"user_id": int(user_id)}) or {}
+    if float(user.get("balance", 0) or 0) < total_retail:
+        await safe_callback_answer(
+            event,
+            f"Insufficient balance. Required ₹{total_retail}",
+            alert=True,
+        )
+        return False
+
+    bulk_id = ObjectId()
+    await safe_callback_answer(event, "Preparing bulk order...", alert=False)
+    await event.edit(
+        f"⏳ **Preparing Bulk Order**\n\n"
+        f"🌍 Country: **{country}**\n"
+        f"📦 Quantity: **{quantity}**\n"
+        f"🚚 Mode: **{_bulk_mode_label(mode)}**\n\n"
+        "Checking account sessions and reserving stock..."
+    )
+
+    selected = await _server1_reserve_bulk_accounts(
+        country=country,
+        price=price,
+        quantity=quantity,
+        buyer_id=user_id,
+        bulk_id=bulk_id,
+        mode=mode,
+    )
+    if len(selected) != quantity:
+        user_states.pop(user_id, None)
+        await event.edit(
+            "❌ **Not enough active accounts are available right now.**\n\n"
+            "Some listed stock failed the live session check. No amount was charged.",
+            buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+        )
+        return False
+
+    zip_path = None
+    if mode == "session_zip":
+        try:
+            zip_path = _build_bulk_session_zip(selected, country, bulk_id)
+        except Exception as e:
+            logging.exception("Could not build Server 1 bulk session ZIP: %s", e)
+            await _server1_release_bulk_accounts(selected, bulk_id)
+            user_states.pop(user_id, None)
+            await event.edit(
+                "❌ Could not prepare the session package. No amount was charged.",
+                buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+            )
+            return False
+
+    finance = await reserve_franchise_sale(total_wholesale, total_retail, user_id)
+    if not finance:
+        await _server1_release_bulk_accounts(selected, bulk_id)
+        if zip_path:
+            shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
+        await notify_franchise_low_balance(total_wholesale)
+        user_states.pop(user_id, None)
+        await event.edit(
+            "⚠️ Service temporarily unavailable. No amount was charged.",
+            buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+        )
+        return False
+
+    old_withdrawable = float(user.get("withdrawable_balance", 0) or 0)
+    withdrawable_deducted = min(old_withdrawable, total_retail)
+    deduction = await users_col.update_one(
+        {"user_id": int(user_id), "balance": {"$gte": total_retail}},
+        {
+            "$inc": {"balance": -total_retail},
+            "$set": {"withdrawable_balance": max(0.0, old_withdrawable - total_retail)},
+        },
+    )
+    if deduction.modified_count == 0:
+        await rollback_franchise_sale(finance, reason="bulk_buyer_balance_changed")
+        await _server1_release_bulk_accounts(selected, bulk_id)
+        if zip_path:
+            shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
+        user_states.pop(user_id, None)
+        await event.edit(
+            "❌ Your balance changed before checkout. No purchase was completed.",
+            buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+        )
+        return False
+
+    entries = []
+    try:
+        await _server1_finalize_bulk_accounts(
+            selected,
+            buyer_id=user_id,
+            bulk_id=bulk_id,
+            mode=mode,
+        )
+        entries = await _server1_create_bulk_orders(
+            selected,
+            buyer_id=user_id,
+            country=country,
+            wholesale=price,
+            retail=retail,
+            bulk_id=bulk_id,
+            mode=mode,
+        )
+        await bulk_orders_col.insert_one({
+            "_id": bulk_id,
+            "user_id": int(user_id),
+            "country": country,
+            "wholesale_price": price,
+            "retail_price": retail,
+            "quantity": quantity,
+            "total_amount": total_retail,
+            "mode": mode,
+            "status": "active" if mode == "direct_otp" else "delivering",
+            "current_index": 0,
+            "accounts": entries,
+            "franchise_finance": finance,
+            "withdrawable_deducted": withdrawable_deducted,
+            "created_at": now_ist(),
+        })
+        await commit_franchise_sale(
+            finance,
+            source=f"server1_bulk_{mode}",
+            order_id=str(bulk_id),
+        )
+    except Exception as e:
+        logging.exception("Server 1 bulk checkout failed after balance deduction: %s", e)
+        await users_col.update_one(
+            {"user_id": int(user_id)},
+            {"$inc": {"balance": total_retail, "withdrawable_balance": withdrawable_deducted}},
+        )
+        await rollback_franchise_sale(finance, reason="bulk_checkout_failed")
+        await _server1_release_bulk_accounts(selected, bulk_id)
+        if zip_path:
+            shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
+        user_states.pop(user_id, None)
+        await event.edit(
+            "❌ Bulk checkout failed. Your full amount was restored.",
+            buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+        )
+        return False
+
+    user_states.pop(user_id, None)
+
+    if mode == "direct_otp":
+        bulk_doc = await bulk_orders_col.find_one({"_id": bulk_id})
+        await _send_bulk_direct_number(bulk_doc, 0, edit_event=event)
+        await log_event(
+            f"📦 **Server 1 Bulk Purchase**\n"
+            f"👤 Buyer: `{user_id}`\n"
+            f"🌍 Country: {country}\n"
+            f"🔐 Mode: Direct OTP\n"
+            f"📦 Quantity: {quantity}\n"
+            f"💰 Total: ₹{total_retail}"
+        )
+        return True
+
+    # Session ZIP mode: deliver all session files + 2FA manifest in one package.
+    try:
+        await ctx()["client"].send_file(
+            int(user_id),
+            zip_path,
+            caption=(
+                f"📦 **Bulk Session Package**\n\n"
+                f"🌍 Country: **{country}**\n"
+                f"📦 Accounts: **{quantity}**\n"
+                f"💰 Total: **₹{total_retail}**\n\n"
+                "The ZIP contains one `.session` file per number plus `accounts.txt` with each number and its 2FA password."
+            ),
+            parse_mode="markdown",
+        )
+        await bulk_orders_col.update_one(
+            {"_id": bulk_id},
+            {"$set": {"status": "completed", "completed_at": now_ist()}},
+        )
+        for acc in selected:
+            try:
+                await acc_mgr.remove_client(str(acc.get("phone") or ""))
+            except Exception:
+                pass
+        await event.edit(
+            "✅ **Bulk Session ZIP Delivered**\n\n"
+            f"📦 {quantity} accounts\n"
+            f"💰 Charged: ₹{total_retail}",
+            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+        )
+        await log_event(
+            f"📦 **Server 1 Bulk Purchase**\n"
+            f"👤 Buyer: `{user_id}`\n"
+            f"🌍 Country: {country}\n"
+            f"🗂️ Mode: Session ZIP\n"
+            f"📦 Quantity: {quantity}\n"
+            f"💰 Total: ₹{total_retail}"
+        )
+        return True
+    except Exception as e:
+        logging.exception("Bulk session ZIP delivery failed: %s", e)
+        # No package reached the customer: reverse the completed checkout.
+        await users_col.update_one(
+            {"user_id": int(user_id)},
+            {"$inc": {"balance": total_retail, "withdrawable_balance": withdrawable_deducted}},
+        )
+        await reverse_committed_franchise_sale(finance, reason="bulk_zip_delivery_failed")
+        await _server1_release_bulk_accounts(selected, bulk_id)
+        for entry in entries:
+            try:
+                await orders_col.update_one(
+                    {"_id": ObjectId(entry["order_id"])},
+                    {"$set": {"status": "refunded", "refund_reason": "zip_delivery_failed"}},
+                )
+            except Exception:
+                pass
+        await bulk_orders_col.update_one(
+            {"_id": bulk_id},
+            {"$set": {"status": "refunded", "refund_reason": "zip_delivery_failed", "completed_at": now_ist()}},
+        )
+        await event.edit(
+            "❌ Session package delivery failed. Your full amount was restored.",
+            buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+        )
+        return False
+    finally:
+        if zip_path:
+            shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
 
 # ---------- FRANCHISE WALLET ----------
 # Linked directly to the owner's own MASTER-bot personal balance — there is no
@@ -5000,6 +5563,7 @@ async def callback_handler(event):
             return
 
         if data == "buy_manual":
+            user_states.pop(user_id, None)
             countries = await accounts_col.distinct(
                 "country",
                 {"status": "available"},
@@ -5518,11 +6082,69 @@ async def callback_handler(event):
                 f"📦 Stock: {stock}"
             )
             buttons = [
-                [Button.inline("✅ Confirm Purchase", b"confirm_purchase", style="success")],
-                [Button.inline("❌ Cancel", b"cancel_purchase", style="danger")]
+                [Button.inline("✅ Buy 1 Account", b"confirm_purchase", style="success")],
             ]
+            if stock >= 2:
+                buttons.append([Button.inline("📦 Bulk Buy", b"bulk_setup", style="primary")])
+            buttons.append([Button.inline("❌ Cancel", b"cancel_purchase", style="danger")])
             await event.edit(confirm_text, buttons=buttons)
             await safe_callback_answer(event, )
+            return
+
+        # ---------- SERVER 1 BULK BUY ----------
+        if data == "bulk_setup":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "awaiting_confirmation":
+                await safe_callback_answer(event, "Session expired. Please choose stock again.", alert=True)
+                return
+            await event.edit(
+                "📦 **Bulk Buy — Server 1**\n\n"
+                f"🌍 Country: **{state['country']}**\n"
+                f"💰 Price per account: **₹{state['retail_price']}**\n\n"
+                "Choose delivery type:",
+                buttons=[
+                    [Button.inline("🔐 Direct OTP — One by One", b"bulk_mode_direct", style="success")],
+                    [Button.inline("🗂️ Session ZIP + 2FA", b"bulk_mode_zip", style="primary")],
+                    [Button.inline("❌ Cancel", b"cancel_purchase", style="danger")],
+                ],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data in {"bulk_mode_direct", "bulk_mode_zip"}:
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "awaiting_confirmation":
+                await safe_callback_answer(event, "Session expired. Please choose stock again.", alert=True)
+                return
+            mode = "direct_otp" if data == "bulk_mode_direct" else "session_zip"
+            state.update({
+                "action": "bulk_buy_server1",
+                "step": "await_quantity",
+                "mode": mode,
+            })
+            user_states[user_id] = state
+            stock = await accounts_col.count_documents({
+                "country": state["country"],
+                "status": "available",
+                "price": state["price"],
+            })
+            await event.edit(
+                f"📦 **{_bulk_mode_label(mode)}**\n\n"
+                f"🌍 Country: **{state['country']}**\n"
+                f"💰 Per account: **₹{state['retail_price']}**\n"
+                f"📦 Available now: **{stock}**\n\n"
+                f"Send quantity from **2 to {min(BULK_BUY_MAX_QTY, stock)}**.",
+                buttons=[[Button.inline("❌ Cancel", b"buy_manual", style="danger")]],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data == "bulk_confirm_server1":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "bulk_buy_server1" or state.get("step") != "confirm":
+                await safe_callback_answer(event, "Bulk session expired. Please start again.", alert=True)
+                return
+            await execute_server1_bulk_purchase(event, user_id, state)
             return
 
         # ---------- CONFIRM PURCHASE (full logic kept) ----------
@@ -9323,6 +9945,70 @@ async def handle_message(event):
         return
 
     # ---- OTHER FLOWS ----
+    # ---- SERVER 1 BULK BUY QUANTITY ----
+    if action == "bulk_buy_server1":
+        if state.get("step") == "await_quantity":
+            raw = (event.message.text or "").strip()
+            try:
+                quantity = int(raw)
+            except Exception:
+                await event.respond(
+                    f"❌ Send a whole number from 2 to {BULK_BUY_MAX_QTY}."
+                )
+                return
+
+            stock = await accounts_col.count_documents({
+                "country": state["country"],
+                "status": "available",
+                "price": state["price"],
+            })
+            max_allowed = min(BULK_BUY_MAX_QTY, int(stock))
+            if quantity < 2 or quantity > max_allowed:
+                if max_allowed < 2:
+                    await event.respond(
+                        "❌ Not enough stock is available for bulk purchase.",
+                        buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+                    )
+                    user_states.pop(user_id, None)
+                    return
+                await event.respond(
+                    f"❌ Quantity must be between 2 and {max_allowed}."
+                )
+                return
+
+            total = round(float(state["retail_price"]) * quantity, 2)
+            user = await users_col.find_one({"user_id": int(user_id)}) or {}
+            balance = float(user.get("balance", 0) or 0)
+            if balance < total:
+                await event.respond(
+                    f"❌ Insufficient balance.\n\nRequired: ₹{total}\nYour balance: ₹{balance}",
+                    buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+                )
+                return
+
+            state["quantity"] = quantity
+            state["step"] = "confirm"
+            user_states[user_id] = state
+            await event.respond(
+                "📦 **Confirm Bulk Purchase**\n\n"
+                f"🌍 Country: **{state['country']}**\n"
+                f"🚚 Mode: **{_bulk_mode_label(state['mode'])}**\n"
+                f"📦 Quantity: **{quantity}**\n"
+                f"💰 Per account: **₹{state['retail_price']}**\n"
+                f"💳 Total: **₹{total}**\n\n"
+                + (
+                    "Numbers will be sent one at a time. The next number is sent automatically after the current OTP arrives."
+                    if state["mode"] == "direct_otp"
+                    else "All session files will be delivered in one ZIP with an accounts.txt file containing the corresponding 2FA passwords."
+                ),
+                buttons=[
+                    [Button.inline("✅ Confirm Bulk Purchase", b"bulk_confirm_server1", style="success")],
+                    [Button.inline("❌ Cancel", b"buy_manual", style="danger")],
+                ],
+            )
+            return
+        return
+
     if action == "add_phone_otp":
         await process_phone_otp_step(event)
     elif action == "add_session":

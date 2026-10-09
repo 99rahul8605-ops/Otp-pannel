@@ -98,3 +98,13 @@ SERVER2_MARKUP_PERCENT=20
 ```
 
 Legacy VNH env fallbacks remain in `bot.py` for older deployments.
+
+
+## Server 1 Bulk Buy
+
+Server 1 price confirmation now includes **Bulk Buy** with two delivery modes:
+
+- **Direct OTP — One by One:** the first number is sent immediately; after its first OTP is delivered, the next number is sent automatically until the batch completes.
+- **Session ZIP + 2FA:** all selected accounts are packaged into one ZIP as Telethon SQLite `.session` files plus `accounts.txt` mapping each phone to its 2FA password.
+
+Bulk quantity defaults to a maximum of 20 and can be configured with `BULK_BUY_MAX_QTY`. Stock is FIFO and every selected session is live-validated before checkout.

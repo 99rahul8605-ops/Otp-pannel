@@ -106,6 +106,16 @@ class AccountManager:
 
                 if buyer_id:
                     key = (buyer_id, phone)
+
+                    # In Direct-OTP bulk mode only the currently issued number
+                    # is allowed to forward its first OTP. Queued numbers remain
+                    # silent until the previous number completes.
+                    if buyer_doc.get("bulk_order_id") and buyer_doc.get("bulk_mode") == "direct_otp" and not buyer_doc.get("bulk_active", False):
+                        logging.info(
+                            f"Suppressed OTP for queued bulk account {buyer_id} / {phone}."
+                        )
+                        return
+
                     is_first_otp = not buyer_doc.get("first_otp_sent", False)
 
                     # First OTP after purchase delivers automatically. Every
@@ -117,7 +127,12 @@ class AccountManager:
                                      f"(no pending request on file).")
                         return
 
-                    msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
+                    if buyer_doc.get("bulk_order_id") and buyer_doc.get("bulk_mode") == "direct_otp":
+                        bulk_index = int(buyer_doc.get("bulk_index", 0) or 0)
+                        bulk_total = int(buyer_doc.get("bulk_total", 0) or 0)
+                        msg = f"📦 **Bulk OTP {bulk_index}/{bulk_total}**\n\n📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
+                    else:
+                        msg = f"📞 **Phone Number:** `{phone}`\n📩 **OTP:** `{otp}`"
                     twofa_password = buyer_doc.get("twofa_password")
                     if twofa_password:
                         msg += f"\n🔐 **Password:** `{twofa_password}`"
@@ -167,6 +182,38 @@ class AccountManager:
                         logging.info(f"Cleared pending OTP request for {buyer_id} / {phone}")
 
         logging.info(f"✅ Client started for {phone}")
+        return True
+
+    async def validate_client(self, phone):
+        """Return (True, None) only when the stored Telegram session is live and authorized.
+
+        Reconnects/reloads the DB session when the in-memory client is missing, so
+        purchase-time health checks also work after process restarts.
+        """
+        client = self.clients.get(phone)
+        if client is None:
+            try:
+                acc = await self.accounts_col.find_one({"phone": phone})
+            except Exception as e:
+                return False, f"database lookup failed: {e}"
+            if not acc or not acc.get("session_string"):
+                return False, "session missing"
+            ok = await self.add_client(phone, acc["session_string"])
+            if not ok:
+                return False, "session could not be opened"
+            client = self.clients.get(phone)
+
+        try:
+            if not client.is_connected():
+                await client.connect()
+            if not await client.is_user_authorized():
+                return False, "session is not authorized"
+            me = await client.get_me()
+            if not me:
+                return False, "account identity unavailable"
+            return True, None
+        except Exception as e:
+            return False, str(e)
 
     async def get_authorizations(self, phone):
         """Fetch the list of active device sessions (Authorization objects) for this account."""
@@ -236,7 +283,12 @@ class AccountManager:
         self.clients.clear()
 
     async def load_all(self):
-        async for acc in self.accounts_col.find({"status": "available"}):
+        async for acc in self.accounts_col.find({
+            "$or": [
+                {"status": "available"},
+                {"status": "sold", "bulk_mode": "direct_otp", "bulk_active": True},
+            ]
+        }):
             try:
                 await self.add_client(acc["phone"], acc["session_string"])
             except Exception as e:
