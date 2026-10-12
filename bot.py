@@ -2159,6 +2159,17 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
             f"📦 Quantity: {quantity}\n"
             f"💰 Total: ₹{total_retail}"
         )
+        await public_log_event(
+            f"📦 **New Bulk Purchase**\n"
+            f"🖥️ Server: **Server 1**\n"
+            f"👤 User ID: `{mask_user_id(user_id)}`\n"
+            f"🌍 Country: **{country}**\n"
+            f"📦 Quantity: **{quantity}**\n"
+            f"🚚 Mode: **Direct OTP**\n"
+            f"💰 Amount: **₹{total_retail}**\n"
+            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST\n\n"
+            "💙 **Thank you for your purchase!**"
+        )
         return True
 
     # Session ZIP mode: deliver all session files + 2FA manifest in one package.
@@ -2240,6 +2251,17 @@ async def execute_server1_bulk_purchase(event, user_id: int, state: dict):
             f"🗂️ Mode: Session ZIP\n"
             f"📦 Quantity: {quantity}\n"
             f"💰 Total: ₹{total_retail}"
+        )
+        await public_log_event(
+            f"📦 **New Bulk Purchase**\n"
+            f"🖥️ Server: **Server 1**\n"
+            f"👤 User ID: `{mask_user_id(user_id)}`\n"
+            f"🌍 Country: **{country}**\n"
+            f"📦 Quantity: **{quantity}**\n"
+            f"🚚 Mode: **Session ZIP**\n"
+            f"💰 Amount: **₹{total_retail}**\n"
+            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST\n\n"
+            "💙 **Thank you for your purchase!**"
         )
         return True
     except Exception as e:
@@ -2362,6 +2384,63 @@ async def get_user_clone(user_id: int):
         "owner_id": user_id,
         "status": {"$nin": ["removed"]},
     })
+
+
+async def is_clone_self_service_enabled() -> bool:
+    """Whether normal master-bot users may create their own clone."""
+    doc = await db['settings'].find_one({
+        "key": "clone_self_service_enabled",
+        "franchise_id": "master",
+    })
+    if doc is None:
+        return True
+    value = doc.get("value", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "off", "no", "disabled"}
+    return bool(value)
+
+
+async def set_clone_self_service_enabled(enabled: bool):
+    await db['settings'].update_one(
+        {"key": "clone_self_service_enabled", "franchise_id": "master"},
+        {"$set": {
+            "value": bool(enabled),
+            "updated_at": now_ist(),
+            "franchise_id": "master",
+        }},
+        upsert=True,
+    )
+
+
+async def resolve_clone_owner_input(raw: str):
+    """Resolve an admin-supplied @username (or numeric ID) to a Telegram user."""
+    value = (raw or "").strip()
+    if not value:
+        return None, "Send the user's Telegram @username or numeric user ID."
+
+    try:
+        target = int(value) if value.lstrip('-').isdigit() else value
+        if isinstance(target, str) and not target.startswith('@'):
+            target = '@' + target
+        entity = await bot.get_entity(target)
+    except Exception:
+        return None, (
+            "Could not find that Telegram user. Send a valid @username. "
+            "If needed, ask the user to start the Master Bot first."
+        )
+
+    if getattr(entity, "bot", False):
+        return None, "The clone owner must be a Telegram user, not a bot."
+
+    owner_id = int(getattr(entity, "id", 0) or 0)
+    if not owner_id:
+        return None, "Could not resolve that Telegram user."
+
+    username = str(getattr(entity, "username", "") or "").strip()
+    first = str(getattr(entity, "first_name", "") or "").strip()
+    last = str(getattr(entity, "last_name", "") or "").strip()
+    name = (first + " " + last).strip() or (f"@{username}" if username else str(owner_id))
+    return {"owner_id": owner_id, "username": username, "name": name}, None
 
 
 # ---------- FRANCHISE PAYMENT SECURITY / AUDIT ----------
@@ -2831,27 +2910,48 @@ async def reverse_committed_franchise_sale(token: dict | None, reason: str = "cu
     await clone_audit(fid, "OWN_PAYMENT_SALE_REVERSED", reason=reason, **token)
 
 
-async def notify_clone_users_before_closure(clone: dict):
+async def notify_clone_users_before_closure(clone: dict, *, final_removal: bool = False):
     fid = clone["franchise_id"]
     client = clone_clients.get(fid)
     if not client:
         return 0
+
+    master_username = await get_master_bot_username()
+    master_handle = master_username if master_username and master_username != "@UnknownBot" else "the Master Bot"
+    master_url = (
+        f"https://t.me/{master_username.lstrip('@')}"
+        if master_username and master_username != "@UnknownBot"
+        else None
+    )
+
     sent = 0
     async for u in db['users'].find({"franchise_id": fid}):
         uid = u.get("user_id")
         if not uid:
             continue
-        bal = float(u.get("balance", 0) or 0)
-        try:
-            await client.send_message(
-                uid,
-                f"⚠️ **Important Notice**\n\n"
-                f"This clone bot is being closed/suspended.\n"
-                f"Your recorded balance: ₹{bal:.2f}\n\n"
-                f"If you have any remaining balance, pending order, or payment issue, "
-                f"please contact the Master Bot/Admin for resolution. Your account and "
-                f"transaction records are retained by the platform."
+
+        if final_removal:
+            message = (
+                "⚠️ **Important Notice**\n\n"
+                "This bot is no longer available.\n\n"
+                f"If you have any balance, pending order, payment issue, or need any help, "
+                f"please go to our Master Bot **{master_handle}** and contact the admin there.\n\n"
+                "Your previous account, order, and transaction records are retained."
             )
+        else:
+            message = (
+                "⚠️ **Important Notice**\n\n"
+                "This bot is being closed and is no longer available for new activity.\n\n"
+                f"For any balance, pending order, payment issue, or other help, "
+                f"please go to our Master Bot **{master_handle}** and contact the admin there."
+            )
+
+        buttons = None
+        if master_url:
+            buttons = [[Button.url("🤖 Open Master Bot", master_url, style="primary")]]
+
+        try:
+            await client.send_message(uid, message, buttons=buttons)
             sent += 1
         except Exception:
             pass
@@ -4734,7 +4834,7 @@ async def show_welcome_menu(event, user_id):
         my_clone = await get_user_clone(user_id)
         if my_clone:
             buttons.append([Button.inline(f"🗑️ Remove My Clone (@{my_clone['bot_username']})", b"remove_my_clone", style="danger")])
-        else:
+        elif await is_clone_self_service_enabled():
             buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
 
     support_link = await get_support_link()
@@ -4777,7 +4877,7 @@ async def _build_main_menu(user_id):
         my_clone = await get_user_clone(user_id)
         if my_clone:
             buttons.append([Button.inline(f"🗑️ Remove My Clone (@{my_clone['bot_username']})", b"remove_my_clone", style="danger")])
-        else:
+        elif await is_clone_self_service_enabled():
             buttons.append([Button.inline("🤖 Clone This Bot", b"self_clone_bot", style="success")])
     support_link = await get_support_link()
     if support_link:
@@ -7259,7 +7359,7 @@ async def callback_handler(event):
             try:
                 await public_log_event(
                     f"🚀 **New SMM Order**\n\n"
-                    f"👤 User: **{smm_buyer_name}** (`{mask_user_id(user_id)}`)\n"
+                    f"👤 User ID: `{mask_user_id(user_id)}`\n"
                     f"📦 Service: **{service['name']}**\n"
                     f"🆔 Service ID: `{service['service']}`\n"
                     f"📊 Quantity: **{quantity}**\n"
@@ -7311,8 +7411,14 @@ async def callback_handler(event):
             if not await is_admin(user_id) or ctx()['is_franchise']:
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
                 return
+            self_service = await is_clone_self_service_enabled()
+            toggle_label = (
+                "🚫 Disable Public Clone Option" if self_service
+                else "✅ Enable Public Clone Option"
+            )
             btns = [
-                [Button.inline("🤖 Clone Bot (New Franchise)", b"admin_clone_bot", style="success")],
+                [Button.inline("➕ Add Clone Manually", b"admin_clone_bot", style="success")],
+                [Button.inline(toggle_label, b"admin_toggle_clone_self_service", style="primary")],
                 [Button.inline("📋 List Clones/Wallets", b"admin_franchise_list", style="primary")],
                 [Button.inline("💰 Add Owner Balance", b"admin_franchise_credit", style="success")],
                 [Button.inline("🔐 Set Security Requirement", b"admin_clone_security_min", style="primary")],
@@ -7321,12 +7427,24 @@ async def callback_handler(event):
             ]
             await event.edit(
                 "🏢 **Franchise Management**\n\n"
-                "Each franchise partner's bot runs live in this same process — "
-                "one clone per user. Every sale on their bot draws down from the "
-                "wallet credit you top up here.",
+                f"Public clone creation: **{'ENABLED' if self_service else 'DISABLED'}**\n"
+                "Admins can always add a clone manually for a specific user using their "
+                "Telegram username and bot token.",
                 buttons=btns
             )
             await safe_callback_answer(event, )
+            return
+
+        if data == "admin_toggle_clone_self_service":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+            current = await is_clone_self_service_enabled()
+            await set_clone_self_service_enabled(not current)
+            status = "ENABLED" if not current else "DISABLED"
+            await safe_callback_answer(event, f"Public clone creation {status}.", alert=True)
+            # Re-render the franchise menu so the toggle label updates immediately.
+            await callback_router(event, data_override="admin_cat_franchise")
             return
 
         if data == "admin_clone_security_min":
@@ -7366,21 +7484,15 @@ async def callback_handler(event):
             if not await is_admin(user_id) or ctx()['is_franchise']:
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
                 return
-            existing = await get_user_clone(user_id)
-            if existing:
-                await safe_callback_answer(event, 
-                    f"❌ You already own a clone: @{existing['bot_username']}. "
-                    f"Remove it first if you want to create a new one.",
-                    alert=True
-                )
-                return
-            user_states[user_id] = {"action": "clone_bot", "step": "token"}
+            user_states[user_id] = {
+                "action": "clone_bot",
+                "step": "owner",
+                "manual_admin": True,
+            }
             await event.edit(
-                "🤖 **Clone Bot**\n\n"
-                "Just send the **bot token** for the new bot "
-                "(get one from @BotFather → /newbot).\n\n"
-                "Everything else is automatic — the bot's name, a unique franchise ID, "
-                "and **you become that bot's admin/owner automatically.**",
+                "➕ **Add Clone Manually**\n\n"
+                "Send the Telegram **@username** of the user who should own/admin the clone.\n\n"
+                "You can also send their numeric Telegram user ID.",
                 buttons=[[Button.inline("🔙 Cancel", b"admin_cat_franchise", style="danger")]]
             )
             await safe_callback_answer(event, )
@@ -7390,6 +7502,14 @@ async def callback_handler(event):
             if ctx()['is_franchise']:
                 await safe_callback_answer(event, "❌ Cloning is only available from the main bot.", alert=True)
                 return
+            if not await is_clone_self_service_enabled():
+                master_username = await get_master_bot_username()
+                await safe_callback_answer(
+                    event,
+                    f"Clone creation is currently disabled. Contact admin via {master_username}.",
+                    alert=True,
+                )
+                return
             existing = await get_user_clone(user_id)
             if existing:
                 await safe_callback_answer(event, 
@@ -7398,7 +7518,7 @@ async def callback_handler(event):
                     alert=True
                 )
                 return
-            user_states[user_id] = {"action": "clone_bot", "step": "token"}
+            user_states[user_id] = {"action": "clone_bot", "step": "token", "owner_id": user_id, "manual_admin": False}
             await event.edit(
                 "🤖 **Clone This Bot — Run Your Own!**\n\n"
                 "Want your own version of this bot, fully under your control?\n\n"
@@ -7447,7 +7567,6 @@ async def callback_handler(event):
                 return
 
             summary = await get_clone_finance_summary(fid)
-            notified = await notify_clone_users_before_closure(clone)
             liabilities = (
                 summary['clone_user_balance'] > 0.009
                 or summary['customer_funds_locked'] > 0.009
@@ -7455,6 +7574,7 @@ async def callback_handler(event):
             )
 
             if liabilities:
+                notified = await notify_clone_users_before_closure(clone, final_removal=False)
                 await bot_clones_col.update_one(
                     {"_id": clone["_id"]},
                     {"$set": {
@@ -7484,6 +7604,7 @@ async def callback_handler(event):
                 await safe_callback_answer(event, )
                 return
 
+            notified = await notify_clone_users_before_closure(clone, final_removal=True)
             await stop_clone(fid)
             security = float(clone.get("security_locked", 0) or 0)
             await bot_clones_col.update_one(
@@ -11453,6 +11574,40 @@ async def handle_message(event):
     elif action == "clone_bot":
         step = state.get("step")
 
+        if step == "owner":
+            if not await is_admin(user_id) or ctx()['is_franchise']:
+                user_states.pop(user_id, None)
+                await event.respond("❌ Unauthorized.")
+                return
+
+            owner, error = await resolve_clone_owner_input(event.message.text)
+            if not owner:
+                await event.respond(f"❌ {error}\n\nTry again, or /cancel.")
+                return
+
+            existing = await get_user_clone(owner["owner_id"])
+            if existing:
+                await event.respond(
+                    f"❌ This user already owns @{existing['bot_username']}. "
+                    "Remove that clone first if you want to assign a new one."
+                )
+                return
+
+            state.update({
+                "step": "token",
+                "owner_id": owner["owner_id"],
+                "owner_username": owner.get("username", ""),
+                "owner_name": owner.get("name", str(owner["owner_id"])),
+                "manual_admin": True,
+            })
+            user_states[user_id] = state
+            owner_label = f"@{owner['username']}" if owner.get('username') else f"ID {owner['owner_id']}"
+            await event.respond(
+                f"✅ Owner selected: **{owner['name']}** ({owner_label})\n\n"
+                "Now send the **bot token** for the clone from @BotFather."
+            )
+            return
+
         if step == "token":
             token = event.message.text.strip()
             wait = await event.respond("⏳ Validating token and setting everything up...")
@@ -11463,7 +11618,18 @@ async def handle_message(event):
 
             bot_username = result["username"]
             display_name = result["display_name"]
-            owner_id = user_id  # whoever submits the token owns & administers this clone
+            manual_admin = bool(state.get("manual_admin"))
+            owner_id = int(state.get("owner_id") or user_id)
+
+            if manual_admin:
+                existing = await get_user_clone(owner_id)
+                if existing:
+                    await wait.edit(
+                        f"❌ Target user already owns @{existing['bot_username']}. "
+                        "Remove that clone first, then try again."
+                    )
+                    return
+
             fid = re.sub(r'[^a-z0-9_]', '', bot_username.lower())[:24] or f"franchise_{owner_id}"
 
             # Guarantee a unique franchise_id even if two bots share a similar username
@@ -11520,7 +11686,7 @@ async def handle_message(event):
                 f"✅ **Clone Ready!**\n\n"
                 f"{launch_note}\n\n"
                 f"🤖 Bot: @{bot_username}\n"
-                f"👤 Owner/Admin: `{owner_id}` (you)\n"
+                f"👤 Owner/Admin: `{owner_id}`" + (" (you)\n" if owner_id == user_id else "\n") +
                 f"🆔 Franchise ID: `{fid}`\n"
                 f"{wallet_note}\n\n"
                 f"Default payment mode is **Master Managed** — customer payments are handled by the platform and your sale margin collects separately.\n\n"
