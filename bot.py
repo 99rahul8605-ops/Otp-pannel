@@ -5623,6 +5623,125 @@ def _stats_period_buttons(active_key: str, custom_days=None):
     return rows
 
 
+def _stats_display_user_name(doc: dict) -> str:
+    """Readable Telegram name from the profile fields already stored in MongoDB."""
+    first = str(doc.get("first_name") or "").strip()
+    last = str(doc.get("last_name") or "").strip()
+    username = str(doc.get("username") or "").strip().lstrip("@")
+
+    name = " ".join(part for part in (first, last) if part).strip()
+    if not name:
+        name = f"@{username}" if username else "Unknown User"
+    elif username:
+        name = f"{name} (@{username})"
+
+    # Keep Telegram legacy Markdown formatting stable even if profile names
+    # contain formatting characters.
+    for ch in ("*", "_", "`", "[", "]"):
+        name = name.replace(ch, "")
+    return name[:80]
+
+
+def _stats_back_callback(range_key: str = "today", custom_days=None) -> bytes:
+    if str(range_key) == "custom" and custom_days:
+        return f"admin_stats|custom|{int(custom_days)}".encode()
+    return f"admin_stats|{str(range_key or 'today')}".encode()
+
+
+async def render_admin_balance_breakdown(
+    event,
+    user_id: int,
+    page: int = 0,
+    range_key: str = "today",
+    custom_days=None,
+):
+    """Show the exact users that make up Current User Balances.
+
+    The list is tenant-scoped, so a clone admin only sees users/balances from
+    that clone and the master admin only sees the master-bot user scope.
+    """
+    if not await is_admin(user_id):
+        await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+        return
+
+    per_page = 12
+    nonzero_filter = {"balance": {"$ne": 0}}
+
+    total_users_with_balance = await users_col.count_documents(nonzero_filter)
+    total_balance = await _stats_sum(users_col, "balance")
+
+    total_pages = max(1, (total_users_with_balance + per_page - 1) // per_page)
+    page = max(0, min(int(page or 0), total_pages - 1))
+
+    cursor = (
+        users_col.find(nonzero_filter)
+        .sort([("balance", -1), ("user_id", 1)])
+        .skip(page * per_page)
+        .limit(per_page)
+    )
+    docs = await cursor.to_list(length=per_page)
+
+    scope_name = (
+        f"Clone • {ctx().get('display_name') or ctx().get('franchise_id')}"
+        if ctx().get("is_franchise")
+        else "Master Bot"
+    )
+
+    lines = [
+        "👛 **USER BALANCE BREAKDOWN**",
+        f"🤖 Scope: **{scope_name}**",
+        f"💰 Current Total: **{_stats_money(total_balance)}**",
+        f"👥 Users with non-zero balance: **{total_users_with_balance:,}**",
+        f"📄 Page: **{page + 1}/{total_pages}**",
+        "",
+    ]
+
+    if not docs:
+        lines.append("No users currently have a non-zero balance.")
+    else:
+        start_no = page * per_page + 1
+        for idx, doc in enumerate(docs, start=start_no):
+            uid = doc.get("user_id", "N/A")
+            balance = float(doc.get("balance", 0) or 0)
+            withdrawable = float(doc.get("withdrawable_balance", 0) or 0)
+            name = _stats_display_user_name(doc)
+            lines.extend([
+                f"**{idx}. {name}**",
+                f"🆔 `{uid}`  •  👛 **{_stats_money(balance)}**",
+                f"💸 Withdrawable: {_stats_money(withdrawable)}",
+                "",
+            ])
+
+    buttons = []
+    nav = []
+    if page > 0:
+        cb = f"admin_balances|{page-1}|{range_key}"
+        if str(range_key) == "custom" and custom_days:
+            cb += f"|{int(custom_days)}"
+        nav.append(Button.inline("⬅️ Prev", cb.encode(), style="primary"))
+
+    if page < total_pages - 1:
+        cb = f"admin_balances|{page+1}|{range_key}"
+        if str(range_key) == "custom" and custom_days:
+            cb += f"|{int(custom_days)}"
+        nav.append(Button.inline("Next ➡️", cb.encode(), style="primary"))
+
+    if nav:
+        buttons.append(nav)
+
+    refresh_cb = f"admin_balances|{page}|{range_key}"
+    if str(range_key) == "custom" and custom_days:
+        refresh_cb += f"|{int(custom_days)}"
+
+    buttons.extend([
+        [Button.inline("🔄 Refresh Balances", refresh_cb.encode(), style="success")],
+        [Button.inline("🔙 Back to Stats", _stats_back_callback(range_key, custom_days), style="primary")],
+    ])
+
+    await event.edit("\n".join(lines), buttons=buttons, parse_mode="markdown")
+    await safe_callback_answer(event)
+
+
 async def render_admin_stats(event, user_id: int, range_key: str = "today", custom_days=None):
     """Detailed, period-filterable business dashboard for the current bot scope."""
     if not await is_admin(user_id):
@@ -5865,8 +5984,13 @@ async def render_admin_stats(event, user_id: int, range_key: str = "today", cust
         if active_key == "custom" and custom_days
         else f"admin_stats|{active_key}".encode()
     )
+    balance_cb = f"admin_balances|0|{active_key}"
+    if active_key == "custom" and custom_days:
+        balance_cb += f"|{int(custom_days)}"
+
     buttons.extend([
-        [Button.inline("🔄 Refresh This Period", refresh_data, style="success")],
+        [Button.inline("👛 View Balance Breakdown", balance_cb.encode(), style="success")],
+        [Button.inline("🔄 Refresh This Period", refresh_data, style="primary")],
         [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
     ])
 
@@ -7951,6 +8075,35 @@ async def callback_handler(event):
             text, btns = await build_smm_platform_menu()
             await event.edit(text, buttons=btns)
             await safe_callback_answer(event)
+            return
+
+        # ---------- ADMIN USER BALANCE BREAKDOWN ----------
+        if data.startswith("admin_balances|"):
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            parts = data.split("|")
+            try:
+                page = int(parts[1]) if len(parts) > 1 else 0
+            except Exception:
+                page = 0
+
+            range_key = parts[2] if len(parts) > 2 else "today"
+            custom_days = None
+            if range_key == "custom" and len(parts) > 3:
+                try:
+                    custom_days = max(1, min(int(parts[3]), 3650))
+                except Exception:
+                    custom_days = 1
+
+            await render_admin_balance_breakdown(
+                event,
+                user_id,
+                page=page,
+                range_key=range_key,
+                custom_days=custom_days,
+            )
             return
 
         # ---------- ADMIN STATS ----------
