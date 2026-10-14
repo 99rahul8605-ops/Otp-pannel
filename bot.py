@@ -422,6 +422,8 @@ def get_client_for_scope(scope_id: str):
 
 # ---------- STATE MACHINE ----------
 user_states = {}
+# Exact list/page a user came from, used by one-step Back buttons.
+user_nav_context = {}
 pending_otp_requests = {}
 
 # ---------- Bot Username Cache ----------
@@ -4038,6 +4040,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         return True
 
     if data.startswith("server3_p1_search_page_"):
+        user_nav_context.setdefault(user_id, {})["server3_p1"] = data
         try:
             page = int(data.rsplit("_", 1)[1])
         except Exception:
@@ -4051,6 +4054,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         return True
 
     if data == "server3_p1":
+        user_nav_context.setdefault(user_id, {})["server3_p1"] = "server3_p1"
         msg, buttons = await build_server3_provider1_menu(user_id, 0)
         if not buttons:
             await safe_callback_answer(event, "❌ Provider 1 is temporarily unavailable.", alert=True)
@@ -4060,6 +4064,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         return True
 
     if data.startswith("server3_p1_page_"):
+        user_nav_context.setdefault(user_id, {})["server3_p1"] = data
         try:
             page = int(data.rsplit("_", 1)[1])
         except Exception:
@@ -4142,6 +4147,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             "supplier_price": supplier_price,
             "wholesale_inr": pricing["wholesale_inr"],
             "retail_price": pricing["retail_inr"],
+            "back_data": user_nav_context.get(user_id, {}).get("server3_p1", "server3_p1"),
         }
         await event.edit(
             "🔵 **Provider 1**\n\n"
@@ -4152,7 +4158,11 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             "Proceed only when you are ready to use the number.",
             buttons=[
                 [Button.inline("✅ Confirm Purchase", b"server3_p1_confirm", style="success")],
-                [Button.inline("❌ Cancel", b"server3_p1", style="danger")],
+                [Button.inline(
+                    "🔙 Back",
+                    str(user_states[user_id].get("back_data") or "server3_p1").encode(),
+                    style="primary",
+                )],
             ],
         )
         await safe_callback_answer(event)
@@ -4197,7 +4207,11 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
                 "Tap confirm again if you want to continue at the updated price.",
                 buttons=[
                     [Button.inline("✅ Confirm New Price", b"server3_p1_confirm", style="success")],
-                    [Button.inline("❌ Cancel", b"server3_p1", style="danger")],
+                    [Button.inline(
+                    "🔙 Back",
+                    str(user_states[user_id].get("back_data") or "server3_p1").encode(),
+                    style="primary",
+                )],
                 ],
             )
             await safe_callback_answer(event, "Price refreshed.", alert=True)
@@ -4208,8 +4222,8 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             await show_insufficient_balance(
                 event,
                 required=retail_price,
-                back_data=b"server3_p1",
-                back_label="🔙 Back to Provider 1",
+                back_data=str(state.get("back_data") or "server3_p1").encode(),
+                back_label="🔙 Back",
             )
             return True
         finance = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
@@ -4300,6 +4314,8 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         )
         try:
             buyer_name = await get_display_name(user_id)
+            updated_user = await users_col.find_one({"user_id": user_id})
+            new_balance = float((updated_user or {}).get("balance", 0) or 0)
             await log_event(
                 "🛒 **New Account Purchase**\n"
                 "🖥️ Server: **Server 3**\n"
@@ -4308,7 +4324,9 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
                 f"📱 Phone: `{phone}`\n"
                 f"🌍 Account: {state.get('label', 'N/A')}\n"
                 f"💰 Retail: ₹{retail_price}\n"
-                f"🧾 Supplier cost: ₹{actual_pricing['wholesale_inr']}"
+                f"🧾 Supplier cost: ₹{actual_pricing['wholesale_inr']}\n"
+                f"👛 Balance After: ₹{new_balance}\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             await public_log_event(
                 "🛒 **New Purchase**\n"
@@ -4344,6 +4362,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         return True
 
     if data.startswith("server3_p2_search_page_"):
+        user_nav_context.setdefault(user_id, {})["server3_p2"] = data
         try:
             page = int(data.rsplit("_", 1)[1])
         except Exception:
@@ -4357,6 +4376,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         return True
 
     if data == "server3_p2":
+        user_nav_context.setdefault(user_id, {})["server3_p2"] = "server3_p2"
         msg, buttons = await build_server3_provider2_menu(user_id, 0)
         if not buttons:
             await safe_callback_answer(event, "❌ Provider 2 is temporarily unavailable.", alert=True)
@@ -4366,6 +4386,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         return True
 
     if data.startswith("server3_p2_page_"):
+        user_nav_context.setdefault(user_id, {})["server3_p2"] = data
         try:
             page = int(data.rsplit("_", 1)[1])
         except Exception:
@@ -4401,6 +4422,7 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             "supplier_price": supplier_price,
             "wholesale_inr": pricing["wholesale_inr"],
             "retail_price": pricing["retail_inr"],
+            "back_data": user_nav_context.get(user_id, {}).get("server3_p2", "server3_p2"),
         }
         await event.edit(
             "🟣 **Provider 2**\n\n"
@@ -4410,7 +4432,11 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             "Live stock can move quickly. Your bot will never accept a higher provider tier without a fresh confirmation.",
             buttons=[
                 [Button.inline("✅ Confirm Purchase", b"server3_p2_confirm", style="success")],
-                [Button.inline("❌ Cancel", b"server3_p2", style="danger")],
+                [Button.inline(
+                    "🔙 Back",
+                    str(user_states[user_id].get("back_data") or "server3_p2").encode(),
+                    style="primary",
+                )],
             ],
         )
         await safe_callback_answer(event)
@@ -4447,7 +4473,11 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
                 "Tap confirm again if you want to continue at the updated price.",
                 buttons=[
                     [Button.inline("✅ Confirm New Price", b"server3_p2_confirm", style="success")],
-                    [Button.inline("❌ Cancel", b"server3_p2", style="danger")],
+                    [Button.inline(
+                    "🔙 Back",
+                    str(user_states[user_id].get("back_data") or "server3_p2").encode(),
+                    style="primary",
+                )],
                 ],
             )
             await safe_callback_answer(event, "Price refreshed.", alert=True)
@@ -4458,8 +4488,8 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
             await show_insufficient_balance(
                 event,
                 required=retail_price,
-                back_data=b"server3_p2",
-                back_label="🔙 Back to Provider 2",
+                back_data=str(state.get("back_data") or "server3_p2").encode(),
+                back_label="🔙 Back",
             )
             return True
         finance = await reserve_franchise_sale(wholesale_inr, retail_price, user_id)
@@ -4546,6 +4576,8 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
         )
         try:
             buyer_name = await get_display_name(user_id)
+            updated_user = await users_col.find_one({"user_id": user_id})
+            new_balance = float((updated_user or {}).get("balance", 0) or 0)
             await log_event(
                 "🛒 **New Account Purchase**\n"
                 "🖥️ Server: **Server 3**\n"
@@ -4554,7 +4586,9 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
                 f"📱 Phone: `{phone}`\n"
                 f"🌍 Country: {state.get('country')} ({state.get('country_code')})\n"
                 f"💰 Retail: ₹{retail_price}\n"
-                f"🧾 Supplier cost: ₹{actual_pricing['wholesale_inr']}"
+                f"🧾 Supplier cost: ₹{actual_pricing['wholesale_inr']}\n"
+                f"👛 Balance After: ₹{new_balance}\n"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
             await public_log_event(
                 "🛒 **New Purchase**\n"
@@ -4583,9 +4617,23 @@ async def handle_server3_callback(event, data: str, user_id: int) -> bool:
                 return True
             await safe_callback_answer(event, "Checking OTP...", alert=False)
             if mode == "check":
+                # Check buttons belong to temporary waiting/status messages, so
+                # updating that status message is fine.
                 await _server3_poll_order_status(event, order, local_id, attempts=6)
             else:
-                await _server3_start_otp(event, order, local_id)
+                # Number Reserved and OTP Received are permanent receipts.
+                # Never edit either one when Get OTP / Request New OTP is tapped.
+                working = await ctx()['client'].send_message(
+                    event.chat_id,
+                    "⏳ **Checking OTP...**",
+                    parse_mode="markdown",
+                )
+                worker = _Server3MessageEditor(
+                    ctx()['client'],
+                    event.chat_id,
+                    working.id,
+                )
+                await _server3_start_otp(worker, order, local_id)
             return True
 
     return False
@@ -4636,7 +4684,7 @@ async def build_smm_category_page(platform: str, page: int):
     text = f"{emoji} **{platform} Services** — Select a category  ({page+1}/{tp})\nTotal categories: {total}"
     return text, buttons
 
-async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float):
+async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float, back_data=None):
     cat_keys = get_smm_platform_categories(platform)
     if cidx >= len(cat_keys):
         return None, None
@@ -4669,7 +4717,10 @@ async def build_smm_service_page(platform: str, cidx: int, page: int, usd: float
 
     buttons.append([Button.inline("🔍 Search Service", b"smm_search", style="primary")])
     buttons.append([Button.inline("🛒 Place Order (enter Service ID)", b"smm_place_order", style="success")])
-    buttons.append([Button.inline("🔙 Back to Categories", f"smm_cat_{platform}_0".encode(), style="primary")])
+    category_back = back_data or f"smm_cat_{platform}_0"
+    if isinstance(category_back, str):
+        category_back = category_back.encode()
+    buttons.append([Button.inline("🔙 Back to Categories", category_back, style="primary")])
     return text, buttons
 
 SMM_SEARCH_LIMIT = 15
@@ -5469,6 +5520,364 @@ async def show_all_withdrawals(event, user_id):
         await event.edit("❌ Error loading withdrawals.", buttons=[[Button.inline("🔙 Back", b"admin", style="primary")]])
 
 
+
+async def _stats_sum(collection, field: str, filt=None) -> float:
+    """Small aggregation helper for the admin statistics dashboard."""
+    pipeline = []
+    if filt:
+        pipeline.append({"$match": dict(filt)})
+    pipeline.append({"$group": {"_id": None, "value": {"$sum": {"$ifNull": [f"${field}", 0]}}}})
+    rows = await collection.aggregate(pipeline).to_list(length=1)
+    if not rows:
+        return 0.0
+    try:
+        return float(rows[0].get("value", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+async def _stats_count_and_sum(collection, field: str, filt=None):
+    filt = dict(filt or {})
+    count = await collection.count_documents(filt)
+    total = await _stats_sum(collection, field, filt)
+    return int(count), float(total)
+
+
+def _stats_money(value) -> str:
+    try:
+        amount = float(value or 0)
+    except Exception:
+        amount = 0.0
+    return f"₹{amount:,.2f}"
+
+
+def _stats_period(range_key: str = "today", custom_days=None):
+    """Return (label, start, end, normalized_key).
+
+    Datetimes are naive IST to match the existing MongoDB timestamps in this bot.
+    Last-N-days includes today as one calendar day.
+    """
+    now = now_ist()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    key = str(range_key or "today").strip().lower()
+
+    if key == "yesterday":
+        return "Yesterday", today_start - timedelta(days=1), today_start, "yesterday"
+
+    if key in {"7d", "7days", "week"}:
+        return "Last 7 Days", today_start - timedelta(days=6), None, "7d"
+
+    if key in {"month", "this_month"}:
+        return "This Month", today_start.replace(day=1), None, "month"
+
+    if key == "all":
+        return "All Time", None, None, "all"
+
+    if key == "custom":
+        try:
+            days = int(custom_days)
+        except Exception:
+            days = 1
+        days = max(1, min(days, 3650))
+        return f"Last {days} Day{'s' if days != 1 else ''}", today_start - timedelta(days=days - 1), None, "custom"
+
+    return "Today", today_start, None, "today"
+
+
+def _stats_with_period(base=None, start=None, end=None, field="created_at"):
+    filt = dict(base or {})
+    if start is not None or end is not None:
+        date_q = {}
+        if start is not None:
+            date_q["$gte"] = start
+        if end is not None:
+            date_q["$lt"] = end
+        filt[field] = date_q
+    return filt
+
+
+def _stats_period_buttons(active_key: str, custom_days=None):
+    def label(key, title):
+        return ("✅ " if active_key == key else "") + title
+
+    rows = [
+        [
+            Button.inline(label("today", "Today"), b"admin_stats|today", style="primary"),
+            Button.inline(label("yesterday", "Yesterday"), b"admin_stats|yesterday", style="primary"),
+        ],
+        [
+            Button.inline(label("7d", "Last 7 Days"), b"admin_stats|7d", style="primary"),
+            Button.inline(label("month", "This Month"), b"admin_stats|month", style="primary"),
+        ],
+        [
+            Button.inline(label("all", "All Time"), b"admin_stats|all", style="primary"),
+            Button.inline(
+                ("✅ " if active_key == "custom" else "") + (
+                    f"Custom ({custom_days}d)" if active_key == "custom" and custom_days else "Custom"
+                ),
+                b"admin_stats|custom",
+                style="success",
+            ),
+        ],
+    ]
+    return rows
+
+
+async def render_admin_stats(event, user_id: int, range_key: str = "today", custom_days=None):
+    """Detailed, period-filterable business dashboard for the current bot scope."""
+    if not await is_admin(user_id):
+        if isinstance(event, events.CallbackQuery.Event):
+            await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+        else:
+            await event.respond("❌ Unauthorized.")
+        return
+
+    period_label, period_start, period_end, active_key = _stats_period(range_key, custom_days)
+
+    excluded_sales = ["refunded", "cancelled", "failed", "provider_response_incomplete"]
+    sale_base = {"status": {"$nin": excluded_sales}}
+    sale_filter = _stats_with_period(sale_base, period_start, period_end)
+
+    server1_filter = _stats_with_period({
+        "status": {"$nin": excluded_sales},
+        "$or": [
+            {"source": {"$exists": False}},
+            {"source": None},
+            {"source": "server1"},
+        ],
+    }, period_start, period_end)
+    server2_filter = _stats_with_period({
+        "status": {"$nin": excluded_sales},
+        "source": "server2",
+    }, period_start, period_end)
+    server3_p1_filter = _stats_with_period({
+        "status": {"$nin": excluded_sales},
+        "source": "server3",
+        "server3_provider": 1,
+    }, period_start, period_end)
+    server3_p2_filter = _stats_with_period({
+        "status": {"$nin": excluded_sales},
+        "source": "server3",
+        "server3_provider": 2,
+    }, period_start, period_end)
+
+    # ---- Users / activity in selected period ----
+    total_users = await users_col.count_documents({})
+    wallet_balance = await _stats_sum(users_col, "balance")
+    new_users = await users_col.count_documents(
+        _stats_with_period({}, period_start, period_end, field="joined_at")
+    )
+    active_users = await users_col.count_documents(
+        _stats_with_period({"last_seen": {"$exists": True}}, period_start, period_end, field="last_seen")
+    )
+
+    # ---- Account sales ----
+    account_sales_count, account_sales_amount = await _stats_count_and_sum(
+        orders_col, "amount", sale_filter
+    )
+    s1_count, s1_amount = await _stats_count_and_sum(orders_col, "amount", server1_filter)
+    s2_count, s2_amount = await _stats_count_and_sum(orders_col, "amount", server2_filter)
+    s3p1_count, s3p1_amount = await _stats_count_and_sum(orders_col, "amount", server3_p1_filter)
+    s3p2_count, s3p2_amount = await _stats_count_and_sum(orders_col, "amount", server3_p2_filter)
+    account_wholesale = await _stats_sum(orders_col, "wholesale_amount", sale_filter)
+    account_margin = max(0.0, account_sales_amount - account_wholesale)
+
+    # ---- Bulk ----
+    bulk_base = {"status": {"$nin": ["cancelled", "failed", "refunded"]}}
+    bulk_filter = _stats_with_period(bulk_base, period_start, period_end)
+    bulk_count, bulk_revenue = await _stats_count_and_sum(
+        bulk_orders_col, "total_amount", bulk_filter
+    )
+    bulk_accounts = await _stats_sum(bulk_orders_col, "quantity", bulk_filter)
+    direct_bulk = await bulk_orders_col.count_documents(
+        _stats_with_period({
+            "mode": "direct_otp",
+            "status": {"$nin": ["cancelled", "failed", "refunded"]},
+        }, period_start, period_end)
+    )
+    zip_bulk = await bulk_orders_col.count_documents(
+        _stats_with_period({
+            "mode": "session_zip",
+            "status": {"$nin": ["cancelled", "failed", "refunded"]},
+        }, period_start, period_end)
+    )
+
+    # ---- SMM ----
+    smm_filter = _stats_with_period({}, period_start, period_end)
+    smm_count, smm_revenue = await _stats_count_and_sum(
+        smm_orders_col, "charge", smm_filter
+    )
+    smm_cost = await _stats_sum(smm_orders_col, "wholesale_cost", smm_filter)
+    smm_margin = max(0.0, smm_revenue - smm_cost)
+
+    # ---- Deposits / withdrawals ----
+    approved_dep_filter = _stats_with_period(
+        {"status": "approved"}, period_start, period_end
+    )
+    pending_dep_filter = _stats_with_period(
+        {"status": {"$in": ["awaiting_proof", "pending", "pending_auto"]}},
+        period_start, period_end,
+    )
+    approved_wd_filter = _stats_with_period(
+        {"status": "approved"}, period_start, period_end
+    )
+    pending_wd_filter = _stats_with_period(
+        {"status": "pending"}, period_start, period_end
+    )
+
+    approved_dep_count, approved_dep_amount = await _stats_count_and_sum(
+        deposits_col, "amount", approved_dep_filter
+    )
+    pending_dep_count, pending_dep_amount = await _stats_count_and_sum(
+        deposits_col, "amount", pending_dep_filter
+    )
+    approved_wd_count, approved_wd_amount = await _stats_count_and_sum(
+        withdrawals_col, "amount", approved_wd_filter
+    )
+    pending_wd_count, pending_wd_amount = await _stats_count_and_sum(
+        withdrawals_col, "amount", pending_wd_filter
+    )
+
+    # ---- Manual balance adjustments ----
+    manual_add_filter = _stats_with_period(
+        {"amount": {"$gt": 0}}, period_start, period_end
+    )
+    manual_deduct_filter = _stats_with_period(
+        {"amount": {"$lt": 0}}, period_start, period_end
+    )
+    manual_added = await _stats_sum(
+        balance_adjustments_col, "amount", manual_add_filter
+    )
+    manual_deducted_rows = await balance_adjustments_col.aggregate([
+        {"$match": manual_deduct_filter},
+        {"$group": {"_id": None, "value": {"$sum": {"$abs": "$amount"}}}},
+    ]).to_list(length=1)
+    manual_deducted = float(manual_deducted_rows[0]["value"]) if manual_deducted_rows else 0.0
+
+    scope_name = (
+        f"Clone • {ctx().get('display_name') or ctx().get('franchise_id')}"
+        if ctx().get("is_franchise")
+        else "Master Bot"
+    )
+
+    now = now_ist()
+    if period_start is None:
+        date_line = "All recorded data"
+    elif period_end is not None:
+        date_line = (
+            f"{period_start.strftime('%d/%m/%Y')} → "
+            f"{(period_end - timedelta(seconds=1)).strftime('%d/%m/%Y')}"
+        )
+    else:
+        date_line = f"{period_start.strftime('%d/%m/%Y')} → Now"
+
+    lines = [
+        "📊 **ADMIN STATS DASHBOARD**",
+        f"🤖 Scope: **{scope_name}**",
+        f"🗓️ Period: **{period_label}**",
+        f"📅 Range: `{date_line}`",
+        f"🕐 Updated: `{now.strftime('%d/%m/%Y %H:%M:%S')} IST`",
+        "",
+        "👥 **USERS**",
+        f"➕ New Users: **{new_users:,}**",
+        f"🟢 Active Users: **{active_users:,}**",
+        f"👤 Total Users Now: **{total_users:,}**",
+        f"👛 Current User Balances: **{_stats_money(wallet_balance)}**",
+        "",
+        f"🛒 **ACCOUNT SALES — {period_label.upper()}**",
+        f"🟢 Server 1: **{s1_count:,}**  •  {_stats_money(s1_amount)}",
+        f"🟠 Server 2: **{s2_count:,}**  •  {_stats_money(s2_amount)}",
+        f"🔵 Server 3 • Provider 1: **{s3p1_count:,}**  •  {_stats_money(s3p1_amount)}",
+        f"🟣 Server 3 • Provider 2: **{s3p2_count:,}**  •  {_stats_money(s3p2_amount)}",
+        f"📦 Total Accounts Sold: **{account_sales_count:,}**",
+        f"💰 Account Revenue: **{_stats_money(account_sales_amount)}**",
+        f"🧾 Supplier Cost: **{_stats_money(account_wholesale)}**",
+        f"📈 Account Gross Margin: **{_stats_money(account_margin)}**",
+        "",
+        "📦 **BULK PURCHASES**",
+        f"🧾 Bulk Orders: **{bulk_count:,}**",
+        f"📱 Accounts Sold in Bulk: **{int(bulk_accounts):,}**",
+        f"🔐 Direct OTP: **{direct_bulk:,}**  •  🗂️ Session ZIP: **{zip_bulk:,}**",
+        f"💰 Bulk Revenue: **{_stats_money(bulk_revenue)}**",
+        "",
+        "🚀 **SMM BUSINESS**",
+        f"📦 Orders: **{smm_count:,}**",
+        f"💰 Customer Spend: **{_stats_money(smm_revenue)}**",
+        f"🧾 Supplier Cost: **{_stats_money(smm_cost)}**",
+        f"📈 Gross Margin: **{_stats_money(smm_margin)}**",
+        "",
+        "💳 **PAYMENTS**",
+        f"✅ Deposits Approved: **{approved_dep_count:,}**  •  {_stats_money(approved_dep_amount)}",
+        f"⏳ Deposits Pending: **{pending_dep_count:,}**  •  {_stats_money(pending_dep_amount)}",
+        f"✅ Withdrawals Approved: **{approved_wd_count:,}**  •  {_stats_money(approved_wd_amount)}",
+        f"⏳ Withdrawals Pending: **{pending_wd_count:,}**  •  {_stats_money(pending_wd_amount)}",
+        f"➕ Manual Balance Added: **{_stats_money(manual_added)}**",
+        f"➖ Manual Balance Deducted: **{_stats_money(manual_deducted)}**",
+    ]
+
+    # Master-only shared Server 1 stock.
+    if not ctx().get("is_franchise"):
+        stock_total = await accounts_col.count_documents({})
+        stock_available = await accounts_col.count_documents({"status": "available"})
+        stock_sold = await accounts_col.count_documents({"status": "sold"})
+        stock_inactive = await accounts_col.count_documents({"status": "inactive"})
+        stock_reserving = await accounts_col.count_documents({"status": "bulk_reserving"})
+        stock_other = max(
+            0,
+            stock_total - stock_available - stock_sold - stock_inactive - stock_reserving,
+        )
+
+        # ObjectId creation time is UTC. Convert the selected IST boundaries.
+        if period_start is None:
+            stock_added_period = stock_total
+        else:
+            oid_query = {}
+            start_utc = period_start.replace(tzinfo=IST).astimezone(timezone.utc)
+            oid_query["$gte"] = ObjectId.from_datetime(start_utc)
+            if period_end is not None:
+                end_utc = period_end.replace(tzinfo=IST).astimezone(timezone.utc)
+                oid_query["$lt"] = ObjectId.from_datetime(end_utc)
+            stock_added_period = await accounts_col.count_documents({"_id": oid_query})
+
+        lines.extend([
+            "",
+            "📦 **SERVER 1 STOCK**",
+            f"➕ Numbers Added ({period_label}): **{stock_added_period:,}**",
+            f"📚 Total Added Records: **{stock_total:,}**",
+            f"✅ Available Now: **{stock_available:,}**",
+            f"🛒 Sold Records: **{stock_sold:,}**",
+            f"⚠️ Inactive: **{stock_inactive:,}**",
+            f"⏳ Reserving: **{stock_reserving:,}**",
+        ])
+        if stock_other:
+            lines.append(f"🗃️ Other Status: **{stock_other:,}**")
+
+        clone_count = await bot_clones_col.count_documents({})
+        lines.extend([
+            "",
+            "🏢 **PLATFORM**",
+            f"🤖 Clone Bots Added: **{clone_count:,}**",
+        ])
+
+    buttons = _stats_period_buttons(active_key, custom_days)
+    refresh_data = (
+        f"admin_stats|custom|{int(custom_days)}".encode()
+        if active_key == "custom" and custom_days
+        else f"admin_stats|{active_key}".encode()
+    )
+    buttons.extend([
+        [Button.inline("🔄 Refresh This Period", refresh_data, style="success")],
+        [Button.inline("🔙 Back to Admin Menu", b"admin", style="primary")],
+    ])
+
+    dashboard_text = "\n".join(lines)
+    if isinstance(event, events.CallbackQuery.Event):
+        await event.edit(dashboard_text, buttons=buttons, parse_mode="markdown")
+        await safe_callback_answer(event)
+    else:
+        await event.respond(dashboard_text, buttons=buttons, parse_mode="markdown")
+
+
 # ============================================================
 #  2. CALLBACK HANDLER
 # ============================================================
@@ -5508,7 +5917,7 @@ async def callback_handler(event):
             return
 
         # Clear states for menu switches
-        if data in ("main", "buy", "balance", "deposit", "orders", "admin",
+        if data in ("main", "buy", "balance", "deposit", "orders", "admin", "admin_stats",
                     "admin_add_otp", "admin_add_sess", "admin_add_stock",
                     "admin_addbal", "admin_deposits",
                     "admin_setprice", "admin_support", "withdraw", "admin_minwithdraw",
@@ -6093,6 +6502,7 @@ async def callback_handler(event):
             return
 
         if data == "server2":
+            user_nav_context.setdefault(user_id, {})["server2"] = "server2"
             if not server2_server.configured:
                 await safe_callback_answer(event, "❌ Server 2 is not configured.", alert=True)
                 return
@@ -6110,6 +6520,7 @@ async def callback_handler(event):
             return
 
         if data.startswith("server2_countries_"):
+            user_nav_context.setdefault(user_id, {})["server2"] = data
             try:
                 page = int(data.rsplit("_", 1)[1])
             except Exception:
@@ -6125,6 +6536,7 @@ async def callback_handler(event):
             return
 
         if data.startswith("server2_search_page_"):
+            user_nav_context.setdefault(user_id, {})["server2"] = data
             try:
                 page = int(data.rsplit("_", 1)[1])
             except Exception:
@@ -6163,6 +6575,7 @@ async def callback_handler(event):
                 "supplier_price": pricing["supplier_price"],
                 "wholesale_inr": pricing["wholesale_inr"],
                 "retail_price": pricing["retail_inr"],
+                "back_data": user_nav_context.get(user_id, {}).get("server2", "server2"),
             }
 
             await event.edit(
@@ -6190,7 +6603,11 @@ async def callback_handler(event):
                             style="success",
                         )
                     ],
-                    [Button.inline("❌ Cancel", b"server2", style="danger")],
+                    [Button.inline(
+                        "🔙 Back",
+                        str(user_states[user_id].get("back_data") or "server2").encode(),
+                        style="primary",
+                    )],
                 ],
             )
             await safe_callback_answer(event, )
@@ -6225,8 +6642,8 @@ async def callback_handler(event):
                 await show_insufficient_balance(
                     event,
                     required=retail_price,
-                    back_data=b"server2",
-                    back_label="🔙 Back to Server 2",
+                    back_data=str(state.get("back_data") or "server2").encode(),
+                    back_label="🔙 Back",
                 )
                 return
 
@@ -6478,7 +6895,8 @@ async def callback_handler(event):
                 msg += f"\n🔒 Password: `{password}`"
             msg += "\n\nKeep these details private."
 
-            await event.edit(
+            await ctx()['client'].send_message(
+                event.chat_id,
                 msg,
                 buttons=[
                     [
@@ -6496,6 +6914,7 @@ async def callback_handler(event):
                         )
                     ],
                 ],
+                parse_mode="markdown",
             )
 
             try:
@@ -6537,7 +6956,7 @@ async def callback_handler(event):
                 count = item["count"]
                 retail = round(price * acct_markup, 2)
                 btns.append([Button.inline(f"₹{retail} ({count} available)", f"price_{country}_{price}", style="primary")])
-            btns.append([Button.inline("🔙 Back", b"buy", style="primary")])
+            btns.append([Button.inline("🔙 Back", b"buy_manual", style="primary")])
             await event.edit(
                 f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
                 buttons=btns
@@ -6570,7 +6989,7 @@ async def callback_handler(event):
             ]
             if stock >= 2:
                 buttons.append([Button.inline("📦 Bulk Buy", b"bulk_setup", style="primary")])
-            buttons.append([Button.inline("❌ Cancel", b"cancel_purchase", style="danger")])
+            buttons.append([Button.inline("🔙 Back", b"cancel_purchase", style="primary")])
             await event.edit(confirm_text, buttons=buttons)
             await safe_callback_answer(event, )
             return
@@ -6589,8 +7008,64 @@ async def callback_handler(event):
                 buttons=[
                     [Button.inline("🔐 Direct OTP — One by One", b"bulk_mode_direct", style="success")],
                     [Button.inline("🗂️ Session ZIP + 2FA", b"bulk_mode_zip", style="primary")],
-                    [Button.inline("❌ Cancel", b"cancel_purchase", style="danger")],
+                    [Button.inline(
+                        "🔙 Back",
+                        f"price_{state['country']}_{state['price']}".encode(),
+                        style="primary",
+                    )],
                 ],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data == "bulk_back_setup":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "bulk_buy_server1":
+                await safe_callback_answer(event, "Session expired. Please choose stock again.", alert=True)
+                return
+            state["action"] = "awaiting_confirmation"
+            state.pop("step", None)
+            state.pop("mode", None)
+            state.pop("quantity", None)
+            user_states[user_id] = state
+            await event.edit(
+                "📦 **Bulk Buy — Server 1**\n\n"
+                f"🌍 Country: **{state['country']}**\n"
+                f"💰 Price per account: **₹{state['retail_price']}**\n\n"
+                "Choose delivery type:",
+                buttons=[
+                    [Button.inline("🔐 Direct OTP — One by One", b"bulk_mode_direct", style="success")],
+                    [Button.inline("🗂️ Session ZIP + 2FA", b"bulk_mode_zip", style="primary")],
+                    [Button.inline(
+                        "🔙 Back",
+                        f"price_{state['country']}_{state['price']}".encode(),
+                        style="primary",
+                    )],
+                ],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data == "bulk_back_quantity":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "bulk_buy_server1":
+                await safe_callback_answer(event, "Session expired. Please choose stock again.", alert=True)
+                return
+            state["step"] = "await_quantity"
+            state.pop("quantity", None)
+            user_states[user_id] = state
+            stock = await accounts_col.count_documents({
+                "country": state["country"],
+                "status": "available",
+                "price": state["price"],
+            })
+            await event.edit(
+                f"📦 **{_bulk_mode_label(state['mode'])}**\n\n"
+                f"🌍 Country: **{state['country']}**\n"
+                f"💰 Per account: **₹{state['retail_price']}**\n"
+                f"📦 Available now: **{stock}**\n\n"
+                f"Send quantity from **2 to {min(BULK_BUY_MAX_QTY, stock)}**.",
+                buttons=[[Button.inline("🔙 Back", b"bulk_back_setup", style="primary")]],
             )
             await safe_callback_answer(event)
             return
@@ -6618,7 +7093,7 @@ async def callback_handler(event):
                 f"💰 Per account: **₹{state['retail_price']}**\n"
                 f"📦 Available now: **{stock}**\n\n"
                 f"Send quantity from **2 to {min(BULK_BUY_MAX_QTY, stock)}**.",
-                buttons=[[Button.inline("❌ Cancel", b"buy_manual", style="danger")]],
+                buttons=[[Button.inline("🔙 Back", b"bulk_back_setup", style="primary")]],
             )
             await safe_callback_answer(event)
             return
@@ -6647,8 +7122,8 @@ async def callback_handler(event):
                 await show_insufficient_balance(
                     event,
                     required=retail_price,
-                    back_data=b"buy_manual",
-                    back_label="🔙 Back to Server 1",
+                    back_data=f"price_{country}_{price}".encode(),
+                    back_label="🔙 Back",
                 )
                 return
 
@@ -6842,7 +7317,7 @@ async def callback_handler(event):
                     price_val = item["_id"] if item["_id"] is not None else DEFAULT_PRICE
                     count = item["count"]
                     btns.append([Button.inline(f"₹{price_val} ({count} available)", f"price_{country}_{price_val}", style="primary")])
-                btns.append([Button.inline("🔙 Back", b"buy", style="primary")])
+                btns.append([Button.inline("🔙 Back", b"buy_manual", style="primary")])
                 await event.edit(
                     f"🌍 Country: {country}\n📦 Total Stock: {total_count}\n💵 Select a price:",
                     buttons=btns
@@ -7161,6 +7636,7 @@ async def callback_handler(event):
             return
 
         if data.startswith("smm_cat_"):
+            user_nav_context.setdefault(user_id, {})["smm_category"] = data
             parts = data.split("_")
             platform, page = parts[2], int(parts[3])
             if not _smm_categorized:
@@ -7173,7 +7649,15 @@ async def callback_handler(event):
         if data.startswith("smm_svc_"):
             parts = data.split("_")
             platform, cidx, page = parts[2], int(parts[3]), int(parts[4])
-            text, btns = await build_smm_service_page(platform, cidx, page, await get_usd_inr())
+            text, btns = await build_smm_service_page(
+                platform,
+                cidx,
+                page,
+                await get_usd_inr(),
+                back_data=user_nav_context.get(user_id, {}).get(
+                    "smm_category", f"smm_cat_{platform}_0"
+                ),
+            )
             if text is None:
                 await safe_callback_answer(event, "Not found.", alert=True)
                 return
@@ -7236,6 +7720,86 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
+        if data == "smm_order_back_service":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "smm_order":
+                await safe_callback_answer(event, "Order session expired.", alert=True)
+                return
+            state.clear()
+            state.update({"action": "smm_order", "step": "service_id"})
+            await event.edit(
+                "🆔 Enter the **Service ID** you want to order:",
+                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data == "smm_order_back_link":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "smm_order" or not state.get("service"):
+                await safe_callback_answer(event, "Order session expired.", alert=True)
+                return
+            state.pop("link", None)
+            state.pop("quantity", None)
+            state.pop("charge", None)
+            state.pop("wholesale_cost", None)
+            state["step"] = "link"
+            service = state["service"]
+            await event.edit(
+                f"📦 **{service['name']}**\n"
+                f"Min: {service['min']} | Max: {service['max']}\n\n"
+                "🔗 Send the **link** for this order:",
+                buttons=[[Button.inline("🔙 Back", b"smm_order_back_service", style="primary")]],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data == "smm_order_back_quantity":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "smm_order" or not state.get("service") or not state.get("link"):
+                await safe_callback_answer(event, "Order session expired.", alert=True)
+                return
+            state.pop("quantity", None)
+            state.pop("charge", None)
+            state.pop("wholesale_cost", None)
+            state["step"] = "quantity"
+            service = state["service"]
+            await event.edit(
+                f"📊 Send the **quantity** you want (Min: {service['min']}, Max: {service['max']}):",
+                buttons=[[Button.inline("🔙 Back", b"smm_order_back_link", style="primary")]],
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data == "smm_order_summary":
+            state = user_states.get(user_id)
+            if not state or state.get("action") != "smm_order" or state.get("step") != "confirm":
+                await safe_callback_answer(event, "Order session expired.", alert=True)
+                return
+            service = state["service"]
+            user_doc = await users_col.find_one({"user_id": user_id}) or {}
+            balance = float(user_doc.get("balance", 0) or 0)
+            charge = state["charge"]
+            summary = (
+                f"🧾 **Order Summary**\n\n"
+                f"📦 Service: {service['name']}\n"
+                f"🔗 Link: {state['link']}\n"
+                f"📊 Quantity: {state['quantity']}\n"
+                f"💰 Charge: ₹{charge}\n"
+                f"👛 Your balance: ₹{balance}\n\n"
+                + ("✅ Confirm to place the order." if balance >= charge
+                   else "❌ Insufficient balance — please deposit first.")
+            )
+            await event.edit(
+                summary,
+                buttons=[
+                    [Button.inline("✅ Confirm Order", b"smm_confirm_order", style="success")],
+                    [Button.inline("🔙 Back", b"smm_order_back_quantity", style="primary")],
+                ],
+            )
+            await safe_callback_answer(event)
+            return
+
         if data == "smm_confirm_order":
             state = user_states.get(user_id)
             if not state or state.get("action") != "smm_order" or state.get("step") != "confirm":
@@ -7259,8 +7823,8 @@ async def callback_handler(event):
                 await show_insufficient_balance(
                     event,
                     required=charge,
-                    back_data=b"smm_services",
-                    back_label="🔙 Back to SMM",
+                    back_data=b"smm_order_summary",
+                    back_label="🔙 Back",
                 )
                 return
 
@@ -7375,7 +7939,7 @@ async def callback_handler(event):
                 f"🔗 Link: {link}\n"
                 f"📊 Quantity: {quantity}\n"
                 f"💰 Charged: ₹{charge}",
-                buttons=[[Button.inline("🔙 Back to Menu", b"main", style="primary")]]
+                buttons=[[Button.inline("🔙 Back to Menu", b"goto_main_new", style="primary")]]
             )
             await safe_callback_answer(event, )
             return
@@ -7389,12 +7953,58 @@ async def callback_handler(event):
             await safe_callback_answer(event)
             return
 
+        # ---------- ADMIN STATS ----------
+        if data == "admin_stats":
+            user_states.pop(user_id, None)
+            await render_admin_stats(event, user_id, "today")
+            return
+
+        if data.startswith("admin_stats|"):
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            parts = data.split("|")
+            range_key = parts[1] if len(parts) > 1 else "today"
+
+            if range_key == "custom" and len(parts) < 3:
+                user_states[user_id] = {
+                    "action": "admin_stats_custom_days",
+                    "step": "await_days",
+                }
+                await event.edit(
+                    "📊 **Custom Stats Range**\n\n"
+                    "Send the number of days you want to view.\n\n"
+                    "Examples:\n"
+                    "• `2` = last 2 days\n"
+                    "• `15` = last 15 days\n"
+                    "• `30` = last 30 days\n\n"
+                    "Allowed: **1 to 3650 days**.",
+                    buttons=[[Button.inline("🔙 Back to Stats", b"admin_stats|today", style="primary")]],
+                    parse_mode="markdown",
+                )
+                await safe_callback_answer(event)
+                return
+
+            custom_days = None
+            if range_key == "custom":
+                try:
+                    custom_days = int(parts[2])
+                except Exception:
+                    custom_days = 1
+                custom_days = max(1, min(custom_days, 3650))
+
+            user_states.pop(user_id, None)
+            await render_admin_stats(event, user_id, range_key, custom_days)
+            return
+
         # ---------- ADMIN PANEL ----------
         if data == "admin":
             if not await is_admin(user_id):
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
                 return
             btns = [
+                [Button.inline("📊 Stats Dashboard", b"admin_stats", style="success")],
                 [Button.inline("📦 Accounts & Stock", b"admin_cat_accounts", style="primary")],
                 [Button.inline("💰 Finance & Transactions", b"admin_cat_finance", style="primary")],
                 [Button.inline("🚀 SMM Panel", b"admin_cat_smm", style="success")],
@@ -10477,6 +11087,31 @@ async def handle_message(event):
         return
     action = state.get("action")
 
+    # ---- ADMIN CUSTOM STATS RANGE ----
+    if action == "admin_stats_custom_days":
+        if not await is_admin(user_id):
+            user_states.pop(user_id, None)
+            await event.respond("❌ Unauthorized.")
+            return
+
+        raw = (event.message.text or "").strip()
+        try:
+            days = int(raw)
+            if days < 1 or days > 3650:
+                raise ValueError
+        except Exception:
+            await event.respond(
+                "❌ Send a whole number from **1 to 3650**.\n"
+                "Example: `15` for the last 15 days.",
+                buttons=[[Button.inline("🔙 Back to Stats", b"admin_stats|today", style="primary")]],
+                parse_mode="markdown",
+            )
+            return
+
+        user_states.pop(user_id, None)
+        await render_admin_stats(event, user_id, "custom", days)
+        return
+
     # ---- BULK ADD ACCOUNTS TO STOCK ----
     if action == "add_stock":
         await process_add_stock_step(event)
@@ -10520,7 +11155,7 @@ async def handle_message(event):
             if balance < total:
                 await event.respond(
                     f"❌ Insufficient balance.\n\nRequired: ₹{total}\nYour balance: ₹{balance}",
-                    buttons=[[Button.inline("🔙 Server 1", b"buy_manual", style="primary")]],
+                    buttons=[[Button.inline("🔙 Back", b"bulk_back_quantity", style="primary")]],
                 )
                 return
 
@@ -10541,7 +11176,7 @@ async def handle_message(event):
                 ),
                 buttons=[
                     [Button.inline("✅ Confirm Bulk Purchase", b"bulk_confirm_server1", style="success")],
-                    [Button.inline("❌ Cancel", b"buy_manual", style="danger")],
+                    [Button.inline("🔙 Back", b"bulk_back_quantity", style="primary")],
                 ],
             )
             return
@@ -11182,6 +11817,7 @@ async def handle_message(event):
                 "matches": matches,
             }
 
+            user_nav_context.setdefault(user_id, {})["server2"] = "server2_search_page_0"
             msg, buttons = await build_server2_search_results_menu(user_id, 0)
             await event.respond(msg, buttons=buttons)
             return
@@ -11244,6 +11880,7 @@ async def handle_message(event):
                 "query": query,
                 "matches": matches,
             }
+            user_nav_context.setdefault(user_id, {})["server3_p1"] = "server3_p1_search_page_0"
             msg, buttons = await build_server3_provider1_search_results(user_id, 0)
             await event.respond(msg, buttons=buttons)
             return
@@ -11269,6 +11906,7 @@ async def handle_message(event):
                 "query": query,
                 "matches": matches,
             }
+            user_nav_context.setdefault(user_id, {})["server3_p2"] = "server3_p2_search_page_0"
             msg, buttons = await build_server3_provider2_search_results(user_id, 0)
             await event.respond(msg, buttons=buttons)
             return
@@ -11739,7 +12377,7 @@ async def handle_message(event):
                 f"📦 **{service['name']}**\n"
                 f"Min: {service['min']} | Max: {service['max']}\n\n"
                 "🔗 Now send the **link** (post/profile/video URL) for this order:",
-                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]]
+                buttons=[[Button.inline("🔙 Back", b"smm_order_back_service", style="primary")]]
             )
             return
 
@@ -11754,7 +12392,7 @@ async def handle_message(event):
             service = state["service"]
             await event.respond(
                 f"📊 Send the **quantity** you want (Min: {service['min']}, Max: {service['max']}):",
-                buttons=[[Button.inline("🔙 Back", b"smm_services", style="primary")]]
+                buttons=[[Button.inline("🔙 Back", b"smm_order_back_link", style="primary")]]
             )
             return
 
@@ -11796,7 +12434,7 @@ async def handle_message(event):
                    else "❌ Insufficient balance — please deposit first.")
             )
             buttons = [[Button.inline("✅ Confirm Order", b"smm_confirm_order", style="success")],
-                       [Button.inline("🔙 Back", b"smm_cancel_order", style="primary")]]
+                       [Button.inline("🔙 Back", b"smm_order_back_quantity", style="primary")]]
             await event.respond(text, buttons=buttons)
             return
 
