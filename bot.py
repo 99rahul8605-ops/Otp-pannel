@@ -12442,6 +12442,256 @@ async def handle_message(event):
         await send_main_menu(event)
 
 
+# ---------- /setclonebalance ----------
+@bot.on(events.NewMessage(pattern=r'^/setclonebalance(?:$|\s)'))
+async def set_clone_balance_cmd(event):
+    """Master-admin-only emergency balance reset for one user inside one clone.
+
+    Usage:
+      /setclonebalance <@clone_username|franchise_id> <user_id> 0
+
+    Only zero is intentionally accepted. This avoids creating arbitrary
+    unbacked clone customer balance from the master command.
+    """
+    set_ctx_from_event(event)
+    admin_id = event.sender_id
+
+    if ctx().get("is_franchise") or not await is_admin(admin_id):
+        await event.respond("❌ Unauthorized.")
+        return
+
+    args = (event.message.text or "").split()
+    if len(args) != 4:
+        await event.respond(
+            "⚠️ **Usage:**\n"
+            "`/setclonebalance <@clone_username|franchise_id> <user_id> 0`\n\n"
+            "Example:\n"
+            "`/setclonebalance @MyCloneBot 123456789 0`",
+            parse_mode="markdown",
+        )
+        return
+
+    clone_key = str(args[1]).strip()
+    if clone_key.startswith("@"):
+        clone_key = clone_key[1:]
+    if not clone_key:
+        await event.respond("❌ Invalid clone username / Franchise ID.")
+        return
+
+    try:
+        target_user_id = int(args[2])
+    except Exception:
+        await event.respond("❌ Invalid user ID.")
+        return
+
+    try:
+        requested_balance = float(args[3])
+    except Exception:
+        await event.respond("❌ Balance must be `0`.", parse_mode="markdown")
+        return
+
+    if abs(requested_balance) > 0.000001:
+        await event.respond(
+            "❌ This safety command only allows setting the clone user's balance to **0**.\n\n"
+            "Use:\n"
+            "`/setclonebalance <clone> <user_id> 0`",
+            parse_mode="markdown",
+        )
+        return
+
+    # Prefer a current/non-removed clone. Telegram usernames are case-insensitive.
+    clone = await bot_clones_col.find_one(
+        {
+            "status": {"$ne": "removed"},
+            "$or": [
+                {"franchise_id": clone_key},
+                {
+                    "bot_username": {
+                        "$regex": f"^{re.escape(clone_key)}$",
+                        "$options": "i",
+                    }
+                },
+            ],
+        },
+        sort=[("_id", -1)],
+    )
+    if not clone:
+        # Historical/removed clone records can still have customer balances that
+        # need resolution, so allow an exact historical match as a fallback.
+        clone = await bot_clones_col.find_one(
+            {
+                "$or": [
+                    {"franchise_id": clone_key},
+                    {
+                        "bot_username": {
+                            "$regex": f"^{re.escape(clone_key)}$",
+                            "$options": "i",
+                        }
+                    },
+                ],
+            },
+            sort=[("_id", -1)],
+        )
+
+    if not clone:
+        await event.respond(
+            f"❌ Clone `{clone_key}` not found.",
+            parse_mode="markdown",
+        )
+        return
+
+    fid = str(clone.get("franchise_id") or "").strip()
+    if not fid:
+        await event.respond("❌ Clone record is missing its Franchise ID.")
+        return
+
+    user_doc = await db["users"].find_one(
+        {"user_id": target_user_id, "franchise_id": fid}
+    )
+    if not user_doc:
+        await event.respond(
+            f"❌ User `{target_user_id}` was not found inside **@{clone.get('bot_username', clone_key)}**.",
+            parse_mode="markdown",
+        )
+        return
+
+    # A rejected pending withdrawal would later refund balance again, undoing
+    # the reset. Require pending withdrawals to be resolved first.
+    pending_withdrawals = await db["withdrawals"].count_documents(
+        {
+            "user_id": target_user_id,
+            "franchise_id": fid,
+            "status": "pending",
+        }
+    )
+    if pending_withdrawals:
+        await event.respond(
+            "⚠️ **Balance was NOT changed.**\n\n"
+            f"This user has **{pending_withdrawals} pending withdrawal(s)** in the clone.\n"
+            "Approve/reject them first, then run the command again.",
+            parse_mode="markdown",
+        )
+        return
+
+    old_balance = round(float(user_doc.get("balance", 0) or 0), 2)
+    old_withdrawable = round(float(user_doc.get("withdrawable_balance", 0) or 0), 2)
+    old_backed = round(float(user_doc.get("owner_backed_balance", 0) or 0), 2)
+
+    # If this user's balance is owner-backed, clearing the customer liability
+    # must also release the matching locked collateral back to the clone owner.
+    released_backing = 0.0
+    if old_backed > 0:
+        fresh_clone = await bot_clones_col.find_one({"_id": clone["_id"]}) or clone
+        clone_locked = round(float(fresh_clone.get("customer_funds_locked", 0) or 0), 2)
+
+        if clone_locked + 0.000001 < old_backed:
+            await event.respond(
+                "❌ **Finance safety check failed — nothing changed.**\n\n"
+                f"User owner-backed balance: **₹{old_backed:.2f}**\n"
+                f"Clone customer funds locked: **₹{clone_locked:.2f}**\n\n"
+                "These values are inconsistent. Please inspect the clone finance audit before resetting this user.",
+                parse_mode="markdown",
+            )
+            return
+
+        lock_result = await bot_clones_col.update_one(
+            {
+                "_id": clone["_id"],
+                "customer_funds_locked": {"$gte": old_backed},
+            },
+            {"$inc": {"customer_funds_locked": -old_backed}},
+        )
+        if lock_result.modified_count != 1:
+            await event.respond(
+                "❌ Could not release the user's locked backing safely. Nothing changed."
+            )
+            return
+        released_backing = old_backed
+
+    # Zero every spendable/withdrawable customer liability together.
+    try:
+        await db["users"].update_one(
+            {"_id": user_doc["_id"], "franchise_id": fid},
+            {
+                "$set": {
+                    "balance": 0.0,
+                    "withdrawable_balance": 0.0,
+                    "owner_backed_balance": 0.0,
+                    "balance_reset_at": now_ist(),
+                    "balance_reset_by": admin_id,
+                }
+            },
+        )
+    except Exception:
+        # Restore clone locked backing if the user update failed.
+        if released_backing > 0:
+            await bot_clones_col.update_one(
+                {"_id": clone["_id"]},
+                {"$inc": {"customer_funds_locked": released_backing}},
+            )
+        raise
+
+    # Released backing becomes the clone owner's free master balance again.
+    owner_id = clone.get("owner_id")
+    if released_backing > 0 and owner_id:
+        await users_col._col.update_one(
+            {"user_id": int(owner_id), "franchise_id": "master"},
+            {"$inc": {"balance": released_backing}},
+            upsert=True,
+        )
+
+    # Targeted adjustment/audit records stay in the clone's own scope.
+    await db["balance_adjustments"].insert_one({
+        "user_id": target_user_id,
+        "franchise_id": fid,
+        "amount": -old_balance,
+        "admin_id": admin_id,
+        "reason": "master_set_clone_balance_zero",
+        "previous_balance": old_balance,
+        "new_balance": 0.0,
+        "previous_withdrawable_balance": old_withdrawable,
+        "released_owner_backing": released_backing,
+        "created_at": now_ist(),
+    })
+
+    await clone_audit(
+        fid,
+        "MASTER_USER_BALANCE_RESET_ZERO",
+        user_id=target_user_id,
+        admin_id=admin_id,
+        previous_balance=old_balance,
+        previous_withdrawable_balance=old_withdrawable,
+        released_owner_backing=released_backing,
+        new_balance=0.0,
+    )
+
+    pending_deposits = await db["deposits"].count_documents({
+        "user_id": target_user_id,
+        "franchise_id": fid,
+        "status": {"$in": ["awaiting_proof", "pending", "pending_auto"]},
+    })
+
+    warning = ""
+    if pending_deposits:
+        warning = (
+            f"\n\n⚠️ Pending deposits: **{pending_deposits}**. "
+            "If one is approved later, the user's balance can increase again."
+        )
+
+    await event.respond(
+        "✅ **Clone User Balance Reset**\n\n"
+        f"🤖 Clone: **@{clone.get('bot_username', 'N/A')}**\n"
+        f"🆔 Franchise: `{fid}`\n"
+        f"👤 User ID: `{target_user_id}`\n"
+        f"💰 Previous Balance: **₹{old_balance:.2f}**\n"
+        f"💸 Previous Withdrawable: **₹{old_withdrawable:.2f}**\n"
+        f"🔒 Owner Backing Released: **₹{released_backing:.2f}**\n"
+        f"✅ New Balance: **₹0.00**"
+        f"{warning}",
+        parse_mode="markdown",
+    )
+
+
 # ---------- /info ----------
 @bot.on(events.NewMessage(pattern=r'^/info(?:$|\s)'))
 async def info_cmd(event):
