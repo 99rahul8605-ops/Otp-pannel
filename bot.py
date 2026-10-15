@@ -412,7 +412,7 @@ async def launch_clone(token: str, franchise_id: str, owner_id: int, display_nam
     client.add_event_handler(broadcast_cmd, events.NewMessage(pattern=r'^/broadcast(?:$|\s)'))
     client.add_event_handler(broadcast_callback, events.CallbackQuery(pattern=b"^broadcast_(confirm|cancel)$"))
     client.add_event_handler(callback_handler, events.CallbackQuery)
-    client.add_event_handler(handle_message, events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
+    client.add_event_handler(handle_message, events.NewMessage(func=lambda e: e.is_private and not (e.message.text or '').startswith('/')))
     client.add_event_handler(start_cmd, events.NewMessage(pattern='/start'))
 
     logging.info(f"🤖 Clone launched live: franchise_id={franchise_id} owner={owner_id}")
@@ -9557,8 +9557,13 @@ async def callback_handler(event):
         if data.startswith("gdepapprove_") or data.startswith("gdepreject_"):
             # Payment-group buttons are intentionally master-admin only. The group
             # may contain other members, but they cannot approve/reject deposits.
+            # Also require the click to originate from the configured payment group
+            # so the approval action cannot be used from any other chat/message copy.
+            if not PAYMENT_GROUP_ID or int(getattr(event, "chat_id", 0) or 0) != int(PAYMENT_GROUP_ID):
+                await safe_callback_answer(event, "❌ Payment approval is allowed only inside the payment approval group.", alert=True)
+                return
             if ctx()['is_franchise'] or not await is_admin(user_id):
-                await safe_callback_answer(event, "❌ Only a Master Admin can process this payment.", alert=True)
+                await safe_callback_answer(event, "❌ You are not authorized to approve or reject payments.", alert=True)
                 return
 
             is_approve = data.startswith("gdepapprove_")
@@ -9718,6 +9723,9 @@ async def callback_handler(event):
             return
 
         if data.startswith("approve_"):
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ You are not authorized to approve payments.", alert=True)
+                return
             dep_id = data.split("_", 1)[1]
             # Atomic: flips status only if it's still pending, so this can't
             # double-credit a deposit the Razorpay webhook just auto-approved
@@ -9740,6 +9748,9 @@ async def callback_handler(event):
             await safe_callback_answer(event, "✅ Approved")
             return
         if data.startswith("reject_"):
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ You are not authorized to reject payments.", alert=True)
+                return
             dep_id = data.split("_", 1)[1]
             result = await deposits_col.update_one(
                 {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "pending_auto"]}},
@@ -11748,89 +11759,95 @@ async def process_deposit_step(event):
                 })
                 logging.error("Could not send manual deposit %s to payment group: %s", dep_id, group_exc)
 
-        admin_client, admins, master_managed = await get_deposit_admin_delivery()
+        # Manual proof delivery has ONE review queue when PAYMENT_GROUP_ID is
+        # configured: the payment approval group. Do not also DM individual
+        # admins, otherwise the same deposit appears in multiple review queues.
+        # If no payment group is configured at all, keep the legacy admin-DM
+        # fallback so older installations still have a reviewer destination.
+        if not PAYMENT_GROUP_ID:
+            admin_client, admins, master_managed = await get_deposit_admin_delivery()
 
-        if not admins:
-            logging.error("No deposit reviewer/admin configured for dep=%s scope=%s", dep_id, ctx()['scope_id'])
+            if not admins:
+                logging.error("No deposit reviewer/admin configured for dep=%s scope=%s", dep_id, ctx()['scope_id'])
 
-        for admin in admins:
-            cb_approve = f"mdepapprove_{dep_id}" if master_managed else f"approve_{dep_id}"
-            cb_reject = f"mdepreject_{dep_id}" if master_managed else f"reject_{dep_id}"
+            for admin in admins:
+                cb_approve = f"mdepapprove_{dep_id}" if master_managed else f"approve_{dep_id}"
+                cb_reject = f"mdepreject_{dep_id}" if master_managed else f"reject_{dep_id}"
 
-            async def _send_proof_to_admin(admin_id=admin):
-                # Fresh buffer on EVERY retry/admin. Reusing one BytesIO can leave
-                # its pointer consumed after a failed Telegram upload.
-                proof_io = io.BytesIO(photo_bytes)
-                ext = file_ext if file_ext in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
-                proof_io.name = f"payment_proof{ext}"
-                return await admin_client.send_file(
-                    admin_id,
-                    proof_io,
-                    caption=(
-                        f"🔔 **New Deposit Request**\n"
-                        f"Clone: `{ctx()['scope_id']}`\n"
-                        f"User: `{user_id}`\n"
-                        f"Amount: ₹{amount}\n"
-                        f"Txn ID: `{txn_id}`\n"
-                        f"Deposit ID: `{dep_id}`"
-                    ),
-                    buttons=[[
-                        Button.inline("✅ Approve", cb_approve, style="success"),
-                        Button.inline("❌ Reject", cb_reject, style="danger"),
-                    ]],
-                )
-
-            try:
-                sent = await telegram_retry(
-                    _send_proof_to_admin,
-                    attempts=3,
-                    base_delay=1.0,
-                    label=f"Send manual deposit proof {dep_id} to admin {admin}",
-                )
-                admin_msg_refs.append({
-                    "admin_id": admin,
-                    "message_id": sent.id,
-                    "admin_scope": "master" if master_managed else ctx()['scope_id'],
-                })
-            except Exception as exc:
-                delivery_failures.append({
-                    "admin_id": int(admin),
-                    "error": f"{type(exc).__name__}: {str(exc)[:180]}",
-                })
-                logging.error("Could not send deposit proof to admin %s: %s", admin, exc)
-
-                # A lightweight fallback means the admin still learns that a
-                # request exists even if Telegram media upload failed.
-                try:
-                    fallback = await telegram_retry(
-                        lambda admin_id=admin: admin_client.send_message(
-                            admin_id,
-                            "⚠️ **Manual Deposit Review Alert**\n\n"
-                            f"The proof image upload failed, but a deposit is waiting for review.\n"
+                async def _send_proof_to_admin(admin_id=admin):
+                    # Fresh buffer on EVERY retry/admin. Reusing one BytesIO can leave
+                    # its pointer consumed after a failed Telegram upload.
+                    proof_io = io.BytesIO(photo_bytes)
+                    ext = file_ext if file_ext in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+                    proof_io.name = f"payment_proof{ext}"
+                    return await admin_client.send_file(
+                        admin_id,
+                        proof_io,
+                        caption=(
+                            f"🔔 **New Deposit Request**\n"
                             f"Clone: `{ctx()['scope_id']}`\n"
                             f"User: `{user_id}`\n"
-                            f"Amount: **₹{amount}**\n"
+                            f"Amount: ₹{amount}\n"
                             f"Txn ID: `{txn_id}`\n"
-                            f"Deposit ID: `{dep_id}`\n\n"
-                            "Open **Admin Panel → Finance → Pending Deposits** and use "
-                            "**📸 Send Proof Here** to fetch the user's original screenshot.",
-                            buttons=[[Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")]],
-                            parse_mode="markdown",
+                            f"Deposit ID: `{dep_id}`"
                         ),
+                        buttons=[[
+                            Button.inline("✅ Approve", cb_approve, style="success"),
+                            Button.inline("❌ Reject", cb_reject, style="danger"),
+                        ]],
+                    )
+
+                try:
+                    sent = await telegram_retry(
+                        _send_proof_to_admin,
                         attempts=3,
                         base_delay=1.0,
-                        label=f"Send deposit fallback alert {dep_id} to admin {admin}",
+                        label=f"Send manual deposit proof {dep_id} to admin {admin}",
                     )
-                    fallback_notice_refs.append({
-                        "admin_id": int(admin),
-                        "message_id": fallback.id,
+                    admin_msg_refs.append({
+                        "admin_id": admin,
+                        "message_id": sent.id,
+                        "admin_scope": "master" if master_managed else ctx()['scope_id'],
                     })
-                except Exception as fallback_exc:
-                    logging.error(
-                        "Could not send fallback deposit alert to admin %s: %s",
-                        admin,
-                        fallback_exc,
-                    )
+                except Exception as exc:
+                    delivery_failures.append({
+                        "admin_id": int(admin),
+                        "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+                    })
+                    logging.error("Could not send deposit proof to admin %s: %s", admin, exc)
+
+                    # Legacy fallback only applies when no payment approval group
+                    # exists. With a configured group we never DM admins.
+                    try:
+                        fallback = await telegram_retry(
+                            lambda admin_id=admin: admin_client.send_message(
+                                admin_id,
+                                "⚠️ **Manual Deposit Review Alert**\n\n"
+                                f"The proof image upload failed, but a deposit is waiting for review.\n"
+                                f"Clone: `{ctx()['scope_id']}`\n"
+                                f"User: `{user_id}`\n"
+                                f"Amount: **₹{amount}**\n"
+                                f"Txn ID: `{txn_id}`\n"
+                                f"Deposit ID: `{dep_id}`\n\n"
+                                "Open **Admin Panel → Finance → Pending Deposits** and use "
+                                "**📸 Send Proof Here** to fetch the user's original screenshot.",
+                                buttons=[[Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")]],
+                                parse_mode="markdown",
+                            ),
+                            attempts=3,
+                            base_delay=1.0,
+                            label=f"Send deposit fallback alert {dep_id} to admin {admin}",
+                        )
+                        fallback_notice_refs.append({
+                            "admin_id": int(admin),
+                            "message_id": fallback.id,
+                        })
+                    except Exception as fallback_exc:
+                        logging.error(
+                            "Could not send fallback deposit alert to admin %s: %s",
+                            admin,
+                            fallback_exc,
+                        )
 
         await deposits_col.update_one(
             {"_id": dep_id},
@@ -11838,7 +11855,7 @@ async def process_deposit_step(event):
                 "admin_msg_refs": admin_msg_refs,
                 "admin_fallback_notice_refs": fallback_notice_refs,
                 "admin_delivery_failures": delivery_failures,
-                "proof_delivered_count": len(admin_msg_refs),
+                "proof_delivered_count": len(admin_msg_refs) + (1 if payment_group_message_id else 0),
                 "payment_group_delivered": bool(payment_group_message_id),
                 "proof_delivery_attempted_at": now_ist(),
             }},
@@ -11879,7 +11896,7 @@ async def process_deposit_step(event):
 #  8. HANDLE ALL TEXT MESSAGES (including new pyrogram flow)
 # ============================================================
 
-@bot.on(events.NewMessage(func=lambda e: e.is_private and not e.message.text.startswith('/')))
+@bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.message.text or '').startswith('/')))
 async def handle_message(event):
     set_ctx_from_event(event)
     user_id = event.sender_id
