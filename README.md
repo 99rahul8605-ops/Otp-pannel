@@ -142,3 +142,8 @@ ANNOUNCEMENT_CHANNEL_ID=-1001234567890
 ```
 
 If it is left blank, stock announcements use `PUBLIC_LOG_CHANNEL_ID`. The posting bot must be able to send messages/buttons in that channel.
+
+
+## Manual payment review group
+
+Set `PAYMENT_GROUP_ID=-1001234567890` to send every submitted manual UPI screenshot to one central Telegram group/channel with Approve/Reject buttons. If it is blank, the bot falls back to `LOGS_CHANNEL_ID`. The master bot must be able to post messages and inline buttons there.

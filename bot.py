@@ -99,6 +99,18 @@ if LOGS_CHANNEL_ID:
 else:
     LOGS_CHANNEL_ID = None
 
+# Dedicated group/channel for MANUAL payment screenshot review. If omitted,
+# reuse LOGS_CHANNEL_ID so existing deployments do not need an immediate env change.
+_PAYMENT_GROUP_RAW = os.getenv("PAYMENT_GROUP_ID", "").strip()
+if _PAYMENT_GROUP_RAW:
+    try:
+        PAYMENT_GROUP_ID = int(_PAYMENT_GROUP_RAW)
+    except ValueError:
+        PAYMENT_GROUP_ID = LOGS_CHANNEL_ID
+        logging.warning("PAYMENT_GROUP_ID is invalid; falling back to LOGS_CHANNEL_ID.")
+else:
+    PAYMENT_GROUP_ID = LOGS_CHANNEL_ID
+
 PUBLIC_LOG_CHANNEL_ID = os.getenv("PUBLIC_LOG_CHANNEL_ID", "").strip()
 if PUBLIC_LOG_CHANNEL_ID:
     try:
@@ -789,10 +801,41 @@ async def is_admin(user_id: int) -> bool:
     return user_id in await get_dynamic_admin_ids()
 
 async def get_all_admin_ids() -> list:
-    """Founding admins for the CURRENT bot (.env ADMIN_IDS for master, just the
-    owner for a clone) + dynamically added ones, deduped — use this for
-    notification loops so newly-added admins get alerts too."""
-    return list(set(ctx()['admin_ids']) | set(await get_dynamic_admin_ids()))
+    """Founding admins for the CURRENT bot plus dynamic admins, in stable order."""
+    result = []
+    for uid in list(ctx()['admin_ids']) + list(await get_dynamic_admin_ids()):
+        try:
+            uid = int(uid)
+        except Exception:
+            continue
+        if uid not in result:
+            result.append(uid)
+    return result
+
+
+async def get_master_admin_ids() -> list:
+    """Resolve master admins even while the current event belongs to a clone."""
+    result = []
+    for uid in ADMIN_IDS:
+        try:
+            uid = int(uid)
+        except Exception:
+            continue
+        if uid not in result:
+            result.append(uid)
+
+    setting = await db['settings'].find_one({
+        "key": "dynamic_admins",
+        "franchise_id": "master",
+    })
+    for uid in (setting or {}).get("value", []):
+        try:
+            uid = int(uid)
+        except Exception:
+            continue
+        if uid not in result:
+            result.append(uid)
+    return result
 
 async def get_min_withdrawal():
     setting = await settings_col.find_one({"key": "min_withdrawal"})
@@ -7563,18 +7606,34 @@ async def callback_handler(event):
             pending_dep = await deposits_col.find_one({"user_id": user_id, "status": {"$in": ["awaiting_proof", "pending", "pending_auto"]}})
             if pending_dep:
                 date_str = pending_dep["created_at"].strftime('%d/%m/%Y %H:%M')
-                await event.edit(
-                    f"⏳ **You already have a pending deposit**\n\n"
-                    f"💰 Amount: ₹{pending_dep['amount']}\n"
-                    f"🔑 Txn ID: `{pending_dep.get('txn_id', 'N/A')}`\n"
-                    f"🕐 Submitted: {date_str}\n\n"
-                    f"Please wait for it to be approved. If you made a "
-                    f"mistake and want to submit a new one instead, cancel this first.",
-                    buttons=[
-                        [Button.inline("❌ Cancel This Deposit", f"cancel_my_deposit_{pending_dep['_id']}".encode(), style="danger")],
-                        [Button.inline("🔙 Back", b"main", style="primary")],
-                    ]
-                )
+                if pending_dep.get("status") == "awaiting_proof":
+                    await event.edit(
+                        f"📲 **Manual Payment Proof Pending**\n\n"
+                        f"💰 Amount: ₹{pending_dep['amount']}\n"
+                        f"🔑 Txn ID: `{pending_dep.get('txn_id', 'N/A')}`\n"
+                        f"🕐 Created: {date_str}\n\n"
+                        "If you have completed the payment, tap **✅ I Have Paid** and then send the screenshot.",
+                        buttons=[
+                            [Button.inline("✅ I Have Paid", f"manual_paid_{pending_dep['_id']}".encode(), style="success")],
+                            [Button.inline("❌ Cancel This Deposit", f"cancel_my_deposit_{pending_dep['_id']}".encode(), style="danger")],
+                            [Button.inline("🔙 Back", b"main", style="primary")],
+                        ],
+                        parse_mode="markdown",
+                    )
+                else:
+                    await event.edit(
+                        f"⏳ **You already have a pending deposit**\n\n"
+                        f"💰 Amount: ₹{pending_dep['amount']}\n"
+                        f"🔑 Txn ID: `{pending_dep.get('txn_id', 'N/A')}`\n"
+                        f"🕐 Submitted: {date_str}\n\n"
+                        f"Your payment proof has been received. Please wait for manual verification. "
+                        f"If you made a mistake and want to submit a new one instead, cancel this first.",
+                        buttons=[
+                            [Button.inline("❌ Cancel This Deposit", f"cancel_my_deposit_{pending_dep['_id']}".encode(), style="danger")],
+                            [Button.inline("🔙 Back", b"main", style="primary")],
+                        ],
+                        parse_mode="markdown",
+                    )
                 await safe_callback_answer(event, )
                 return
             razorpay_ready = bool(await get_effective_razorpay_key_id()) and bool(await get_effective_razorpay_key_secret())
@@ -7633,6 +7692,42 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
 
+        if data.startswith("manual_paid_"):
+            dep_id = data[len("manual_paid_"):]
+            try:
+                oid = ObjectId(dep_id)
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid deposit.", alert=True)
+                return
+
+            dep = await deposits_col.find_one({"_id": oid})
+            if not dep or int(dep.get("user_id", 0)) != int(user_id):
+                await safe_callback_answer(event, "❌ Deposit not found.", alert=True)
+                return
+            if dep.get("status") != "awaiting_proof":
+                await safe_callback_answer(event, "ℹ️ Payment proof is already submitted or this request is closed.", alert=True)
+                return
+
+            user_states[user_id] = {
+                "action": "deposit",
+                "step": "screenshot",
+                "amount": float(dep.get("amount", 0) or 0),
+                "txn_id": dep.get("txn_id", "N/A"),
+                "deposit_id": str(dep["_id"]),
+            }
+            await ctx()['client'].send_message(
+                event.chat_id,
+                "📸 **Send Payment Screenshot**\n\n"
+                f"💰 Amount: **₹{dep.get('amount', 0)}**\n"
+                f"🔑 Txn ID: `{dep.get('txn_id', 'N/A')}`\n\n"
+                "Please send the payment screenshot as a photo/image now. "
+                "As soon as the bot receives it, your manual verification request will be submitted.",
+                buttons=[[Button.inline("❌ Cancel Deposit", f"cancel_my_deposit_{dep['_id']}".encode(), style="danger")]],
+                parse_mode="markdown",
+            )
+            await safe_callback_answer(event, "Send the payment screenshot now.")
+            return
+
         if data.startswith("cancel_my_deposit_"):
             dep_id = data[len("cancel_my_deposit_"):]
             dep = await deposits_col.find_one({"_id": ObjectId(dep_id)})
@@ -7667,6 +7762,13 @@ async def callback_handler(event):
                     )
                 except Exception as e:
                     logging.error(f"Could not disable admin deposit message: {e}")
+
+            if dep.get("method") == "manual_upi":
+                await sync_payment_group_deposit_message(
+                    dep,
+                    f"🚫 **CANCELLED** by user `{user_id}`\n"
+                    f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                )
 
             # Remove the user's Razorpay QR / Payment Link message completely.
             # This callback is attached to that payment message, so deleting the
@@ -9298,23 +9400,246 @@ async def callback_handler(event):
             await safe_callback_answer(event, )
             return
         if data == "admin_deposits":
-            cursor = deposits_col.find({"status": {"$in": ["pending", "pending_auto"]}}).sort("created_at", 1)
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+
+            # Master admins must also be able to recover master-managed clone
+            # deposits if a Telegram notification was missed. Own-payment clone
+            # deposits remain visible only inside that clone's admin panel.
+            if not ctx()['is_franchise']:
+                managed = await bot_clones_col.find({
+                    "status": {"$ne": "removed"},
+                    "payment_mode": {"$ne": "own_payment"},
+                }).to_list(length=None)
+                allowed_scopes = ["master"] + [
+                    str(c.get("franchise_id")) for c in managed if c.get("franchise_id")
+                ]
+                cursor = db['deposits'].find({
+                    "franchise_id": {"$in": allowed_scopes},
+                    "status": {"$in": ["pending", "pending_auto"]},
+                }).sort("created_at", 1)
+            else:
+                cursor = deposits_col.find({
+                    "status": {"$in": ["pending", "pending_auto"]}
+                }).sort("created_at", 1)
+
             pending = await cursor.to_list(length=10)
             if not pending:
                 await safe_callback_answer(event, "No pending deposits.", alert=True)
                 return
+
             btns = []
-            for dep in pending:
+            lines = ["🕒 **Pending Deposits**", ""]
+            for index, dep in enumerate(pending, start=1):
                 txn_id = dep.get('txn_id', 'N/A')
+                dep_scope = str(dep.get('franchise_id') or 'master')
                 tag = "🅰️ " if dep.get("status") == "pending_auto" else ""
+                delivered = int(dep.get("proof_delivered_count", len(dep.get("admin_msg_refs", []))) or 0)
+                lines.append(
+                    f"{index}. `{dep_scope}` • User `{dep.get('user_id')}` • "
+                    f"**₹{dep.get('amount', 0)}** • `{txn_id}` • Proof sent: **{delivered}**"
+                )
+
+                if not ctx()['is_franchise'] and dep_scope != "master":
+                    approve_cb = f"mdepapprove_{dep['_id']}"
+                    reject_cb = f"mdepreject_{dep['_id']}"
+                else:
+                    approve_cb = f"approve_{dep['_id']}"
+                    reject_cb = f"reject_{dep['_id']}"
+
                 btns.append([
-                    Button.inline(f"✅ Approve {tag}₹{dep['amount']} ({txn_id})", f"approve_{dep['_id']}", style="success"),
-                    Button.inline(f"❌ Reject", f"reject_{dep['_id']}", style="danger")
+                    Button.inline(f"✅ Approve {tag}₹{dep['amount']}", approve_cb, style="success"),
+                    Button.inline("❌ Reject", reject_cb, style="danger"),
                 ])
-            btns.append([Button.inline("🔙 Back", b"admin", style="primary")])
-            await event.edit("🕒 **Pending Deposits** (🅰️ = Razorpay auto-QR, still awaiting/overridable)", buttons=btns)
-            await safe_callback_answer(event, )
+                if dep.get("proof_source_message_id"):
+                    btns.append([
+                        Button.inline(
+                            f"📸 Send Proof Here • #{index}",
+                            f"dep_proof_{dep['_id']}",
+                            style="primary",
+                        )
+                    ])
+
+            btns.append([Button.inline("🔙 Back", b"admin_cat_finance", style="primary")])
+            await event.edit("\n".join(lines), buttons=btns, parse_mode="markdown")
+            await safe_callback_answer(event)
             return
+
+        if data.startswith("dep_proof_"):
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+            try:
+                oid = ObjectId(data[len("dep_proof_"):])
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid deposit.", alert=True)
+                return
+
+            if ctx()['is_franchise']:
+                dep = await deposits_col.find_one({"_id": oid})
+            else:
+                dep = await db['deposits'].find_one({"_id": oid})
+                if dep and dep.get("franchise_id") != "master":
+                    clone = await bot_clones_col.find_one({"franchise_id": dep.get("franchise_id")})
+                    if not clone or clone.get("payment_mode", "master_managed") == "own_payment":
+                        dep = None
+
+            if not dep:
+                await safe_callback_answer(event, "❌ Deposit not available in this admin scope.", alert=True)
+                return
+
+            proof_message_id = dep.get("proof_source_message_id")
+            if not proof_message_id:
+                await safe_callback_answer(event, "❌ Original proof message was not recorded.", alert=True)
+                return
+
+            dep_scope = str(dep.get("franchise_id") or "master")
+            source_ctx = find_ctx_by_scope(dep_scope)
+            if dep_scope != "master" and source_ctx.get("scope_id") != dep_scope:
+                await safe_callback_answer(event, "❌ Clone bot is currently offline; proof cannot be fetched now.", alert=True)
+                return
+
+            try:
+                source_msg = await source_ctx['client'].get_messages(
+                    int(dep['user_id']),
+                    ids=int(proof_message_id),
+                )
+                if not source_msg or not source_msg.media:
+                    raise RuntimeError("original media message not found")
+
+                proof_bytes = None
+                last_exc = None
+                for attempt in range(1, 4):
+                    try:
+                        proof_bytes = await source_msg.download_media(file=bytes)
+                        if proof_bytes:
+                            break
+                        raise RuntimeError("empty proof media")
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt < 3:
+                            await asyncio.sleep(float(attempt))
+                if not proof_bytes:
+                    raise last_exc or RuntimeError("could not download proof")
+
+                proof_io = io.BytesIO(proof_bytes)
+                proof_io.name = "payment_proof.jpg"
+                if not ctx()['is_franchise'] and dep_scope != "master":
+                    approve_cb = f"mdepapprove_{oid}"
+                    reject_cb = f"mdepreject_{oid}"
+                else:
+                    approve_cb = f"approve_{oid}"
+                    reject_cb = f"reject_{oid}"
+
+                await ctx()['client'].send_file(
+                    user_id,
+                    proof_io,
+                    caption=(
+                        f"📸 **Deposit Proof Recovery**\n"
+                        f"Clone: `{dep_scope}`\n"
+                        f"User: `{dep.get('user_id')}`\n"
+                        f"Amount: **₹{dep.get('amount', 0)}**\n"
+                        f"Txn ID: `{dep.get('txn_id', 'N/A')}`\n"
+                        f"Deposit ID: `{oid}`"
+                    ),
+                    buttons=[[
+                        Button.inline("✅ Approve", approve_cb, style="success"),
+                        Button.inline("❌ Reject", reject_cb, style="danger"),
+                    ]],
+                    parse_mode="markdown",
+                )
+                await safe_callback_answer(event, "✅ Proof sent to you in a new message.", alert=True)
+            except Exception as exc:
+                logging.error("Could not recover deposit proof %s: %s", oid, exc)
+                await safe_callback_answer(event, "❌ Could not fetch the original proof right now.", alert=True)
+            return
+        if data.startswith("gdepapprove_") or data.startswith("gdepreject_"):
+            # Payment-group buttons are intentionally master-admin only. The group
+            # may contain other members, but they cannot approve/reject deposits.
+            if ctx()['is_franchise'] or not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Only a Master Admin can process this payment.", alert=True)
+                return
+
+            is_approve = data.startswith("gdepapprove_")
+            dep_id = data.split("_", 1)[1]
+            try:
+                oid = ObjectId(dep_id)
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid deposit.", alert=True)
+                return
+
+            deposit = await db['deposits'].find_one({"_id": oid, "method": "manual_upi"})
+            if not deposit:
+                await safe_callback_answer(event, "❌ Manual deposit not found.", alert=True)
+                return
+
+            new_status = "approved" if is_approve else "rejected"
+            result = await db['deposits'].update_one(
+                {"_id": oid, "status": "pending"},
+                {"$set": {
+                    "status": new_status,
+                    "approved_at" if is_approve else "rejected_at": now_ist(),
+                    "approved_via" if is_approve else "rejected_via": "payment_group",
+                    "processed_by": user_id,
+                }},
+            )
+            if result.modified_count == 0:
+                await safe_callback_answer(event, "Already processed.", alert=True)
+                return
+
+            scope_id = str(deposit.get("franchise_id") or "master")
+            target_ctx = await _deposit_scope_context(scope_id)
+            token = current_ctx.set(target_ctx)
+            try:
+                admin_name = None
+                try:
+                    # The clicking admin belongs to the master bot/group.
+                    ent = await bot.get_entity(user_id)
+                    admin_name = ent.first_name or str(user_id)
+                    if ent.username:
+                        admin_name += f" (@{ent.username})"
+                except Exception:
+                    admin_name = str(user_id)
+
+                deposit["status"] = new_status
+                if is_approve:
+                    await finalize_deposit_credit(
+                        deposit,
+                        approver_label=f"Payment Group Admin {admin_name} (`{user_id}`)",
+                        admin_click_event=event,
+                        admin_user_id=user_id,
+                    )
+                    await safe_callback_answer(event, "✅ Payment approved")
+                else:
+                    await release_clone_customer_capacity(deposit, reason="payment_group_rejected")
+                    txn_id = deposit.get("txn_id", "N/A")
+                    try:
+                        await target_ctx['client'].send_message(
+                            deposit['user_id'],
+                            "❌ **Deposit Rejected**\n\n"
+                            f"💰 Amount: **₹{deposit.get('amount', 0)}**\n"
+                            f"🔑 Txn ID: `{txn_id}`\n\n"
+                            "If you believe this is a mistake, please contact support.",
+                            parse_mode="markdown",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        original = await event.get_message()
+                        base = (original.text or original.message or "") if original else ""
+                        await event.edit(
+                            base + f"\n\n❌ **REJECTED** by {admin_name} (`{user_id}`)\n"
+                                   f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                            buttons=None,
+                        )
+                    except Exception:
+                        pass
+                    await safe_callback_answer(event, "❌ Payment rejected")
+            finally:
+                current_ctx.reset(token)
+            return
+
         if data.startswith("mdepapprove_") or data.startswith("mdepreject_"):
             if ctx()['is_franchise'] or not await is_admin(user_id):
                 await safe_callback_answer(event, "❌ Unauthorized", alert=True)
@@ -9363,10 +9688,19 @@ async def callback_handler(event):
                     await safe_callback_answer(event, "✅ Approved")
                 else:
                     await release_clone_customer_capacity(deposit, reason="master_admin_rejected")
+                    await sync_payment_group_deposit_message(
+                        deposit,
+                        f"❌ **REJECTED BY MASTER** (`{user_id}`)\n"
+                        f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                    )
                     try:
                         await target_ctx['client'].send_message(
                             deposit['user_id'],
-                            "❌ **Deposit Rejected.** If you believe this is a mistake, please contact the Master Bot/Admin."
+                            "❌ **Deposit Rejected**\n\n"
+                            f"💰 Amount: **₹{deposit.get('amount', 0)}**\n"
+                            f"🔑 Txn ID: `{deposit.get('txn_id', 'N/A')}`\n\n"
+                            "If you believe this is a mistake, please contact the Master Bot/Admin.",
+                            parse_mode="markdown",
                         )
                     except Exception:
                         pass
@@ -9435,10 +9769,20 @@ async def callback_handler(event):
                 pass
             except Exception as e:
                 logging.error(f"Could not edit reject message: {e}")
+            if deposit and deposit.get("method") == "manual_upi":
+                await sync_payment_group_deposit_message(
+                    deposit,
+                    f"❌ **REJECTED** by {admin_name} (`{user_id}`)\n"
+                    f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                )
             try:
                 await ctx()['client'].send_message(
                     deposit["user_id"],
-                    f"❌ **Deposit Rejected.**\nIf you believe this is a mistake, please contact support."
+                    "❌ **Deposit Rejected**\n\n"
+                    f"💰 Amount: **₹{deposit.get('amount', 0)}**\n"
+                    f"🔑 Txn ID: `{deposit.get('txn_id', 'N/A')}`\n\n"
+                    "If you believe this is a mistake, please contact support.",
+                    parse_mode="markdown",
                 )
             except Exception:
                 pass
@@ -10616,10 +10960,28 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
             except Exception:
                 pass
 
+    # Keep the central payment-group copy in sync if approval happened from
+    # an admin DM / pending-deposits screen rather than from the group itself.
+    same_payment_group_message = bool(
+        admin_click_event is not None
+        and PAYMENT_GROUP_ID
+        and getattr(admin_click_event, "chat_id", None) == PAYMENT_GROUP_ID
+    )
+    if deposit.get("method") == "manual_upi" and not same_payment_group_message:
+        await sync_payment_group_deposit_message(
+            deposit,
+            f"✅ **APPROVED** by {approver_label}\n"
+            f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+        )
+
     try:
         await ctx()['client'].send_message(
             user_id_dep,
-            f"✅ **Deposit Approved!**\n💰 ₹{amount} added to your balance."
+            "✅ **Deposit Approved!**\n\n"
+            f"💰 Amount: **₹{amount}**\n"
+            f"🔑 Txn ID: `{deposit.get('txn_id') or deposit.get('qr_code_id') or 'N/A'}`\n"
+            f"✅ ₹{amount} has been added to your balance.",
+            parse_mode="markdown",
         )
     except Exception:
         pass
@@ -10800,10 +11162,113 @@ async def start_webhook_server():
 
 
 async def get_deposit_admin_delivery():
-    """Return (client, admin_ids, master_managed_clone)."""
+    """Return (client, admin_ids, master_managed_clone).
+
+    Master-managed clone deposits are reviewed by MASTER admins, including
+    dynamically-added master admins. Own-payment clone deposits stay with that
+    clone's own admins.
+    """
     if ctx()['is_franchise'] and await get_clone_payment_mode(ctx()['franchise_id']) != "own_payment":
-        return bot, list(ADMIN_IDS), True
+        return bot, await get_master_admin_ids(), True
     return ctx()['client'], await get_all_admin_ids(), False
+
+
+async def _deposit_scope_context(scope_id: str) -> dict:
+    """Return a usable scoped context even if a clone client is temporarily offline."""
+    if not scope_id or scope_id == "master":
+        return master_ctx()
+    for c in client_contexts.values():
+        if c.get("scope_id") == scope_id:
+            return c
+    clone = await bot_clones_col.find_one({"franchise_id": scope_id}) or {}
+    return {
+        "scope_id": scope_id,
+        "is_franchise": True,
+        "franchise_id": scope_id,
+        "owner_id": clone.get("owner_id"),
+        "display_name": clone.get("display_name") or clone.get("bot_username") or scope_id,
+        "admin_ids": [clone.get("owner_id")] if clone.get("owner_id") else [],
+        "client": clone_clients.get(scope_id) or bot,
+    }
+
+
+async def send_manual_deposit_to_payment_group(
+    *,
+    photo_bytes: bytes,
+    user_id: int,
+    amount: float,
+    txn_id: str,
+    dep_id,
+    file_ext: str = ".jpg",
+):
+    """Post one manual payment request + proof image to the central payment group."""
+    if not PAYMENT_GROUP_ID:
+        return None
+
+    try:
+        user_name = await get_display_name(user_id)
+    except Exception:
+        user_name = str(user_id)
+
+    scope_id = ctx()['scope_id']
+    clone_label = ctx().get('display_name') or scope_id
+
+    async def _send():
+        proof_io = io.BytesIO(photo_bytes)
+        ext = file_ext if file_ext in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+        proof_io.name = f"payment_proof{ext}"
+        return await bot.send_file(
+            PAYMENT_GROUP_ID,
+            proof_io,
+            caption=(
+                "💳 **MANUAL PAYMENT REQUEST**\n\n"
+                f"🤖 Bot/Scope: **{clone_label}** (`{scope_id}`)\n"
+                f"👤 User: {user_name}\n"
+                f"🆔 User ID: `{user_id}`\n"
+                f"💰 Amount: **₹{amount}**\n"
+                f"🔑 Txn ID: `{txn_id}`\n"
+                f"🧾 Deposit ID: `{dep_id}`\n\n"
+                "📸 Payment screenshot received. Please verify manually."
+            ),
+            buttons=[[ 
+                Button.inline("✅ Approve", f"gdepapprove_{dep_id}".encode(), style="success"),
+                Button.inline("❌ Reject", f"gdepreject_{dep_id}".encode(), style="danger"),
+            ]],
+            parse_mode="markdown",
+        )
+
+    return await telegram_retry(
+        _send,
+        attempts=3,
+        base_delay=1.0,
+        label=f"Send manual deposit {dep_id} to payment group",
+    )
+
+
+async def sync_payment_group_deposit_message(deposit: dict, status_text: str):
+    """Mark the central payment-group copy so it never stays stale after processing."""
+    if not PAYMENT_GROUP_ID or not deposit:
+        return
+    msg_id = deposit.get("payment_group_message_id")
+    if not msg_id:
+        return
+    try:
+        msg = await bot.get_messages(PAYMENT_GROUP_ID, ids=int(msg_id))
+        if not msg:
+            return
+        base = (msg.text or msg.message or "")
+        # Avoid adding duplicate terminal markers on retries/races.
+        if "**APPROVED**" in base or "**REJECTED**" in base or "**CANCELLED**" in base:
+            return
+        await bot.edit_message(
+            PAYMENT_GROUP_ID,
+            int(msg_id),
+            base.rstrip() + "\n\n" + status_text,
+            buttons=None,
+            parse_mode="markdown",
+        )
+    except Exception as exc:
+        logging.error("Could not sync payment group message for deposit %s: %s", deposit.get("_id"), exc)
 
 
 async def _reserve_capacity_for_new_deposit(dep_id, amount: float):
@@ -11069,14 +11534,18 @@ async def start_manual_deposit(event, user_id: int, amount: float):
         f"💳 **Manual Deposit ₹{amount}**\n"
         f"🔑 **Txn ID:** `{txn_id}`\n\n"
         f"1️⃣ Scan the QR and complete payment.\n"
-        f"2️⃣ Send the payment screenshot here.\n"
-        f"3️⃣ Payment will be verified before balance credit."
+        f"2️⃣ After paying, tap **✅ I Have Paid** below.\n"
+        f"3️⃣ The bot will then ask you for the payment screenshot.\n"
+        f"4️⃣ Admin will manually verify it before balance credit."
     )
     await ctx()["client"].send_file(
         event.chat_id, buf, caption=caption, force_document=False,
-        buttons=[[Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")]],
+        buttons=[
+            [Button.inline("✅ I Have Paid", f"manual_paid_{dep_id}".encode(), style="success")],
+            [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
+        ],
     )
-    state["step"] = "screenshot"
+    state["step"] = "await_paid_click"
 
 
 async def process_deposit_step(event):
@@ -11147,9 +11616,31 @@ async def process_deposit_step(event):
             ]
         )
         return
+    elif step == "await_paid_click":
+        dep_id = state.get("deposit_id")
+        await event.respond(
+            "ℹ️ After completing the UPI payment, tap **✅ I Have Paid** on the QR message first. "
+            "Then I will ask you for the screenshot.",
+            buttons=[[Button.inline("✅ I Have Paid", f"manual_paid_{dep_id}".encode(), style="success")]] if dep_id else None,
+            parse_mode="markdown",
+        )
+        return
     elif step == "screenshot":
-        if not event.message.photo:
-            await event.respond("❌ Please send a photo (screenshot).", buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]])
+        # Telegram screenshots may arrive either as a normal Photo or as an
+        # image Document when the user chooses "send as file". Accept both.
+        document = getattr(event.message, "document", None)
+        mime_type = str(getattr(document, "mime_type", "") or "").lower()
+        file_ext = str(getattr(getattr(event.message, "file", None), "ext", "") or "").lower()
+        is_image_document = bool(document) and (
+            mime_type.startswith("image/")
+            or file_ext in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+        )
+        if not event.message.photo and not is_image_document:
+            await event.respond(
+                "❌ Please send the payment screenshot as an image/photo.\n"
+                "You may also send JPG/PNG/WebP as a file.",
+                buttons=[[Button.inline("🔙 Cancel", b"goto_main_new", style="danger")]],
+            )
             return
 
         # First handler wins immediately; extra screenshots in the same album /
@@ -11171,54 +11662,215 @@ async def process_deposit_step(event):
             await event.respond("ℹ️ This deposit request was already submitted or cancelled.")
             return
 
+        # Download BEFORE changing DB status to pending. Previously a temporary
+        # Telegram download failure could leave a deposit stuck as pending even
+        # though no admin ever received the proof.
+        photo_bytes = None
+        download_error = None
+        for attempt in range(1, 4):
+            try:
+                photo_bytes = await event.message.download_media(file=bytes)
+                if photo_bytes:
+                    break
+                raise RuntimeError("Telegram returned empty proof media")
+            except Exception as exc:
+                download_error = exc
+                logging.warning(
+                    "Deposit proof download failed dep=%s attempt=%s/3: %s",
+                    dep_id,
+                    attempt,
+                    exc,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(float(attempt))
+
+        if not photo_bytes:
+            state["step"] = "screenshot"
+            await deposits_col.update_one(
+                {"_id": dep_id, "status": "awaiting_proof"},
+                {"$set": {
+                    "last_proof_error": f"download_failed: {type(download_error).__name__}: {str(download_error)[:180]}",
+                    "last_proof_error_at": now_ist(),
+                }},
+            )
+            await event.respond(
+                "❌ Could not read the screenshot due to a temporary Telegram error. "
+                "Please send the same screenshot again."
+            )
+            return
+
+        # Only now atomically claim this proof submission.
         update = await deposits_col.update_one(
             {"_id": dep_id, "status": "awaiting_proof"},
-            {"$set": {"status": "pending", "proof_received_at": now_ist()}}
+            {"$set": {
+                "status": "pending",
+                "proof_received_at": now_ist(),
+                "proof_source_message_id": event.message.id,
+                "proof_source_chat_id": event.chat_id,
+                "proof_mime_type": mime_type or ("image/jpeg" if event.message.photo else "image/unknown"),
+            }},
         )
         if update.modified_count == 0:
             user_states.pop(user_id, None)
             return
 
-        photo_bytes = await event.message.download_media(file=bytes)
-        photo_io = io.BytesIO(photo_bytes)
-        photo_io.name = "payment_proof.jpg"
         admin_msg_refs = []
-        admin_client, admins, master_managed = await get_deposit_admin_delivery()
-        for admin in admins:
+        delivery_failures = []
+        fallback_notice_refs = []
+        payment_group_message_id = None
+
+        # Central payment-group copy: this is the primary manual review queue.
+        if PAYMENT_GROUP_ID:
             try:
-                cb_approve = f"mdepapprove_{dep_id}" if master_managed else f"approve_{dep_id}"
-                cb_reject = f"mdepreject_{dep_id}" if master_managed else f"reject_{dep_id}"
-                sent = await admin_client.send_file(
-                    admin, photo_io,
+                group_msg = await send_manual_deposit_to_payment_group(
+                    photo_bytes=photo_bytes,
+                    user_id=user_id,
+                    amount=amount,
+                    txn_id=txn_id,
+                    dep_id=dep_id,
+                    file_ext=file_ext,
+                )
+                if group_msg:
+                    payment_group_message_id = group_msg.id
+                    await deposits_col.update_one(
+                        {"_id": dep_id},
+                        {"$set": {
+                            "payment_group_chat_id": PAYMENT_GROUP_ID,
+                            "payment_group_message_id": group_msg.id,
+                            "payment_group_sent_at": now_ist(),
+                        }},
+                    )
+            except Exception as group_exc:
+                delivery_failures.append({
+                    "target": "payment_group",
+                    "chat_id": PAYMENT_GROUP_ID,
+                    "error": f"{type(group_exc).__name__}: {str(group_exc)[:180]}",
+                })
+                logging.error("Could not send manual deposit %s to payment group: %s", dep_id, group_exc)
+
+        admin_client, admins, master_managed = await get_deposit_admin_delivery()
+
+        if not admins:
+            logging.error("No deposit reviewer/admin configured for dep=%s scope=%s", dep_id, ctx()['scope_id'])
+
+        for admin in admins:
+            cb_approve = f"mdepapprove_{dep_id}" if master_managed else f"approve_{dep_id}"
+            cb_reject = f"mdepreject_{dep_id}" if master_managed else f"reject_{dep_id}"
+
+            async def _send_proof_to_admin(admin_id=admin):
+                # Fresh buffer on EVERY retry/admin. Reusing one BytesIO can leave
+                # its pointer consumed after a failed Telegram upload.
+                proof_io = io.BytesIO(photo_bytes)
+                ext = file_ext if file_ext in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+                proof_io.name = f"payment_proof{ext}"
+                return await admin_client.send_file(
+                    admin_id,
+                    proof_io,
                     caption=(
                         f"🔔 **New Deposit Request**\n"
                         f"Clone: `{ctx()['scope_id']}`\n"
-                        f"User: `{user_id}`\nAmount: ₹{amount}\nTxn ID: `{txn_id}`"
+                        f"User: `{user_id}`\n"
+                        f"Amount: ₹{amount}\n"
+                        f"Txn ID: `{txn_id}`\n"
+                        f"Deposit ID: `{dep_id}`"
                     ),
                     buttons=[[
                         Button.inline("✅ Approve", cb_approve, style="success"),
                         Button.inline("❌ Reject", cb_reject, style="danger"),
-                    ]]
+                    ]],
+                )
+
+            try:
+                sent = await telegram_retry(
+                    _send_proof_to_admin,
+                    attempts=3,
+                    base_delay=1.0,
+                    label=f"Send manual deposit proof {dep_id} to admin {admin}",
                 )
                 admin_msg_refs.append({
-                    "admin_id": admin, "message_id": sent.id,
+                    "admin_id": admin,
+                    "message_id": sent.id,
                     "admin_scope": "master" if master_managed else ctx()['scope_id'],
                 })
-                photo_io.seek(0)
-            except Exception as e:
-                logging.error("Could not send deposit proof to admin %s: %s", admin, e)
+            except Exception as exc:
+                delivery_failures.append({
+                    "admin_id": int(admin),
+                    "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+                })
+                logging.error("Could not send deposit proof to admin %s: %s", admin, exc)
 
-        await deposits_col.update_one({"_id": dep_id}, {"$set": {"admin_msg_refs": admin_msg_refs}})
-        if not admin_msg_refs:
-            # No reviewer received the proof; revert so the user can retry.
-            await deposits_col.update_one({"_id": dep_id, "status": "pending"}, {"$set": {"status": "awaiting_proof"}})
+                # A lightweight fallback means the admin still learns that a
+                # request exists even if Telegram media upload failed.
+                try:
+                    fallback = await telegram_retry(
+                        lambda admin_id=admin: admin_client.send_message(
+                            admin_id,
+                            "⚠️ **Manual Deposit Review Alert**\n\n"
+                            f"The proof image upload failed, but a deposit is waiting for review.\n"
+                            f"Clone: `{ctx()['scope_id']}`\n"
+                            f"User: `{user_id}`\n"
+                            f"Amount: **₹{amount}**\n"
+                            f"Txn ID: `{txn_id}`\n"
+                            f"Deposit ID: `{dep_id}`\n\n"
+                            "Open **Admin Panel → Finance → Pending Deposits** and use "
+                            "**📸 Send Proof Here** to fetch the user's original screenshot.",
+                            buttons=[[Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")]],
+                            parse_mode="markdown",
+                        ),
+                        attempts=3,
+                        base_delay=1.0,
+                        label=f"Send deposit fallback alert {dep_id} to admin {admin}",
+                    )
+                    fallback_notice_refs.append({
+                        "admin_id": int(admin),
+                        "message_id": fallback.id,
+                    })
+                except Exception as fallback_exc:
+                    logging.error(
+                        "Could not send fallback deposit alert to admin %s: %s",
+                        admin,
+                        fallback_exc,
+                    )
+
+        await deposits_col.update_one(
+            {"_id": dep_id},
+            {"$set": {
+                "admin_msg_refs": admin_msg_refs,
+                "admin_fallback_notice_refs": fallback_notice_refs,
+                "admin_delivery_failures": delivery_failures,
+                "proof_delivered_count": len(admin_msg_refs),
+                "payment_group_delivered": bool(payment_group_message_id),
+                "proof_delivery_attempted_at": now_ist(),
+            }},
+        )
+
+        if not admin_msg_refs and not payment_group_message_id:
+            # No reviewer destination actually received the image. Keep the original
+            # user message reference, but return the deposit to awaiting_proof so the
+            # user can retry instead of leaving a silent pending request.
+            await deposits_col.update_one(
+                {"_id": dep_id, "status": "pending"},
+                {"$set": {
+                    "status": "awaiting_proof",
+                    "proof_delivery_failed_at": now_ist(),
+                }},
+            )
             state["step"] = "screenshot"
-            await event.respond("❌ Could not submit proof right now. Please try the screenshot again.")
+            await event.respond(
+                "❌ Your screenshot reached the bot, but it could not be delivered to a reviewer. "
+                "Please send the screenshot again in a moment."
+            )
             return
 
         await event.respond(
-            f"✅ Deposit request submitted! Amount: ₹{amount}, Txn ID: `{txn_id}`",
-            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]]
+            "✅ **Payment Request Received**\n\n"
+            f"💰 Amount: **₹{amount}**\n"
+            f"🔑 Txn ID: `{txn_id}`\n\n"
+            "📸 Your payment screenshot has been received successfully.\n"
+            "⏳ An admin will manually verify your payment shortly.\n"
+            "You will receive another confirmation message after approval.",
+            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]],
+            parse_mode="markdown",
         )
         user_states.pop(user_id, None)
 
