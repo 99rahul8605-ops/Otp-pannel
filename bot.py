@@ -1306,7 +1306,7 @@ async def notify_otp_sent_to_owner(
         current_ctx.reset(token)
 
 
-async def log_event(text):
+async def log_event(text, dm_master_admins: bool = True):
     c = ctx()
     if c['is_franchise']:
         owner_name = await get_display_name(c['owner_id']) if c['owner_id'] else "Unknown"
@@ -1320,7 +1320,7 @@ async def log_event(text):
 
     # Every clone transaction also gets DM'd straight to the master admins —
     # so the platform owner hears about it even with no logs channel set up.
-    if c['is_franchise']:
+    if c['is_franchise'] and dm_master_admins:
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(admin_id, text, parse_mode="markdown")
@@ -7763,7 +7763,7 @@ async def callback_handler(event):
                 except Exception as e:
                     logging.error(f"Could not disable admin deposit message: {e}")
 
-            if dep.get("method") == "manual_upi":
+            if dep.get("payment_group_message_id"):
                 await sync_payment_group_deposit_message(
                     dep,
                     f"🚫 **CANCELLED** by user `{user_id}`\n"
@@ -7793,7 +7793,8 @@ async def callback_handler(event):
                 f"🚫 **Deposit Cancelled by User**\n"
                 f"👤 User: {cancel_name} (`{user_id}`)\n"
                 f"💰 Amount: ₹{dep['amount']} | Txn ID: `{dep.get('txn_id', 'N/A')}`\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                dm_master_admins=False,
             )
             return
 
@@ -10913,7 +10914,8 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
                                 f"👤 Referrer: {referrer_name} (`{referrer_id}`)\n"
                                 f"👤 Referred User: `{user_id_dep}` (first deposit ₹{amount})\n"
                                 f"💰 Bonus: ₹{bonus}\n"
-                                f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+                                f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                                dm_master_admins=False,
                             )
                         except Exception as e:
                             await users_col.update_one(
@@ -10978,10 +10980,11 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
         and PAYMENT_GROUP_ID
         and getattr(admin_click_event, "chat_id", None) == PAYMENT_GROUP_ID
     )
-    if deposit.get("method") == "manual_upi" and not same_payment_group_message:
+    if deposit.get("payment_group_message_id") and not same_payment_group_message:
+        auto_mark = "AUTO-APPROVED" if str(deposit.get("approved_via", "")).startswith("razorpay") else "APPROVED"
         await sync_payment_group_deposit_message(
             deposit,
-            f"✅ **APPROVED** by {approver_label}\n"
+            f"✅ **{auto_mark}** by {approver_label}\n"
             f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
         )
 
@@ -11004,7 +11007,8 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
         f"💰 Amount: ₹{amount}\n"
         f"🧾 Ref: `{deposit.get('txn_id') or deposit.get('qr_code_id') or 'N/A'}`\n"
         f"👤 Approved by: {approver_label}\n"
-        f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
+        f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+        dm_master_admins=False,
     )
     await public_log_event(
         f"💳 **Deposit Successful**\n"
@@ -11049,6 +11053,8 @@ async def handle_razorpay_qr_credited(scope_id: str, qr_id: str, payment_id: str
     token = current_ctx.set(find_ctx_by_scope(target_scope))
     try:
         dep["status"] = "approved"
+        dep["approved_via"] = "razorpay_auto"
+        dep["payment_id"] = payment_id
         await finalize_deposit_credit(dep, approver_label="Razorpay (auto)")
         await razorpay_close_qr(qr_id, dep.get("payment_credential_scope") or scope_id)
     finally:
@@ -11096,6 +11102,7 @@ async def handle_razorpay_payment_link_paid(
     token = current_ctx.set(find_ctx_by_scope(target_scope))
     try:
         dep["status"] = "approved"
+        dep["approved_via"] = "razorpay_payment_link"
         dep["payment_id"] = payment_id
         await finalize_deposit_credit(dep, approver_label="Razorpay Payment Link (auto)")
     finally:
@@ -11256,6 +11263,47 @@ async def send_manual_deposit_to_payment_group(
     )
 
 
+async def send_auto_deposit_to_payment_group(
+    *, user_id: int, amount: float, txn_id: str, dep_id, method_label: str
+):
+    """Post Razorpay/auto deposits only to the central payment group (no admin DMs)."""
+    if not PAYMENT_GROUP_ID:
+        logging.warning("PAYMENT_GROUP_ID is not configured; auto deposit %s has no admin-side notification target.", dep_id)
+        return None
+
+    try:
+        user_name = await get_display_name(user_id)
+    except Exception:
+        user_name = str(user_id)
+
+    scope_id = ctx()['scope_id']
+    clone_label = ctx().get('display_name') or scope_id
+
+    async def _send():
+        return await bot.send_message(
+            PAYMENT_GROUP_ID,
+            (
+                "⚡ **AUTO PAYMENT STARTED**\n\n"
+                f"🤖 Bot/Scope: **{clone_label}** (`{scope_id}`)\n"
+                f"👤 User: {user_name}\n"
+                f"🆔 User ID: `{user_id}`\n"
+                f"💰 Amount: **₹{amount}**\n"
+                f"💳 Method: **{method_label}**\n"
+                f"🔑 Txn ID: `{txn_id}`\n"
+                f"🧾 Deposit ID: `{dep_id}`\n\n"
+                "⏳ Waiting for Razorpay confirmation. This payment auto-approves after a verified webhook."
+            ),
+            parse_mode="markdown",
+        )
+
+    return await telegram_retry(
+        _send,
+        attempts=3,
+        base_delay=1.0,
+        label=f"Send auto deposit {dep_id} to payment group",
+    )
+
+
 async def sync_payment_group_deposit_message(deposit: dict, status_text: str):
     """Mark the central payment-group copy so it never stays stale after processing."""
     if not PAYMENT_GROUP_ID or not deposit:
@@ -11269,7 +11317,12 @@ async def sync_payment_group_deposit_message(deposit: dict, status_text: str):
             return
         base = (msg.text or msg.message or "")
         # Avoid adding duplicate terminal markers on retries/races.
-        if "**APPROVED**" in base or "**REJECTED**" in base or "**CANCELLED**" in base:
+        if (
+            "**APPROVED**" in base
+            or "**AUTO-APPROVED**" in base
+            or "**REJECTED**" in base
+            or "**CANCELLED**" in base
+        ):
             return
         await bot.edit_message(
             PAYMENT_GROUP_ID,
@@ -11359,21 +11412,22 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
             else:
                 raise RuntimeError("Razorpay QR response had no image_url/short_url")
 
-            admin_client, admins, managed = await get_deposit_admin_delivery()
-            for admin in admins:
-                try:
-                    sent = await admin_client.send_message(
-                        admin,
-                        f"🔔 **New Deposit (Razorpay UPI QR)**\n"
-                        f"Clone: `{scope_id}`\nUser: `{user_id}`\nAmount: ₹{amount}\nQR ID: `{qr_id}`\n\n"
-                        f"This auto-approves on Razorpay confirmation."
-                    )
-                    await deposits_col.update_one({"_id": dep_id}, {"$push": {"admin_msg_refs": {
-                        "admin_id": admin, "message_id": sent.id,
-                        "admin_scope": "master" if managed else scope_id,
-                    }}})
-                except Exception:
-                    pass
+            try:
+                group_msg = await send_auto_deposit_to_payment_group(
+                    user_id=user_id,
+                    amount=amount,
+                    txn_id=qr_id,
+                    dep_id=dep_id,
+                    method_label="Razorpay UPI QR",
+                )
+                if group_msg:
+                    await deposits_col.update_one({"_id": dep_id}, {"$set": {
+                        "payment_group_chat_id": PAYMENT_GROUP_ID,
+                        "payment_group_message_id": group_msg.id,
+                        "payment_group_sent_at": now_ist(),
+                    }})
+            except Exception as exc:
+                logging.error("Could not send auto QR deposit %s to payment group: %s", dep_id, exc)
             return
         except Exception as e:
             logging.error(f"Failed to send Razorpay QR to user, falling back to Payment Link: {e}")
@@ -11410,21 +11464,22 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
         [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
     ])
 
-    admin_client, admins, managed = await get_deposit_admin_delivery()
-    for admin in admins:
-        try:
-            sent = await admin_client.send_message(
-                admin,
-                f"🔔 **New Deposit (Razorpay Payment Link)**\nClone: `{scope_id}`\n"
-                f"User: `{user_id}`\nAmount: ₹{amount}\nPayment Link ID: `{payment_link_id}`\n\n"
-                f"Auto-approves on payment confirmation."
-            )
-            await deposits_col.update_one({"_id": dep_id}, {"$push": {"admin_msg_refs": {
-                "admin_id": admin, "message_id": sent.id,
-                "admin_scope": "master" if managed else scope_id,
-            }}})
-        except Exception:
-            pass
+    try:
+        group_msg = await send_auto_deposit_to_payment_group(
+            user_id=user_id,
+            amount=amount,
+            txn_id=payment_link_id,
+            dep_id=dep_id,
+            method_label="Razorpay Payment Link",
+        )
+        if group_msg:
+            await deposits_col.update_one({"_id": dep_id}, {"$set": {
+                "payment_group_chat_id": PAYMENT_GROUP_ID,
+                "payment_group_message_id": group_msg.id,
+                "payment_group_sent_at": now_ist(),
+            }})
+    except Exception as exc:
+        logging.error("Could not send auto Payment Link deposit %s to payment group: %s", dep_id, exc)
 
 
 async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float):
@@ -11478,25 +11533,22 @@ async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float
     ]
     await event.respond(msg, buttons=buttons)
 
-    for admin in await get_all_admin_ids():
-        try:
-            sent = await ctx()["client"].send_message(
-                admin,
-                f"🔔 **New Deposit (Razorpay Payment Link)**\n"
-                f"User: `{user_id}`\n"
-                f"Amount: ₹{amount}\n"
-                f"Payment Link ID: `{payment_link_id}`\n\n"
-                f"This auto-approves when Razorpay sends `payment_link.paid`."
-            )
-            await deposits_col.update_one(
-                {"_id": dep_id},
-                {"$push": {"admin_msg_refs": {
-                    "admin_id": admin,
-                    "message_id": sent.id,
-                }}}
-            )
-        except Exception:
-            pass
+    try:
+        group_msg = await send_auto_deposit_to_payment_group(
+            user_id=user_id,
+            amount=amount,
+            txn_id=payment_link_id,
+            dep_id=dep_id,
+            method_label="Razorpay Payment Link",
+        )
+        if group_msg:
+            await deposits_col.update_one({"_id": dep_id}, {"$set": {
+                "payment_group_chat_id": PAYMENT_GROUP_ID,
+                "payment_group_message_id": group_msg.id,
+                "payment_group_sent_at": now_ist(),
+            }})
+    except Exception as exc:
+        logging.error("Could not send legacy auto Payment Link deposit %s to payment group: %s", dep_id, exc)
 
 
 
