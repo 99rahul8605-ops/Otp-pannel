@@ -35,7 +35,6 @@ import qrcode
 import hmac
 from aiohttp import web
 from bson import ObjectId
-from pymongo.errors import DuplicateKeyError
 from account_manager import AccountManager
 from server2_server import Server2Server
 from server3_server import Server3Server
@@ -53,8 +52,6 @@ PAYEE_NAME = os.getenv("PAYEE_NAME", "").strip()
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "50").strip())
 REFERRAL_BONUS_PERCENT = float(os.getenv("REFERRAL_BONUS_PERCENT", "10").strip())
 REFERRAL_BONUS_MAX = float(os.getenv("REFERRAL_BONUS_MAX", "5").strip())
-# Default join reward; admins can override it from the bot (per franchise scope).
-REFERRAL_SIGNUP_BONUS = float(os.getenv("REFERRAL_SIGNUP_BONUS", "0.05").strip())
 MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "10").strip())
 CLONE_SECURITY_DEPOSIT_MIN = float(os.getenv("CLONE_SECURITY_DEPOSIT_MIN", "1000").strip())
 BULK_BUY_MAX_QTY = max(2, int(os.getenv("BULK_BUY_MAX_QTY", "20").strip()))
@@ -381,8 +378,6 @@ settings_col = ScopedCollection(db['settings'])
 withdrawals_col = ScopedCollection(db['withdrawals'])
 smm_orders_col = ScopedCollection(db['smm_orders'])
 balance_adjustments_col = ScopedCollection(db['balance_adjustments'])
-# Deterministic _id makes signup awards unique even during simultaneous /start calls.
-referral_signup_claims_col = db['referral_signup_claims']
 bot_clones_col = db['bot_clones']                # master-only, intentionally NOT scoped
 clone_finance_audit_col = db['clone_finance_audit']  # immutable-ish finance/audit trail
 clone_withdrawals_col = db['clone_withdrawals']      # clone margin withdrawal requests
@@ -877,173 +872,6 @@ async def set_smm_markup(value: float, member: bool = False):
         {"key": key},
         {"$set": {"value": value, "updated_at": now_ist()}},
         upsert=True
-    )
-
-async def award_referral_signup_bonus(referred_user_id: int):
-    """Configured join reward after all required joins, at most once.
-
-    All *money* mutations use a deterministic receipt in the same atomic
-    MongoDB update as their balance change. Claims in an intermediate state
-    may be retried after an interrupted worker without paying a second time.
-    """
-    referred = await users_col.find_one({"user_id": referred_user_id})
-    if not referred or not referred.get("referral_signup_eligible"):
-        return
-    referrer_id = referred.get("referred_by")
-    if not referrer_id or referrer_id == referred_user_id or not await is_referral_enabled():
-        return
-    referrer = await users_col.find_one({"user_id": referrer_id})
-    if not referrer:
-        return
-
-    # Fail closed for missing/failed membership checks. Each verification
-    # must complete before any first-time funding/credit is attempted.
-    if not await is_user_member(referred_user_id):
-        return
-    required_chat_count = len(await get_force_join_channels())
-    claim_id = f"{ctx()['scope_id']}:{referred_user_id}"
-    # Snapshot only when creating the claim. A retry after an admin changes
-    # the rate MUST keep the amount reserved by the original claim.
-    configured_amount = await get_referral_signup_bonus()
-    try:
-        await referral_signup_claims_col.insert_one({
-            "_id": claim_id,
-            "scope_id": ctx()['scope_id'],
-            "referred_user_id": referred_user_id,
-            "referrer_id": referrer_id,
-            "amount": configured_amount,
-            "required_chats_verified": required_chat_count,
-            "verified_at": now_ist(),
-            "status": "processing",
-            "schema_version": 2,
-            "created_at": now_ist(),
-        })
-    except DuplicateKeyError:
-        # A previous worker may have died mid-funding. Resume safely; never
-        # treat a duplicate claim as an instruction to pay again.
-        pass
-
-    ledger = await referral_signup_claims_col.find_one({"_id": claim_id})
-    if not ledger or ledger.get('status') == 'paid':
-        return
-    if ledger.get('schema_version') != 2:
-        # Pre-hardening claims lack atomic funding/credit receipts. A legacy
-        # in-flight claim may already have moved money. Never replay blindly.
-        logging.error('Legacy unfinished referral claim %s requires manual balance review', claim_id)
-        return
-    # Never switch the original receiver if different /start payloads race.
-    if ledger.get('referrer_id') != referrer_id:
-        logging.error('Referral ledger referrer mismatch for %s', claim_id)
-        return
-    # Use the immutable claim amount for funding, wallet credit, messages and
-    # logs, including retried operations and races with admin setting edits.
-    reward_amount = round(float(ledger['amount']), 2)
-    if not 0 <= reward_amount <= 1000:
-        logging.error('Referral claim %s has invalid reward amount %r', claim_id, reward_amount)
-        return
-
-    try:
-        # Each clone funding debit is also receipt-guarded. This may return
-        # False when a clone has insufficient backing; the next verified
-        # /start / Check Again can retry after their owner funds the wallet.
-        funded = await fund_clone_referral_bonus(
-            reward_amount, referrer_id,
-            reward_key=f"signup:{claim_id}",
-        )
-        if not funded:
-            await users_col.update_one(
-                {"user_id": referred_user_id,
-                 "referral_signup_bonus_status": {"$ne": "paid"}},
-                {"$set": {"referral_signup_bonus_status": "not_paid_clone_insufficient_funds"}},
-            )
-            await referral_signup_claims_col.update_one(
-                {"_id": claim_id, "status": {"$ne": "paid"}},
-                {"$set": {"status": "not_paid_clone_insufficient_funds"}},
-            )
-            return
-
-        # Single-document compare-and-credit: receipt and wallet increment
-        # either both happen once or neither happens, across all processes.
-        credit = await users_col.update_one(
-            {"user_id": referrer_id,
-             "referral_signup_credit_receipts": {"$ne": claim_id}},
-            {"$inc": {
-                "balance": reward_amount,
-                "withdrawable_balance": reward_amount,
-                "referral_earnings": reward_amount,
-             }, "$addToSet": {"referral_signup_credit_receipts": claim_id}},
-        )
-        if credit.modified_count != 1:
-            current_referrer = await users_col.find_one({"user_id": referrer_id})
-            if not current_referrer or claim_id not in current_referrer.get('referral_signup_credit_receipts', []):
-                raise RuntimeError(f"Signup referrer {referrer_id} disappeared before credit")
-
-        await users_col.update_one(
-            {"user_id": referred_user_id},
-            {"$set": {
-                "referral_signup_bonus_claimed": True,
-                "referral_signup_bonus_status": "paid",
-                "referral_signup_bonus_amount": reward_amount,
-                "referral_signup_bonus_referrer_id": referrer_id,
-                "referral_signup_bonus_paid_at": now_ist(),
-            }},
-        )
-        # Only the first successful transition to PAID sends notifications.
-        # A simultaneous worker may also finish funding, but not credit/log.
-        completed = await referral_signup_claims_col.update_one(
-            {"_id": claim_id, "status": {"$ne": "paid"}},
-            {"$set": {"status": "paid", "paid_at": now_ist()}},
-        )
-        if not completed.modified_count:
-            return
-    except Exception as exc:
-        logging.exception("Signup referral credit failed for referred %s / referrer %s", referred_user_id, referrer_id)
-        # Never replace a successful 'paid' status with an error from a
-        # slower concurrent worker or one that got an ambiguous DB response.
-        await referral_signup_claims_col.update_one(
-            {"_id": claim_id, "status": {"$ne": "paid"}},
-            {"$set": {"status": "credit_error_review_required", "error": str(exc)[:300]}},
-        )
-        return
-
-    try:
-        await ctx()['client'].send_message(
-            referrer_id,
-            f"🎉 **Referral Joined!**\n\n💰 You earned ₹{reward_amount:.2f} "
-            "for a new referral. You'll also earn your first-deposit bonus "
-            "when they make their first approved deposit."
-        )
-    except Exception:
-        pass
-    try:
-        # Existing private logs channel, NOT the public logs channel.
-        await log_event(
-            f"🎁 **Referral Join Bonus Credited**\n"
-            f"👤 Referrer: `{referrer_id}`"
-            f" (@{referrer.get('username') or 'N/A'})\n"
-            f"👤 Referred User: `{referred_user_id}`"
-            f" (@{referred.get('username') or 'N/A'})\n"
-            f"✅ Required Channels/Groups: {required_chat_count} verified\n"
-            f"💰 Fixed Bonus: ₹{reward_amount:.2f}\n"
-            f"📌 Status: Credited to referrer's wallet\n"
-            f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
-            dm_master_admins=False,
-        )
-    except Exception:
-        logging.exception("Could not log signup referral reward for %s", referred_user_id)
-
-
-async def get_referral_signup_bonus() -> float:
-    """Current per-bot join reward; stored in MongoDB, no restart required."""
-    setting = await settings_col.find_one({"key": "referral_signup_bonus"})
-    return round(float(setting['value'] if setting is not None else REFERRAL_SIGNUP_BONUS), 2)
-
-async def set_referral_signup_bonus(value: float):
-    """Persist a new join amount for NEW claims only."""
-    await settings_col.update_one(
-        {"key": "referral_signup_bonus"},
-        {"$set": {"value": round(value, 2), "updated_at": now_ist()}},
-        upsert=True,
     )
 
 async def get_referral_bonus_percent() -> float:
@@ -2892,16 +2720,11 @@ async def activate_clone_customer_collateral(deposit: dict) -> bool:
     return True
 
 
-async def fund_clone_referral_bonus(amount: float, beneficiary_user_id: int | None = None,
-                                    reward_key: str | None = None) -> bool:
-    """Fund clone rewards, using an atomic receipt for retry-safe referral awards.
+async def fund_clone_referral_bonus(amount: float, beneficiary_user_id: int | None = None) -> bool:
+    """Make franchise referral rewards come from the clone owner, never master funds.
 
-    A single $inc + $addToSet on the funding wallet makes each *reward_key*
-    charge at most once, even if two bot workers race or the DB reply is lost.
-    For own-payment clones, the backing steps also have independent receipts:
-    a retry can finish them without debiting the clone owner twice.
-
-    Legacy callers without reward_key retain the original funding behavior.
+    In Own-Payment mode the funded bonus is also added to locked customer
+    backing, so it cannot later be spent without matching collateral.
     """
     amount = round(float(amount or 0), 2)
     if amount <= 0 or not ctx()['is_franchise']:
@@ -2911,51 +2734,6 @@ async def fund_clone_referral_bonus(amount: float, beneficiary_user_id: int | No
     if not clone:
         return False
     mode = clone.get("payment_mode", "master_managed")
-    if reward_key:
-        if mode == "own_payment":
-            owner_filter = {"user_id": int(clone['owner_id']), "franchise_id": "master"}
-            result = await users_col._col.update_one(
-                {**owner_filter, "balance": {"$gte": amount},
-                 "referral_funding_receipts": {"$ne": reward_key}},
-                {"$inc": {"balance": -amount},
-                 "$addToSet": {"referral_funding_receipts": reward_key}},
-            )
-            if not result.modified_count:
-                owner = await users_col._col.find_one(owner_filter)
-                if not owner or reward_key not in owner.get('referral_funding_receipts', []):
-                    return False
-            # Backing increments are each atomic and idempotent, too.
-            await bot_clones_col.update_one(
-                {"_id": clone['_id'], "referral_lock_receipts": {"$ne": reward_key}},
-                {"$inc": {"customer_funds_locked": amount},
-                 "$addToSet": {"referral_lock_receipts": reward_key}},
-            )
-            if beneficiary_user_id is not None:
-                backing = await users_col._col.update_one(
-                    {"user_id": int(beneficiary_user_id), "franchise_id": fid,
-                     "referral_backing_receipts": {"$ne": reward_key}},
-                    {"$inc": {"owner_backed_balance": amount},
-                     "$addToSet": {"referral_backing_receipts": reward_key}},
-                )
-                if not backing.modified_count:
-                    beneficiary = await users_col._col.find_one(
-                        {"user_id": int(beneficiary_user_id), "franchise_id": fid})
-                    if not beneficiary or reward_key not in beneficiary.get('referral_backing_receipts', []):
-                        raise RuntimeError('Clone referral beneficiary missing while funding')
-        else:
-            result = await bot_clones_col.update_one(
-                {"_id": clone['_id'], "earnings_wallet": {"$gte": amount},
-                 "referral_funding_receipts": {"$ne": reward_key}},
-                {"$inc": {"earnings_wallet": -amount},
-                 "$addToSet": {"referral_funding_receipts": reward_key}},
-            )
-            if not result.modified_count:
-                latest = await bot_clones_col.find_one({"_id": clone['_id']})
-                if not latest or reward_key not in latest.get('referral_funding_receipts', []):
-                    return False
-        return True
-
-    # Backward compatible path for unrelated, non-idempotent callers.
     if mode == "own_payment":
         result = await users_col._col.update_one(
             {"user_id": int(clone['owner_id']), "franchise_id": "master", "balance": {"$gte": amount}},
@@ -6294,12 +6072,6 @@ async def callback_handler(event):
         # ---------- CHECK JOIN ----------
         if data == "check_join":
             if await is_user_member(user_id):
-                # A referred user can finish joining from this button without
-                # ever sending /start again. Pay only after verification.
-                try:
-                    await award_referral_signup_bonus(user_id)
-                except Exception:
-                    logging.exception("Could not process verified join referral for %s", user_id)
                 await show_welcome_menu(event, user_id)
             else:
                 await safe_callback_answer(event, "You haven't joined all channels yet!", alert=True)
@@ -6733,26 +6505,22 @@ async def callback_handler(event):
             ref_link = f"https://t.me/{username}?start=ref{user_id}" if username else "N/A"
             invited_count = await users_col.count_documents({"referred_by": user_id})
             paid_count = await users_col.count_documents({"referred_by": user_id, "referral_bonus_paid": True})
-            signup_paid_count = await users_col.count_documents({"referred_by": user_id, "referral_signup_bonus_status": "paid"})
             user_doc = await users_col.find_one({"user_id": user_id})
             withdrawable = user_doc.get('withdrawable_balance', 0) if user_doc else 0
             total_earned = round(user_doc.get('referral_earnings', 0), 2) if user_doc else 0
             cur_percent = await get_referral_bonus_percent()
             cur_max = await get_referral_bonus_max()
-            join_bonus = await get_referral_signup_bonus()
             min_wd = await get_min_withdrawal()
 
             text = (
                 "👥 **Referral Program**\n\n"
                 "🔗 **Your Referral Link:**\n"
                 f"`{ref_link}`\n\n"
-                f"💰 **Referral Join Bonus:** ₹{join_bonus:.2f} after joining all required channels/groups\n"
-                f"💳 **First Deposit Bonus:** {cur_percent}% of their **first approved deposit**, "
-                f"up to ₹{cur_max} max (extra)\n\n"
+                f"💰 **Bonus:** {cur_percent}% of your referral's **first deposit**, "
+                f"up to ₹{cur_max} max\n\n"
                 "📊 **Your Stats:**\n"
                 f"• Total Invited: **{invited_count}** users\n"
-                f"• Join Bonuses Paid: **{signup_paid_count}** users\n"
-                f"• First Deposit Bonuses: **{paid_count}** users\n"
+                f"• Bonus Paid: **{paid_count}** users\n"
                 f"• Total Earned: **₹{total_earned}**\n\n"
                 f"💸 **Withdrawable Balance:** ₹{withdrawable}\n"
                 f"📏 **Minimum Withdrawal:** ₹{min_wd}\n\n"
@@ -9261,11 +9029,9 @@ async def callback_handler(event):
                 return
             cur_percent = await get_referral_bonus_percent()
             cur_max = await get_referral_bonus_max()
-            join_bonus = await get_referral_signup_bonus()
             enabled = await is_referral_enabled()
             btns = [
                 [Button.inline("🔴 Turn OFF" if enabled else "🟢 Turn ON", b"admin_toggle_referral", style="danger" if enabled else "success")],
-                [Button.inline("✏️ Edit Join Bonus (₹)", b"admin_set_ref_signup", style="primary")],
                 [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
                 [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
                 [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
@@ -9274,10 +9040,9 @@ async def callback_handler(event):
                 f"🎁 **Referral Bonus Settings**\n\n"
                 f"Status: {'🟢 ON' if enabled else '🔴 OFF'} "
                 + ("(default OFF for clones — turn on if you want it)\n\n" if ctx()['is_franchise'] else "\n\n") +
-                f"Join Bonus: **₹{join_bonus:.2f}** per eligible new referral\n"
-                f"First Deposit: **{cur_percent}%**, capped at **₹{cur_max}**\n\n"
-                f"Example: One signup + ₹100 first deposit pays "
-                f"₹{join_bonus + round(min(100 * (cur_percent/100), cur_max), 2):.2f} in total.",
+                f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
+                f"Example: A ₹100 deposit currently pays a "
+                f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
                 buttons=btns
             )
             await safe_callback_answer(event, )
@@ -9293,10 +9058,8 @@ async def callback_handler(event):
             # Re-render the settings screen with the updated state
             cur_percent = await get_referral_bonus_percent()
             cur_max = await get_referral_bonus_max()
-            join_bonus = await get_referral_signup_bonus()
             btns = [
                 [Button.inline("🔴 Turn OFF" if new_state else "🟢 Turn ON", b"admin_toggle_referral", style="danger" if new_state else "success")],
-                [Button.inline("✏️ Edit Join Bonus (₹)", b"admin_set_ref_signup", style="primary")],
                 [Button.inline("✏️ Edit Bonus %", b"admin_set_ref_percent", style="primary")],
                 [Button.inline("✏️ Edit Max Cap (₹)", b"admin_set_ref_max", style="primary")],
                 [Button.inline("🔙 Back to Finance Menu", b"admin_cat_finance", style="primary")],
@@ -9304,25 +9067,11 @@ async def callback_handler(event):
             await event.edit(
                 f"🎁 **Referral Bonus Settings**\n\n"
                 f"Status: {'🟢 ON' if new_state else '🔴 OFF'}\n\n"
-                f"Join Bonus: **₹{join_bonus:.2f}** per eligible new referral\n"
-                f"First Deposit: **{cur_percent}%**, capped at **₹{cur_max}**\n\n"
-                f"Example: One signup + ₹100 first deposit pays "
-                f"₹{join_bonus + round(min(100 * (cur_percent/100), cur_max), 2):.2f} in total.",
+                f"Current: **{cur_percent}%** of first deposit, capped at **₹{cur_max}**\n\n"
+                f"Example: A ₹100 deposit currently pays a "
+                f"₹{round(min(100 * (cur_percent/100), cur_max), 2)} referral bonus.",
                 buttons=btns
             )
-            return
-
-        if data == "admin_set_ref_signup":
-            if not await is_admin(user_id):
-                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
-                return
-            user_states[user_id] = {"action": "set_ref_signup", "step": "await_value"}
-            await event.edit(
-                "💰 Send the new join bonus amount in rupees (e.g. `0.05`, `0.50`, `1`). "
-                "It will apply only to new referral claims. Enter `0` to set zero join bonus.",
-                buttons=[[Button.inline("🔙 Cancel", b"admin_referral_settings", style="primary")]]
-            )
-            await safe_callback_answer(event)
             return
 
         if data == "admin_set_ref_percent":
@@ -11110,7 +10859,7 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
                 bonus = round(min(amount * (ref_percent / 100), ref_max), 2)
 
                 if bonus > 0:
-                    funded = await fund_clone_referral_bonus(bonus, referrer_id, reward_key=f"firstdeposit:{ctx()['scope_id']}:{user_id_dep}")
+                    funded = await fund_clone_referral_bonus(bonus, referrer_id)
                     if not funded:
                         await users_col.update_one(
                             {"user_id": user_id_dep},
@@ -11125,22 +10874,17 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
                         )
                     else:
                         try:
-                            # First-deposit credit is atomic/idempotent even
-                            # if this method gets retried after an interruption.
-                            receipt = f"firstdeposit:{ctx()['scope_id']}:{user_id_dep}"
-                            ref_credit = await users_col.update_one(
-                                {"user_id": referrer_id,
-                                 "referral_deposit_credit_receipts": {"$ne": receipt}},
-                                {"$inc": {
-                                    "balance": bonus,
-                                    "withdrawable_balance": bonus,
-                                    "referral_earnings": bonus,
-                                 }, "$addToSet": {"referral_deposit_credit_receipts": receipt}},
+                            await users_col.update_one(
+                                {"user_id": referrer_id},
+                                {
+                                    "$inc": {
+                                        "balance": bonus,
+                                        "withdrawable_balance": bonus,
+                                        "referral_earnings": bonus,
+                                    }
+                                },
+                                upsert=True
                             )
-                            if not ref_credit.modified_count:
-                                ref_doc = await users_col.find_one({"user_id": referrer_id})
-                                if not ref_doc or receipt not in ref_doc.get('referral_deposit_credit_receipts', []):
-                                    raise RuntimeError('First-deposit referrer missing before credit')
 
                             await users_col.update_one(
                                 {"user_id": user_id_dep},
@@ -11164,22 +10908,15 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
                             except Exception:
                                 pass
 
-                            # A Telegram logging failure must not turn an
-                            # already-credited reward into a payout error.
-                            try:
-                                referrer_name = await get_display_name(referrer_id)
-                                await log_event(
-                                    f"🎁 **Referral First Deposit Bonus Credited**\n"
-                                    f"👤 Referrer: {referrer_name} (`{referrer_id}`)\n"
-                                    f"👤 Referred User: `{user_id_dep}`\n"
-                                    f"💳 First Approved Deposit: ₹{amount}\n"
-                                    f"📈 Rate: {ref_percent}% (cap ₹{ref_max})\n"
-                                    f"💰 Bonus Credited: ₹{bonus:.2f}\n"
-                                    f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
-                                    dm_master_admins=False,
-                                )
-                            except Exception:
-                                logging.exception("Could not log first-deposit referral bonus for %s", user_id_dep)
+                            referrer_name = await get_display_name(referrer_id)
+                            await log_event(
+                                f"🎁 **Referral Bonus Paid**\n"
+                                f"👤 Referrer: {referrer_name} (`{referrer_id}`)\n"
+                                f"👤 Referred User: `{user_id_dep}` (first deposit ₹{amount})\n"
+                                f"💰 Bonus: ₹{bonus}\n"
+                                f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                                dm_master_admins=False,
+                            )
                         except Exception as e:
                             await users_col.update_one(
                                 {"user_id": user_id_dep},
@@ -12877,39 +12614,6 @@ async def handle_message(event):
                                  buttons=[[Button.inline("🔙 Admin Menu", b"admin", style="primary")]])
             user_states.pop(user_id, None)
 
-    elif action == "set_ref_signup":
-        if not await is_admin(user_id):
-            user_states.pop(user_id, None)
-            await event.respond("❌ Unauthorized.")
-            return
-        if state.get("step") == "await_value":
-            raw = (event.message.text or "").strip()
-            try:
-                from decimal import Decimal, InvalidOperation
-                amount = Decimal(raw)
-                if not amount.is_finite() or amount < 0 or amount > 1000 or amount != amount.quantize(Decimal("0.01")):
-                    raise ValueError
-                val = float(amount)
-            except (InvalidOperation, ValueError):
-                await event.respond(
-                    "❌ Send an amount between ₹0 and ₹1000 with at most two decimal places (e.g. `0.05`, `1`).",
-                    buttons=[[Button.inline("🔙 Cancel", b"admin_referral_settings", style="danger")]]
-                )
-                return
-            await set_referral_signup_bonus(val)
-            user_states.pop(user_id, None)
-            await event.respond(
-                f"✅ Join bonus set to ₹{val:.2f} for NEW referrals. Older/pending claims keep their original amount.",
-                buttons=[[Button.inline("🔙 Referral Settings", b"admin_referral_settings", style="primary")]]
-            )
-            await log_event(
-                f"⚙️ **Referral Join Bonus Changed**\n"
-                f"👤 Admin: `{user_id}`\n"
-                f"💰 New bonus: ₹{val:.2f}\n"
-                f"🕐 Time: {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
-                dm_master_admins=False,
-            )
-
     elif action == "set_ref_percent":
         step = state.get("step")
         if step == "await_value":
@@ -13983,31 +13687,20 @@ async def start_cmd(event):
     }
     user_data = await users_col.find_one({"user_id": user_id})
     if not user_data:
-        # A self-referral or a non-existent inviter is not a genuine referral.
-        if referrer_id and (referrer_id == user_id or not await users_col.find_one({"user_id": referrer_id})):
-            referrer_id = None
-        signup_eligible = bool(referrer_id and await is_referral_enabled())
-        try:
-            await users_col.insert_one({
-                "user_id": user_id,
-                "balance": 0,
-                "joined_at": now_ist(),
-                "referred_by": referrer_id,
-                "referral_bonus_paid": False,
-                "referral_signup_eligible": signup_eligible,
-                "referral_signup_bonus_claimed": False,
-                "withdrawable_balance": 0,
-                "owner_backed_balance": 0,
-                **profile_fields,
-            })
-        except DuplicateKeyError:
-            # Another concurrent /start just created this user. Never change
-            # their original referrer and never create a duplicate user.
-            await users_col.update_one({"user_id": user_id}, {"$set": profile_fields})
+        await users_col.insert_one({
+            "user_id": user_id,
+            "balance": 0,
+            "joined_at": now_ist(),
+            "referred_by": referrer_id,
+            "referral_bonus_paid": False,
+            "withdrawable_balance": 0,
+            "owner_backed_balance": 0,
+            **profile_fields,
+        })
     else:
         await users_col.update_one({"user_id": user_id}, {"$set": profile_fields})
-        # Existing users cannot retroactively attach a referral code.
-        # Otherwise a new /start payload could earn a first-deposit bonus.
+        if user_data.get("referred_by") is None and referrer_id and referrer_id != user_id:
+            await users_col.update_one({"user_id": user_id}, {"$set": {"referred_by": referrer_id}})
         if "referral_bonus_paid" not in user_data:
             await users_col.update_one({"user_id": user_id}, {"$set": {"referral_bonus_paid": False}})
         if "withdrawable_balance" not in user_data:
@@ -14016,14 +13709,6 @@ async def start_cmd(event):
     if not await is_user_member(user_id):
         await send_join_message(event)
         return
-
-    # Grant the signup reward only after membership; the once-only DB claim
-    # protects against users reopening their referral /start link.
-    try:
-        await award_referral_signup_bonus(user_id)
-    except Exception:
-        # An issue paying a bonus must never block the customer's /start flow.
-        logging.exception("Could not process signup referral for user %s", user_id)
 
     if start_payload.startswith("stk_"):
         if await open_server1_stock_deeplink(event, user_id, start_payload):
@@ -14062,20 +13747,6 @@ async def main():
         sys.exit(1)
 
     client_contexts[bot] = master_ctx()
-
-    # Critical for referral idempotency: the same Telegram user must never
-    # exist as two wallet documents in one bot/franchise scope. Index creation
-    # fails closed if old duplicate records exist, rather than taking payments
-    # while a known wallet-integrity problem remains.
-    try:
-        await db['users'].create_index(
-            [('franchise_id', 1), ('user_id', 1)],
-            unique=True, name='unique_franchise_user_wallet',
-        )
-    except Exception as exc:
-        logging.critical('Cannot enforce unique wallet IDs; fix duplicate users before starting: %s', exc)
-        await bot.disconnect()
-        return
 
     # Razorpay auto-approval webhook (harmless to start even if no Razorpay
     # keys are configured yet — it just won't have a matching secret to
