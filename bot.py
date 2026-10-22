@@ -12,6 +12,7 @@ import secrets
 import time
 import aiohttp
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -36,6 +37,7 @@ import hmac
 from aiohttp import web
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
+from razorpay_api_verification import (expected_paise, captured_payment, qr_payment_ids, link_payment_ids)
 from account_manager import AccountManager
 from server2_server import Server2Server
 from server3_server import Server3Server
@@ -74,11 +76,10 @@ SESSION_READER_BOT_USERNAME = os.getenv("SESSION_READER_BOT_USERNAME", "").strip
 
 # ---------- RAZORPAY (auto-approved UPI QR deposits) ----------
 # Optional. If a Razorpay Key ID + Key Secret are configured (via .env for the
-# master, or via Admin Panel → Finance & Transactions for any bot/franchise),
-# deposits switch from "static QR + manual screenshot" to a per-transaction
-# dynamic UPI QR generated through Razorpay's QR Code API. Razorpay notifies
-# us the instant it's paid (webhook), so the deposit is credited automatically
-# with no admin action needed. Falls back to the old manual flow if unset.
+# master, or via Admin Panel), bot issues an individual QR/Payment Link.
+# Deposits are verified through authenticated Razorpay API GET requests.
+# No publicly reachable domain or webhook is required. A signed webhook is
+# still optional for existing deployments, and uses the SAME API verification.
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
@@ -86,6 +87,9 @@ RAZORPAY_API_BASE = "https://api.razorpay.com/v1"
 RAZORPAY_QR_EXPIRY_SECONDS = int(os.getenv("RAZORPAY_QR_EXPIRY_SECONDS", "900").strip())
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080").strip())
+# OFF by default: no inbound webhook endpoint is needed to receive money.
+RAZORPAY_ENABLE_WEBHOOK = os.getenv("RAZORPAY_ENABLE_WEBHOOK", "false").strip().lower() in ("1", "true", "yes")
+RAZORPAY_API_POLL_SECONDS = max(30, int(os.getenv("RAZORPAY_API_POLL_SECONDS", "60")))
 
 SMM_API_URL = os.getenv("SMM_API_URL", "").strip()
 SMM_API_KEY = os.getenv("SMM_API_KEY", "").strip()
@@ -2749,6 +2753,80 @@ async def _payment_setting(scope_id: str, key: str, env_default: str = "") -> st
     return ""
 
 
+# Manual payment settings live in the SAME credential scope as UPI/Razorpay.
+# Clones using master-managed payment inherit the master's payment options;
+# clones in own-payment mode can set their own options independently.
+async def get_manual_payment_enabled() -> bool:
+    scope_id = await payment_credential_scope()
+    setting = await db["settings"].find_one({
+        "key": "manual_payment_enabled", "franchise_id": scope_id,
+    })
+    if setting is None:
+        return True  # Backwards compatible: existing manual QR stays available.
+    value = setting.get("value", True)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+async def set_manual_payment_enabled(enabled: bool):
+    scope_id = await payment_credential_scope()
+    await db["settings"].update_one(
+        {"key": "manual_payment_enabled", "franchise_id": scope_id},
+        {"$set": {"value": bool(enabled), "updated_at": now_ist()}},
+        upsert=True,
+    )
+
+
+def validate_payment_link(raw: str) -> str:
+    """Only allow HTTPS links; never send arbitrary schemes in Telegram buttons."""
+    value = str(raw or "").strip()
+    if not value or len(value) > 2048 or any(ch.isspace() for ch in value):
+        raise ValueError("Send one valid HTTPS payment link (max 2048 characters).")
+    parsed = urlsplit(value)
+    if (parsed.scheme.lower() != "https" or not parsed.hostname or
+            parsed.username is not None or parsed.password is not None):
+        raise ValueError("Payment links must start with https:// and contain a valid host.")
+    return value
+
+
+async def get_effective_payment_link() -> str:
+    return await _payment_setting(await payment_credential_scope(), "manual_payment_link")
+
+
+async def set_payment_link(value: str):
+    link = validate_payment_link(value) if value else ""
+    scope_id = await payment_credential_scope()
+    await db["settings"].update_one(
+        {"key": "manual_payment_link", "franchise_id": scope_id},
+        {"$set": {"value": link, "updated_at": now_ist()}},
+        upsert=True,
+    )
+
+
+async def get_deposit_method_availability() -> dict:
+    """One source of truth for menu visibility and click-time validation."""
+    razorpay = bool(await get_effective_razorpay_key_id()) and bool(await get_effective_razorpay_key_secret())
+    manual_enabled = await get_manual_payment_enabled()
+    upi = bool(await get_effective_upi_id()) if manual_enabled else False
+    custom_link = bool(await get_effective_payment_link()) if manual_enabled else False
+    return {"razorpay": razorpay, "manual_qr": upi, "manual_link": custom_link,
+            "manual_enabled": manual_enabled}
+
+
+def deposit_method_buttons(available: dict) -> list:
+    buttons = []
+    if available["razorpay"]:
+        buttons.append([Button.inline("⚡ Razorpay QR (Auto)", b"deposit_method_auto", style="success")])
+        buttons.append([Button.inline("🔗 Razorpay Payment Link (Auto)", b"deposit_method_payment_link", style="success")])
+    if available["manual_qr"]:
+        buttons.append([Button.inline("📲 UPI QR + Screenshot", b"deposit_method_manual", style="primary")])
+    if available["manual_link"]:
+        buttons.append([Button.inline("🔗 Payment Link + Screenshot", b"deposit_method_manual_link", style="primary")])
+    buttons.append([Button.inline("🔙 Cancel", b"main", style="danger")])
+    return buttons
+
+
 async def get_effective_upi_id() -> str:
     return await _payment_setting(await payment_credential_scope(), "upi_id", UPI_ID)
 
@@ -3231,12 +3309,12 @@ async def cleanup_expired_clone_deposit_reservations():
             cutoff = now_ist() - timedelta(minutes=45)
             cursor = db['deposits'].find({
                 "collateral_state": "reserved",
-                "status": {"$in": ["awaiting_proof", "pending_auto"]},
+                "status": "awaiting_proof",
                 "created_at": {"$lte": cutoff},
             }).limit(100)
             async for dep in cursor:
                 result = await db['deposits'].update_one(
-                    {"_id": dep['_id'], "collateral_state": "reserved", "status": {"$in": ["awaiting_proof", "pending_auto"]}},
+                    {"_id": dep['_id'], "collateral_state": "reserved", "status": "awaiting_proof"},
                     {"$set": {"status": "expired", "expired_at": now_ist()}}
                 )
                 if result.modified_count:
@@ -6325,6 +6403,7 @@ async def callback_handler(event):
                     "admin_account_markup", "admin_server2_markup", "my_franchise_wallet", "admin_clone_bot",
                     "admin_manage_admins", "admin_add_admin", "admin_remove_admin", "self_clone_bot",
                     "admin_set_upi", "admin_edit_upi_id", "admin_edit_payee_name",
+                    "admin_payment_options", "admin_edit_payment_link", "admin_manual_on", "admin_manual_off",
                     "admin_razorpay", "admin_edit_rzp_key_id", "admin_edit_rzp_key_secret",
                     "admin_edit_rzp_webhook_secret", "admin_rzp_disable",
                     "remove_my_clone", "admin_remove_clone_list", "goto_main_new", "admin_toggle_referral",
@@ -7852,6 +7931,18 @@ async def callback_handler(event):
                         ],
                         parse_mode="markdown",
                     )
+                elif pending_dep.get("status") == "pending_auto":
+                    await event.edit(
+                        f"⏳ **Razorpay Payment Pending**\n\n"
+                        f"💰 Amount: ₹{pending_dep['amount']}\n"
+                        f"🕐 Created: {date_str}\n\n"
+                        "Complete your QR/link payment, then tap **✅ Check Payment**. "
+                        "Bot also checks Razorpay automatically in the background.",
+                        buttons=[
+                            [Button.inline("✅ Check Payment", f"razorpay_check_{pending_dep['_id']}".encode(), style="success")],
+                            [Button.inline("🔙 Back", b"main", style="primary")],
+                        ], parse_mode="markdown",
+                    )
                 else:
                     await event.edit(
                         f"⏳ **You already have a pending deposit**\n\n"
@@ -7868,11 +7959,11 @@ async def callback_handler(event):
                     )
                 await safe_callback_answer(event, )
                 return
-            razorpay_ready = bool(await get_effective_razorpay_key_id()) and bool(await get_effective_razorpay_key_secret())
-            if not razorpay_ready and not await get_effective_upi_id():
-                msg = "❌ Deposits aren't set up yet — the bot owner needs to set a UPI ID first."
+            methods = await get_deposit_method_availability()
+            if not (methods["razorpay"] or methods["manual_qr"] or methods["manual_link"]):
+                msg = "❌ No deposit method is enabled or configured right now."
                 if await is_admin(user_id):
-                    msg += "\n\nGo to Admin Panel → Finance & Transactions → Set UPI ID."
+                    msg += "\n\nGo to Admin Panel → Finance & Transactions → Payment Options."
                 await safe_callback_answer(event, msg, alert=True)
                 return
             user_states[user_id] = {"action": "deposit", "step": "amount"}
@@ -7884,44 +7975,71 @@ async def callback_handler(event):
             return
 
 
-        if data == "deposit_method_auto":
+        if data in ("deposit_method_auto", "deposit_method_payment_link",
+                    "deposit_method_manual", "deposit_method_manual_link"):
             state = user_states.get(user_id)
-            if not state or state.get("action") != "deposit" or not state.get("amount"):
-                await safe_callback_answer(event, "Deposit session expired. Start again.", alert=True)
+            if (not state or state.get("action") != "deposit" or
+                    state.get("step") != "choose_method" or not state.get("amount")):
+                await safe_callback_answer(event, "Deposit session expired or already processing. Start again.", alert=True)
                 return
-
             amount = float(state["amount"])
-            razorpay_ready = bool(await get_effective_razorpay_key_id()) and bool(await get_effective_razorpay_key_secret())
-            if not razorpay_ready:
-                await safe_callback_answer(event, "Razorpay is not configured. Use Manual Deposit.", alert=True)
+            methods = await get_deposit_method_availability()
+            permission = {
+                "deposit_method_auto": methods["razorpay"],
+                "deposit_method_payment_link": methods["razorpay"],
+                "deposit_method_manual": methods["manual_qr"],
+                "deposit_method_manual_link": methods["manual_link"],
+            }
+            if not permission[data]:
+                await safe_callback_answer(event, "This payment method is disabled or no longer configured.", alert=True)
                 return
-
-            await event.edit(
-                "⏳ Creating secure Razorpay payment...",
-                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
-            )
-            await start_razorpay_auto_deposit(event, user_id, amount)
-            user_states.pop(user_id, None)
-            await safe_callback_answer(event, )
+            # Consume this menu selection before any network/database work; a
+            # second rapid button press must not create another pending deposit.
+            state["step"] = "creating_deposit"
+            try:
+                if data in ("deposit_method_auto", "deposit_method_payment_link"):
+                    await event.edit("⏳ Creating secure Razorpay payment...")
+                    await start_razorpay_auto_deposit(
+                        event, user_id, amount,
+                        prefer_link=(data == "deposit_method_payment_link"),
+                    )
+                    user_states.pop(user_id, None)
+                else:
+                    await event.edit("⏳ Preparing manual payment instructions...")
+                    await start_manual_deposit(
+                        event, user_id, amount,
+                        payment_view="link" if data == "deposit_method_manual_link" else "qr",
+                    )
+            except Exception:
+                logging.exception("Deposit method initiation failed for user %s", user_id)
+                if user_states.get(user_id) is state:
+                    user_states.pop(user_id, None)
+                await event.respond("❌ Could not create the payment right now. Check your pending deposits before trying again.")
+            await safe_callback_answer(event)
             return
 
-        if data == "deposit_method_manual":
-            state = user_states.get(user_id)
-            if not state or state.get("action") != "deposit" or not state.get("amount"):
-                await safe_callback_answer(event, "Deposit session expired. Start again.", alert=True)
+        if data.startswith("razorpay_check_"):
+            try:
+                dep_id = ObjectId(data[len("razorpay_check_"):])
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid payment request.", alert=True)
                 return
-
-            amount = float(state["amount"])
-            if not await get_effective_upi_id():
-                await safe_callback_answer(event, "Manual UPI deposit is not configured.", alert=True)
+            dep = await deposits_col.find_one({'_id': dep_id, 'user_id': user_id})
+            if not dep:
+                await safe_callback_answer(event, "❌ Payment not found.", alert=True)
                 return
-
-            await event.edit(
-                "📲 Generating manual UPI QR...",
-                buttons=[[Button.inline("🔙 Cancel", b"main", style="danger")]]
-            )
-            await start_manual_deposit(event, user_id, amount)
-            await safe_callback_answer(event, )
+            if dep.get('method') not in ('razorpay_upi_qr', 'razorpay_payment_link'):
+                await safe_callback_answer(event, "Not a Razorpay payment.", alert=True)
+                return
+            await safe_callback_answer(event, "⏳ Checking Razorpay API...")
+            msg = await verify_and_credit_razorpay_deposit(dep_id, trigger='user_button')
+            try:
+                await event.respond(msg, buttons=[
+                    [Button.inline('✅ Check Payment', f'razorpay_check_{dep_id}'.encode(), style='success')],
+                    [Button.inline('🔙 Main Menu', b'main', style='primary')],
+                ])
+            except Exception:
+                logging.exception('Could not send payment-check result')
             return
 
         if data.startswith("manual_paid_"):
@@ -7965,6 +8083,10 @@ async def callback_handler(event):
             dep = await deposits_col.find_one({"_id": ObjectId(dep_id)})
             if not dep or dep["user_id"] != user_id:
                 await safe_callback_answer(event, "❌ Not found.", alert=True)
+                return
+            if dep.get('method') in ('razorpay_upi_qr', 'razorpay_payment_link'):
+                await safe_callback_answer(event,
+                    "Razorpay requests cannot be cancelled here while payment may be in flight. Use Check Payment or contact support.", alert=True)
                 return
             if dep["status"] not in ("awaiting_proof", "pending", "pending_auto"):
                 await safe_callback_answer(event, "Already processed — can't cancel now.", alert=True)
@@ -9082,6 +9204,7 @@ async def callback_handler(event):
                 if mode == "own_payment":
                     btns.extend([
                         [Button.inline("🏦 Set Own UPI ID", b"admin_set_upi", style="primary")],
+                        [Button.inline("💳 Payment Options", b"admin_payment_options", style="primary")],
                         [Button.inline("⚡ Own Razorpay", b"admin_razorpay", style="primary")],
                         [Button.inline("🕒 Pending Own Deposits", b"admin_deposits", style="primary")],
                     ])
@@ -9102,6 +9225,7 @@ async def callback_handler(event):
                     [Button.inline("💰 Add Balance", b"admin_addbal", style="success")],
                     [Button.inline("💲 Set Price", b"admin_setprice", style="primary")],
                     [Button.inline("🏦 Set UPI ID", b"admin_set_upi", style="primary")],
+                    [Button.inline("💳 Payment Options", b"admin_payment_options", style="primary")],
                     [Button.inline("⚡ Razorpay Auto-Approval", b"admin_razorpay", style="primary")],
                     [Button.inline("🕒 Pending Deposits", b"admin_deposits", style="primary")],
                     [Button.inline("📜 Transaction History", b"admin_transactions", style="primary")],
@@ -9112,6 +9236,80 @@ async def callback_handler(event):
                 ]
                 await event.edit("💰 **Finance & Transactions**", buttons=btns)
             await safe_callback_answer(event, )
+            return
+
+        if data == "admin_payment_options":
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+            if ctx()['is_franchise'] and await get_clone_payment_mode(ctx()['franchise_id']) != "own_payment":
+                await safe_callback_answer(event, "Switch to Own Payment Mode first.", alert=True)
+                return
+            manual_enabled = await get_manual_payment_enabled()
+            payment_link = await get_effective_payment_link()
+            upi = await get_effective_upi_id()
+            key_id = await get_effective_razorpay_key_id()
+            key_secret = await get_effective_razorpay_key_secret()
+            btns = [
+                [Button.inline("🔴 Turn Manual OFF" if manual_enabled else "🟢 Turn Manual ON",
+                               b"admin_manual_off" if manual_enabled else b"admin_manual_on",
+                               style="danger" if manual_enabled else "success")],
+                [Button.inline("🔗 Set / Change Payment Link", b"admin_edit_payment_link", style="primary")],
+                [Button.inline("🏦 UPI ID / QR Settings", b"admin_set_upi", style="primary")],
+                [Button.inline("⚡ Razorpay Settings", b"admin_razorpay", style="primary")],
+                [Button.inline("🔙 Back", b"admin_cat_finance", style="primary")],
+            ]
+            await event.edit(
+                "💳 **Payment Options**\n\n"
+                f"Manual UPI / custom link: **{'🟢 ON' if manual_enabled else '🔴 OFF'}**\n"
+                f"Manual UPI QR: **{'Configured' if upi else 'Not configured'}**\n"
+                f"Custom payment link: **{'Configured' if payment_link else 'Not configured'}**\n"
+                f"Razorpay QR + Razorpay Link: **{'Ready' if key_id and key_secret else 'Not configured'}**\n\n"
+                "Manual OFF hides both screenshot methods; existing pending proofs can still be reviewed. "
+                "Razorpay QR/Link stay available independently.\n"
+                "Custom links require a screenshot and admin approval; they do not auto-credit.",
+                buttons=btns,
+            )
+            await safe_callback_answer(event)
+            return
+
+        if data in ("admin_manual_on", "admin_manual_off"):
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+            if ctx()['is_franchise'] and await get_clone_payment_mode(ctx()['franchise_id']) != "own_payment":
+                await safe_callback_answer(event, "Switch to Own Payment Mode first.", alert=True)
+                return
+            # Explicit ON/OFF actions are idempotent even on rapid double taps.
+            enabled = data == "admin_manual_on"
+            await set_manual_payment_enabled(enabled)
+            await log_event(f"💳 Manual payment {'ENABLED' if enabled else 'DISABLED'} by admin `{user_id}`", dm_master_admins=False)
+            await safe_callback_answer(event, "Manual payment ON" if enabled else "Manual payment OFF")
+            await event.edit(
+                f"💳 Manual payment is now **{'ON' if enabled else 'OFF'}**.\n\n"
+                "Existing pending deposits can still be completed/reviewed.\n"
+                "Razorpay QR and Razorpay Payment Link are unaffected.",
+                buttons=[[Button.inline("🔙 Payment Options", b"admin_payment_options", style="primary")]],
+            )
+            return
+
+        if data == "admin_edit_payment_link":
+            if not await is_admin(user_id):
+                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+                return
+            if ctx()['is_franchise'] and await get_clone_payment_mode(ctx()['franchise_id']) != "own_payment":
+                await safe_callback_answer(event, "Switch to Own Payment Mode first.", alert=True)
+                return
+            user_states[user_id] = {"action": "set_payment_link", "step": "await_value"}
+            existing = await get_effective_payment_link()
+            await event.edit(
+                "🔗 **Custom Payment Link**\n\n"
+                f"Current: {'Configured' if existing else 'Not configured'}\n\n"
+                "Send a full **https://** payment link, or send `REMOVE` to delete it.\n"
+                "This is a manual screenshot method: payment confirmation does **not** auto-credit.",
+                buttons=[[Button.inline("🔙 Cancel", b"admin_payment_options", style="danger")]],
+            )
+            await safe_callback_answer(event)
             return
 
         if data == "admin_set_upi":
@@ -9132,7 +9330,7 @@ async def callback_handler(event):
                 f"🏦 **UPI Settings**\n\n"
                 f"Current UPI ID: `{cur_upi or 'Not set'}`\n"
                 f"Current Payee Name: `{cur_name or 'Not set'}`\n\n"
-                f"Deposits stay disabled for your customers until you set a UPI ID.",
+                "UPI ID is required for the manual QR option; Razorpay and a custom payment link are configured separately.",
                 buttons=btns
             )
             await safe_callback_answer(event, )
@@ -9182,23 +9380,22 @@ async def callback_handler(event):
                 [Button.inline("✏️ Edit Webhook Secret", b"admin_edit_rzp_webhook_secret", style="primary")],
             ]
             if configured:
-                btns.append([Button.inline("🔴 Disable (fall back to manual QR)", b"admin_rzp_disable", style="danger")])
+                btns.append([Button.inline("🔴 Disable Razorpay", b"admin_rzp_disable", style="danger")])
             btns.append([Button.inline("🔙 Back", b"admin_cat_finance", style="primary")])
             await event.edit(
                 f"⚡ **Razorpay Auto-Approval**\n\n"
-                f"Status: {'🟢 Enabled — deposits auto-credit via UPI QR' if configured else '🔴 Disabled — using manual QR + screenshot approval'}\n"
+                f"Status: {'🟢 Enabled — QR and Payment Link can auto-credit' if configured else '🔴 Disabled — manual methods depend on Payment Options'}\n"
                 f"Key ID: `{key_id or 'Not set'}`\n"
                 f"Key Secret: `{masked_secret}`\n"
                 f"Webhook Secret: `{'Set' if webhook_secret else 'Not set'}`\n\n"
-                f"**Setup:**\n"
-                f"1️⃣ Get your Key ID/Secret from Razorpay Dashboard → Settings → API Keys.\n"
-                f"2️⃣ Set both here — deposits switch to auto-credited UPI QR immediately.\n"
-                f"3️⃣ In Razorpay Dashboard → Webhooks, add a webhook pointing at:\n"
-                f"`https://YOUR_DOMAIN{webhook_path}`\n"
-                f"with the **qr_code.credited** event enabled, and set a secret.\n"
-                f"4️⃣ Paste that same secret here as the Webhook Secret.\n\n"
-                f"Your server must be reachable at that URL/port (`{WEBHOOK_HOST}:{WEBHOOK_PORT}` "
-                f"by default — put it behind a reverse proxy/domain with HTTPS, Razorpay requires it).",
+                f"**Webhook-free setup:**\n"
+                f"1️⃣ Generate Razorpay API Key ID and Secret in the dashboard.\n"
+                f"2️⃣ Save both keys here. No webhook or domain is required.\n"
+                f"3️⃣ Customers pay via unique QR/Payment Link; bot fetches actual\n"
+                f"captured payment via Razorpay API automatically every {RAZORPAY_API_POLL_SECONDS}s,\n"
+                f"or when they tap ✅ Check Payment.\n\n"
+                f"Optional: existing signed webhook integration can be enabled\n"
+                f"via RAZORPAY_ENABLE_WEBHOOK=true and configured separately.\n",
                 buttons=btns
             )
             await safe_callback_answer(event, )
@@ -9248,8 +9445,8 @@ async def callback_handler(event):
             await set_razorpay_key_id("")
             await set_razorpay_key_secret("")
             await event.edit(
-                "🔴 Razorpay auto-approval disabled. Deposits will fall back to the manual "
-                "UPI QR + screenshot + admin-approval flow.",
+                "🔴 Razorpay auto-approval disabled. Manual methods remain available only "
+                "if Manual Payment is ON and a UPI ID or payment link is configured.",
                 buttons=[[Button.inline("🔙 Back", b"admin_razorpay", style="primary")]]
             )
             await safe_callback_answer(event, )
@@ -9918,7 +10115,7 @@ async def callback_handler(event):
                 return
             new_status = "approved" if is_approve else "rejected"
             result = await db['deposits'].update_one(
-                {"_id": oid, "status": {"$in": ["pending", "pending_auto"]}},
+                {"_id": oid, "status": "pending"},
                 {"$set": {
                     "status": new_status,
                     "approved_at" if is_approve else "rejected_at": now_ist(),
@@ -9983,7 +10180,7 @@ async def callback_handler(event):
             # double-credit a deposit the Razorpay webhook just auto-approved
             # (or vice versa).
             result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "pending_auto"]}},
+                {"_id": ObjectId(dep_id), "status": "pending"},
                 {"$set": {"status": "approved", "approved_at": now_ist(), "approved_via": "admin_manual"}}
             )
             if result.modified_count == 0:
@@ -11071,11 +11268,19 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
     if not await activate_clone_customer_collateral(deposit):
         raise RuntimeError(f"Could not activate collateral for deposit {deposit.get('_id')}")
 
-    await users_col.update_one(
-        {"user_id": user_id_dep},
-        {"$inc": {"balance": amount}},
-        upsert=True
+    # Same deposit may be retried after a DB timeout, restart or simultaneous
+    # API check: balance and receipt are written in ONE MongoDB document update.
+    receipt = f"deposit:{ctx()['scope_id']}:{deposit['_id']}"
+    wallet_credit = await users_col.update_one(
+        {"user_id": user_id_dep, "wallet_deposit_receipts": {"$ne": receipt}},
+        {"$inc": {"balance": amount}, "$addToSet": {"wallet_deposit_receipts": receipt}},
     )
+    if not wallet_credit.modified_count:
+        existing = await users_col.find_one({"user_id": user_id_dep})
+        if not existing or receipt not in existing.get('wallet_deposit_receipts', []):
+            raise RuntimeError(f"Wallet user missing during deposit credit: {user_id_dep}")
+        # Receipt means balance was already credited; later stages are safe to
+        # retry (first-referral reward has its own once-only claim).
 
     # ---------- Referral Bonus: FIRST approved deposit only ----------
     # Atomically claim the referral reward before crediting the referrer.
@@ -11206,6 +11411,9 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
                 user_id_dep,
             )
 
+    if not wallet_credit.modified_count:
+        return  # Already wallet-credited; skip duplicate notices/log messages.
+
     if admin_click_event is not None:
         orig_msg = await admin_click_event.get_message()
         original_caption = (orig_msg.text or orig_msg.message or "") if orig_msg else ""
@@ -11282,95 +11490,158 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
     )
 
 
+async def razorpay_api_get(path: str, credential_scope: str):
+    """Authenticated read from the fixed Razorpay API host; never from user URL."""
+    key_id = await _payment_setting(credential_scope, "razorpay_key_id", RAZORPAY_KEY_ID)
+    secret = await _payment_setting(credential_scope, "razorpay_key_secret", RAZORPAY_KEY_SECRET)
+    if not key_id or not secret:
+        raise RuntimeError("Razorpay API keys are not configured for this payment account")
+    async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, secret)) as session:
+        async with session.get(f"{RAZORPAY_API_BASE}{path}", timeout=aiohttp.ClientTimeout(total=15)) as res:
+            if res.status != 200:
+                logging.error("Razorpay API GET %s returned HTTP %s", path.split('?')[0], res.status)
+                raise RuntimeError("Razorpay API temporarily unavailable")
+            return await res.json(content_type=None)
+
+
+async def _api_verify_razorpay_deposit(dep: dict):
+    """(payment_id, message). Never accepts IDs, amount or status from a user."""
+    paise = expected_paise(dep.get("amount"))
+    if not paise:
+        return None, "Invalid deposit amount; contact support."
+    cred = dep.get("payment_credential_scope") or dep.get("franchise_id") or "master"
+    method = dep.get("method")
+    if method == "razorpay_upi_qr":
+        qr_id = dep.get("qr_code_id")
+        if not isinstance(qr_id, str) or not re.fullmatch(r"qr_[A-Za-z0-9]+", qr_id):
+            return None, "Invalid QR reference."
+        data = await razorpay_api_get(f"/payments/qr_codes/{qr_id}/payments?count=100", cred)
+        ids = qr_payment_ids(data, paise)
+    elif method == "razorpay_payment_link":
+        link_id = dep.get("payment_link_id")
+        if not isinstance(link_id, str) or not re.fullmatch(r"plink_[A-Za-z0-9]+", link_id):
+            return None, "Invalid Payment Link reference."
+        data = await razorpay_api_get(f"/payment_links/{link_id}", cred)
+        ids = link_payment_ids(data, link_id, str(dep['_id']), paise)
+    else:
+        return None, "Not a Razorpay API-verifiable deposit."
+    # Accept exactly one captured transaction. Multiple matches need review.
+    if len(set(ids)) != 1 or len(ids) != 1:
+        return None, "Payment not captured yet, or needs manual reconciliation."
+    payment_id = ids[0]
+    payment = await razorpay_api_get(f"/payments/{payment_id}", cred)
+    if not captured_payment(payment, payment_id, paise):
+        return None, "Payment is not captured for this amount."
+    return payment_id, None
+
+
+async def verify_and_credit_razorpay_deposit(dep_id, trigger="api_check"):
+    """API verification -> unique payment receipt -> atomic approval -> wallet credit.
+
+    Shared by the Telegram check button, background polling and optional webhook.
+    """
+    dep = await db['deposits'].find_one({'_id': dep_id})
+    if not dep:
+        return "❌ Deposit not found."
+    if dep.get('method') not in ('razorpay_upi_qr', 'razorpay_payment_link'):
+        return "❌ This is not a Razorpay payment."
+    if dep.get('status') == 'approved':
+        if dep.get('approved_via') == 'razorpay_api' and not dep.get('wallet_credit_completed_at'):
+            # Recover an interruption after deposit approval but before wallet posting.
+            return await _resume_razorpay_credit(dep)
+        return "✅ Payment already processed. No second credit."
+    if dep.get('status') not in ('pending_auto',):
+        return "⚠️ Deposit is closed. If you paid, contact support with your payment ID."
+    try:
+        payment_id, reason = await _api_verify_razorpay_deposit(dep)
+    except Exception as exc:
+        logging.warning("Razorpay verify failed for deposit %s: %s", dep_id, exc)
+        return "⚠️ Could not reach Razorpay. Please try again shortly."
+    if not payment_id:
+        return f"⏳ {reason} Try Check Payment again shortly."
+
+    # Unique sparse index prevents a Razorpay transaction being attached to
+    # two deposits, including across master/clone scopes.
+    try:
+        result = await db['deposits'].update_one(
+            {'_id': dep_id, 'status': 'pending_auto'},
+            {'$set': {'status': 'approved', 'approved_via': 'razorpay_api',
+                      'approved_at': now_ist(), 'payment_id': payment_id,
+                      'razorpay_verified_payment_id': payment_id}},
+        )
+    except DuplicateKeyError:
+        logging.critical("Razorpay payment reused across deposits: %s / %s", payment_id, dep_id)
+        return "⚠️ Payment requires admin reconciliation."
+    if not result.modified_count:
+        fresh = await db['deposits'].find_one({'_id': dep_id})
+        if fresh and fresh.get('status') == 'approved':
+            if fresh.get('approved_via') == 'razorpay_api' and not fresh.get('wallet_credit_completed_at'):
+                return await _resume_razorpay_credit(fresh)
+            return "✅ Payment already processed. No second credit."
+        return "⚠️ Payment state changed. Contact support if money was debited."
+    dep['status'] = 'approved'
+    dep['approved_via'] = 'razorpay_api'
+    dep['payment_id'] = payment_id
+    return await _resume_razorpay_credit(dep)
+
+
+async def _resume_razorpay_credit(dep):
+    scope = dep.get('franchise_id', 'master')
+    target = await _deposit_scope_context(scope)
+    token = current_ctx.set(target)
+    try:
+        # Concurrent resumes are safe: finalize uses an atomic wallet receipt.
+        await finalize_deposit_credit(dep, approver_label='Razorpay API (verified)')
+        await db['deposits'].update_one(
+            {'_id': dep['_id'], 'status': 'approved'},
+            {'$set': {'wallet_credit_completed_at': now_ist()}},
+        )
+        if dep.get('qr_code_id'):
+            await razorpay_close_qr(dep['qr_code_id'], dep.get('payment_credential_scope'))
+        return '✅ Razorpay payment verified. Wallet credited successfully.'
+    except Exception:
+        logging.exception('Razorpay deposit credit needs retry: %s', dep['_id'])
+        return '⏳ Payment verified, wallet posting is pending. Retry Check Payment or contact support.'
+    finally:
+        current_ctx.reset(token)
+
+
+async def poll_pending_razorpay_deposits():
+    """API polling works even when users never press Check Payment."""
+    while True:
+        try:
+            cutoff = now_ist() - timedelta(days=7)
+            cursor = db['deposits'].find({
+                '$or': [
+                    {'status': 'pending_auto', 'method': {'$in': ['razorpay_upi_qr', 'razorpay_payment_link']},
+                     'created_at': {'$gte': cutoff}},
+                    {'status': 'approved', 'approved_via': 'razorpay_api',
+                     'wallet_credit_completed_at': {'$exists': False}},
+                ]
+            }).sort('last_api_check_at', 1).limit(50)
+            async for dep in cursor:
+                await db['deposits'].update_one({'_id': dep['_id']}, {'$set': {'last_api_check_at': now_ist()}})
+                await verify_and_credit_razorpay_deposit(dep['_id'], trigger='api_poll')
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception('Razorpay API polling error')
+        await asyncio.sleep(RAZORPAY_API_POLL_SECONDS)
+
+
 async def handle_razorpay_qr_credited(scope_id: str, qr_id: str, payment_id: str, amount_paise: int):
-    """Called from the Razorpay webhook once a 'qr_code.credited' event is
-    verified. Finds the matching pending deposit, atomically marks it
-    approved (guards against duplicate webhook retries crediting it twice
-    or racing a manual admin approval), then credits the wallet."""
-    if not qr_id:
-        return
-    dep = await db['deposits'].find_one({"qr_code_id": qr_id})
-    if not dep:
-        logging.warning(f"Razorpay webhook: no deposit found for qr_code_id={qr_id} credential_scope={scope_id}")
-        return
-
-    expected_paise = int(round(dep.get("amount", 0) * 100))
-    if amount_paise and expected_paise and amount_paise != expected_paise:
-        # Shouldn't normally happen since the QR is created with fixed_amount,
-        # but log it loudly rather than silently crediting the wrong figure.
-        logging.warning(
-            f"Razorpay webhook: amount mismatch for deposit {dep['_id']} "
-            f"(expected {expected_paise} paise, got {amount_paise} paise) — crediting the expected amount."
-        )
-
-    result = await db['deposits'].update_one(
-        {"_id": dep["_id"], "status": {"$in": ["pending", "pending_auto"]}},
-        {"$set": {"status": "approved", "payment_id": payment_id, "approved_at": now_ist(),
-                   "approved_via": "razorpay_auto"}}
-    )
-    if result.modified_count == 0:
-        logging.info(f"Razorpay webhook: deposit {dep['_id']} already processed, skipping.")
-        return
-
-    target_scope = dep.get("franchise_id", "master")
-    token = current_ctx.set(find_ctx_by_scope(target_scope))
-    try:
-        dep["status"] = "approved"
-        dep["approved_via"] = "razorpay_auto"
-        dep["payment_id"] = payment_id
-        await finalize_deposit_credit(dep, approver_label="Razorpay (auto)")
-        await razorpay_close_qr(qr_id, dep.get("payment_credential_scope") or scope_id)
-    finally:
-        current_ctx.reset(token)
+    """Optional signed webhook: hint only; fetch payment from Razorpay API."""
+    dep = await db['deposits'].find_one({'qr_code_id': qr_id, 'payment_credential_scope': scope_id})
+    if dep:
+        await verify_and_credit_razorpay_deposit(dep['_id'], trigger='webhook')
 
 
-
-async def handle_razorpay_payment_link_paid(
-    scope_id: str, payment_link_id: str, payment_id: str, amount_paise: int
-):
-    """Auto-credit a pending deposit when Razorpay sends payment_link.paid."""
-    if not payment_link_id:
-        return
-
-    dep = await db["deposits"].find_one({"payment_link_id": payment_link_id})
-    if not dep:
-        logging.warning(
-            f"Razorpay webhook: no deposit found for payment_link_id={payment_link_id} "
-            f"credential_scope={scope_id}"
-        )
-        return
-
-    expected_paise = int(round(dep.get("amount", 0) * 100))
-    if amount_paise and expected_paise and amount_paise != expected_paise:
-        logging.error(
-            f"Razorpay Payment Link amount mismatch for deposit {dep['_id']}: "
-            f"expected {expected_paise}, got {amount_paise}. Deposit NOT credited."
-        )
-        return
-
-    result = await db["deposits"].update_one(
-        {"_id": dep["_id"], "status": {"$in": ["pending", "pending_auto"]}},
-        {"$set": {
-            "status": "approved",
-            "payment_id": payment_id,
-            "approved_at": now_ist(),
-            "approved_via": "razorpay_payment_link",
-        }},
-    )
-    if result.modified_count == 0:
-        logging.info(f"Razorpay webhook: deposit {dep['_id']} already processed, skipping.")
-        return
-
-    target_scope = dep.get("franchise_id", "master")
-    token = current_ctx.set(find_ctx_by_scope(target_scope))
-    try:
-        dep["status"] = "approved"
-        dep["approved_via"] = "razorpay_payment_link"
-        dep["payment_id"] = payment_id
-        await finalize_deposit_credit(dep, approver_label="Razorpay Payment Link (auto)")
-    finally:
-        current_ctx.reset(token)
-
+async def handle_razorpay_payment_link_paid(scope_id: str, payment_link_id: str, payment_id: str, amount_paise: int):
+    """Optional signed webhook: hint only; fetch payment from Razorpay API."""
+    dep = await db['deposits'].find_one({'payment_link_id': payment_link_id, 'payment_credential_scope': scope_id})
+    if dep:
+        await verify_and_credit_razorpay_deposit(dep['_id'], trigger='webhook')
 
 
 async def razorpay_webhook_handler(request: web.Request) -> web.Response:
@@ -11611,8 +11882,8 @@ async def _reserve_capacity_for_new_deposit(dep_id, amount: float):
     return False, msg
 
 
-async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
-    """Try live dynamic UPI QR first; fall back to a standard Payment Link.
+async def start_razorpay_auto_deposit(event, user_id: int, amount: float, prefer_link: bool = False):
+    """Use Razorpay QR (fallback to Link), or request Link directly.
 
     In own-payment franchise mode, the same amount is reserved from the clone
     owner's MASTER balance before the user is allowed to pay. That reservation
@@ -11642,7 +11913,7 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
         )
         return
 
-    qr = await razorpay_create_qr(amount, dep_id, user_id, scope_id, credential_scope)
+    qr = None if prefer_link else await razorpay_create_qr(amount, dep_id, user_id, scope_id, credential_scope)
 
     if qr and qr.get("id"):
         qr_id = qr["id"]
@@ -11656,10 +11927,11 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
         caption = (
             f"💳 **Deposit ₹{amount}**\n\n"
             f"Scan this UPI QR to pay.\n"
-            f"✅ Your balance will be credited automatically after payment confirmation.\n\n"
+            f"✅ Razorpay API verifies payment before wallet credit.\n"
+            f"Tap Check Payment after paying (automatic API checking also runs).\n\n"
             f"⏳ QR expires in ~{minutes} min."
         )
-        buttons = [[Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")]]
+        buttons = [[Button.inline("✅ Check Payment", f"razorpay_check_{dep_id}".encode(), style="success")]]
         try:
             if image_url:
                 async with aiohttp.ClientSession() as sess:
@@ -11719,12 +11991,13 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
     msg = (
         f"💳 **Deposit ₹{amount}**\n\n"
         f"Tap **Pay ₹{amount}** below.\n"
-        f"✅ Your balance will be credited automatically after payment confirmation.\n\n"
+        f"✅ Razorpay API verifies payment before wallet credit.\n"
+            f"Tap Check Payment after paying (automatic API checking also runs).\n\n"
         f"⏳ Link expires in ~{minutes} min."
     )
     await event.respond(msg, buttons=[
         [Button.url(f"💳 Pay ₹{amount}", short_url)],
-        [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
+        [Button.inline("✅ Check Payment", f"razorpay_check_{dep_id}".encode(), style="success")],
     ])
 
     try:
@@ -11746,77 +12019,12 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float):
 
 
 async def start_razorpay_payment_link_deposit(event, user_id: int, amount: float):
-    """Create a Razorpay standard Payment Link and auto-credit via payment_link.paid."""
-    scope_id = ctx()["scope_id"]
-    result = await deposits_col.insert_one({
-        "user_id": user_id,
-        "amount": amount,
-        "status": "pending_auto",
-        "method": "razorpay_payment_link",
-        "created_at": now_ist(),
-    })
-    dep_id = result.inserted_id
-
-    payment_link = await razorpay_create_payment_link(amount, dep_id, user_id, scope_id)
-    if not payment_link or not payment_link.get("id") or not payment_link.get("short_url"):
-        await deposits_col.update_one(
-            {"_id": dep_id},
-            {"$set": {"status": "failed"}}
-        )
-        await event.respond(
-            "❌ Couldn't generate the Razorpay Payment Link right now. "
-            "Check the server log for the Razorpay API error.",
-            buttons=[[Button.inline("🔙 Main Menu", b"goto_main_new", style="primary")]]
-        )
-        return
-
-    payment_link_id = payment_link["id"]
-    short_url = payment_link["short_url"]
-
-    await deposits_col.update_one(
-        {"_id": dep_id},
-        {"$set": {
-            "payment_link_id": payment_link_id,
-            "payment_link_url": short_url,
-            "txn_id": payment_link_id,
-        }}
-    )
-
-    minutes = max(15, max(900, RAZORPAY_QR_EXPIRY_SECONDS) // 60)
-    msg = (
-        f"💳 **Deposit ₹{amount}**\n\n"
-        f"Tap **Pay ₹{amount}** below to open Razorpay's secure payment page.\n"
-        f"✅ After Razorpay confirms the payment, your balance will be credited "
-        f"automatically.\n\n"
-        f"⏳ Link expires in ~{minutes} min."
-    )
-    buttons = [
-        [Button.url(f"💳 Pay ₹{amount}", short_url)],
-        [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
-    ]
-    await event.respond(msg, buttons=buttons)
-
-    try:
-        group_msg = await send_auto_deposit_to_payment_group(
-            user_id=user_id,
-            amount=amount,
-            txn_id=payment_link_id,
-            dep_id=dep_id,
-            method_label="Razorpay Payment Link",
-        )
-        if group_msg:
-            await deposits_col.update_one({"_id": dep_id}, {"$set": {
-                "payment_group_chat_id": PAYMENT_GROUP_ID,
-                "payment_group_message_id": group_msg.id,
-                "payment_group_sent_at": now_ist(),
-            }})
-    except Exception as exc:
-        logging.error("Could not send legacy auto Payment Link deposit %s to payment group: %s", dep_id, exc)
+    """Compatibility alias: use reservation-safe shared payment creation."""
+    await start_razorpay_auto_deposit(event, user_id, amount, prefer_link=True)
 
 
-
-async def start_manual_deposit(event, user_id: int, amount: float):
-    """Static UPI QR + screenshot + admin approval with clone collateral reservation."""
+async def start_manual_deposit(event, user_id: int, amount: float, payment_view: str = "qr"):
+    """Static QR or admin-configured HTTPS link; both need screenshot approval."""
     state = user_states.setdefault(user_id, {"action": "deposit"})
     state["action"] = "deposit"
     state["amount"] = amount
@@ -11827,10 +12035,14 @@ async def start_manual_deposit(event, user_id: int, amount: float):
     credential_scope = await payment_credential_scope()
     mode = await get_clone_payment_mode(scope_id) if ctx()['is_franchise'] else "master"
 
+    manual_enabled = await get_manual_payment_enabled()
     upi_id = await get_effective_upi_id()
     payee_name = await get_effective_payee_name()
-    if not upi_id:
-        await event.respond("❌ Manual deposits aren't available right now.", buttons=[[Button.inline("🔙 Back", b"main", style="danger")]])
+    custom_link = await get_effective_payment_link()
+    if (not manual_enabled or payment_view not in ("qr", "link") or
+            (payment_view == "qr" and not upi_id) or
+            (payment_view == "link" and not custom_link)):
+        await event.respond("❌ This manual deposit method is disabled or not configured.", buttons=[[Button.inline("🔙 Back", b"main", style="danger")]])
         user_states.pop(user_id, None)
         return
 
@@ -11838,6 +12050,8 @@ async def start_manual_deposit(event, user_id: int, amount: float):
         "user_id": user_id, "amount": amount, "txn_id": txn_id,
         "proof_type": "screenshot", "status": "awaiting_proof",
         "method": "manual_upi", "payment_mode": mode,
+        "manual_payment_view": payment_view,
+        "manual_payment_link_url": custom_link if payment_view == "link" else None,
         "payment_credential_scope": credential_scope, "created_at": now_ist(),
     })
     dep_id = result.inserted_id
@@ -11853,24 +12067,39 @@ async def start_manual_deposit(event, user_id: int, amount: float):
         user_states.pop(user_id, None)
         return
 
-    upi_string = f"upi://pay?pa={upi_id}&pn={payee_name}&am={amount}&tn={txn_id}"
-    img = qrcode.make(upi_string)
-    buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0); buf.name = "manual_upi_qr.png"
-    caption = (
-        f"💳 **Manual Deposit ₹{amount}**\n"
+    buttons = []
+    if custom_link:
+        buttons.append([Button.url("🔗 Open Payment Link", custom_link)])
+    buttons.extend([
+        [Button.inline("✅ I Have Paid", f"manual_paid_{dep_id}".encode(), style="success")],
+        [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
+    ])
+    instructions = (
+        f"💳 **Manual Deposit ₹{amount:.2f}**\n"
         f"🔑 **Txn ID:** `{txn_id}`\n\n"
-        f"1️⃣ Scan the QR and complete payment.\n"
-        f"2️⃣ After paying, tap **✅ I Have Paid** below.\n"
-        f"3️⃣ The bot will then ask you for the payment screenshot.\n"
-        f"4️⃣ Admin will manually verify it before balance credit."
+        "1️⃣ Complete the payment using the QR or payment link shown.\n"
+        "2️⃣ Tap **✅ I Have Paid** after payment.\n"
+        "3️⃣ Send your payment screenshot.\n"
+        "4️⃣ Admin verifies the payment before crediting your balance.\n\n"
+        "⚠️ Custom links do not automatically verify payment."
     )
-    await ctx()["client"].send_file(
-        event.chat_id, buf, caption=caption, force_document=False,
-        buttons=[
-            [Button.inline("✅ I Have Paid", f"manual_paid_{dep_id}".encode(), style="success")],
-            [Button.inline("❌ Cancel", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
-        ],
-    )
+    if payment_view == "qr":
+        upi_string = f"upi://pay?pa={upi_id}&pn={payee_name}&am={amount}&tn={txn_id}"
+        img = qrcode.make(upi_string)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        buf.name = "manual_upi_qr.png"
+        await ctx()["client"].send_file(
+            event.chat_id, buf, caption=instructions, force_document=False,
+            buttons=buttons,
+        )
+    else:
+        if upi_id:
+            instructions += "\n\n📲 The UPI QR option is also available from Deposit."
+        await ctx()["client"].send_message(
+            event.chat_id, instructions, buttons=buttons, parse_mode="markdown",
+        )
     state["step"] = "await_paid_click"
 
 
@@ -11902,45 +12131,34 @@ async def process_deposit_step(event):
                 user_states.pop(user_id, None)
                 return
 
-        razorpay_ready = bool(await get_effective_razorpay_key_id()) and bool(await get_effective_razorpay_key_secret())
-        manual_ready = bool(await get_effective_upi_id())
-
-        buttons = []
-        if razorpay_ready:
-            buttons.append([
-                Button.inline("⚡ Razorpay Auto Pay", b"deposit_method_auto", style="success")
-            ])
-        if manual_ready:
-            buttons.append([
-                Button.inline("📲 Manual UPI + Screenshot", b"deposit_method_manual", style="primary")
-            ])
-        buttons.append([Button.inline("🔙 Cancel", b"main", style="danger")])
-
-        if not razorpay_ready and not manual_ready:
-            await event.respond(
-                "❌ No deposit method is configured right now.",
-                buttons=buttons
-            )
+        methods = await get_deposit_method_availability()
+        buttons = deposit_method_buttons(methods)
+        if not (methods["razorpay"] or methods["manual_qr"] or methods["manual_link"]):
+            await event.respond("❌ No deposit method is configured and enabled right now.", buttons=buttons)
             user_states.pop(user_id, None)
             return
 
+        descriptions = []
+        if methods["razorpay"]:
+            descriptions.append("⚡ **Razorpay QR / Payment Link** — automatic webhook confirmation.")
+        if methods["manual_qr"]:
+            descriptions.append("📲 **UPI QR** — manual screenshot and admin approval.")
+        if methods["manual_link"]:
+            descriptions.append("🔗 **Custom Payment Link** — manual screenshot and admin approval.")
         state["step"] = "choose_method"
         await event.respond(
-            f"💳 **Deposit ₹{amount}**\n\n"
-            f"Choose payment method:\n\n"
-            f"⚡ **Razorpay Auto Pay** — automatic confirmation and balance credit.\n"
-            f"📲 **Manual UPI** — pay via UPI QR, then send screenshot for admin approval.",
-            buttons=buttons
+            f"💳 **Deposit ₹{amount:.2f}**\n\nChoose payment method:\n\n" + "\n".join(descriptions),
+            buttons=buttons,
         )
     elif step == "choose_method":
+        methods = await get_deposit_method_availability()
         await event.respond(
-            "👇 Please choose a payment method using the buttons above.",
-            buttons=[
-                [Button.inline("⚡ Razorpay Auto Pay", b"deposit_method_auto", style="success")],
-                [Button.inline("📲 Manual UPI + Screenshot", b"deposit_method_manual", style="primary")],
-                [Button.inline("🔙 Cancel", b"main", style="danger")],
-            ]
+            "👇 Choose one of the currently available payment methods:",
+            buttons=deposit_method_buttons(methods),
         )
+        return
+    elif step == "creating_deposit":
+        await event.respond("⏳ Your deposit is being created. Please check your pending deposits.")
         return
     elif step == "await_paid_click":
         dep_id = state.get("deposit_id")
@@ -12540,6 +12758,37 @@ async def handle_message(event):
             user_states.pop(user_id, None)
             return
 
+    elif action == "set_payment_link":
+        if not await is_admin(user_id):
+            user_states.pop(user_id, None)
+            await event.respond("❌ Unauthorized.")
+            return
+        if ctx()['is_franchise'] and await get_clone_payment_mode(ctx()['franchise_id']) != "own_payment":
+            user_states.pop(user_id, None)
+            await event.respond("❌ Switch to Own Payment Mode first.")
+            return
+        value = (event.message.text or "").strip()
+        if value.upper() == "REMOVE":
+            link = ""
+        else:
+            try:
+                link = validate_payment_link(value)
+            except ValueError as exc:
+                await event.respond(f"❌ {exc}", buttons=[[Button.inline("🔙 Cancel", b"admin_payment_options", style="danger")]])
+                return
+        await set_payment_link(link)
+        user_states.pop(user_id, None)
+        await log_event(
+            f"🔗 Custom payment link {'UPDATED' if link else 'REMOVED'} by admin `{user_id}`",
+            dm_master_admins=False,
+        )
+        await event.respond(
+            "✅ Payment link saved. Manual payment must be ON for customers to use it."
+            if link else "✅ Custom payment link removed.",
+            buttons=[[Button.inline("🔙 Payment Options", b"admin_payment_options", style="primary")]],
+        )
+        return
+
     elif action == "set_upi_id":
         step = state.get("step")
         if step == "await_value":
@@ -12549,7 +12798,7 @@ async def handle_message(event):
                                      buttons=[[Button.inline("🔙 Cancel", b"admin_set_upi", style="danger")]])
                 return
             await set_upi_id(upi)
-            await event.respond(f"✅ UPI ID set to `{upi}`. Deposits are now enabled for your customers.",
+            await event.respond(f"✅ UPI ID set to `{upi}`. The manual QR appears only while Manual Payment is ON.",
                                  buttons=[[Button.inline("🔙 UPI Settings", b"admin_set_upi", style="primary")]])
             user_states.pop(user_id, None)
 
@@ -14077,13 +14326,23 @@ async def main():
         await bot.disconnect()
         return
 
-    # Razorpay auto-approval webhook (harmless to start even if no Razorpay
-    # keys are configured yet — it just won't have a matching secret to
-    # verify against until an admin sets one via the bot).
     try:
-        await start_webhook_server()
-    except Exception as e:
-        logging.error(f"❌ Could not start Razorpay webhook server: {e}")
+        await db['deposits'].create_index(
+            [('razorpay_verified_payment_id', 1)], unique=True,
+            partialFilterExpression={'razorpay_verified_payment_id': {'$type': 'string'}},
+            name='unique_razorpay_verified_payment',
+        )
+    except Exception as exc:
+        logging.critical('Cannot enforce unique Razorpay payment IDs; refusing startup: %s', exc)
+        await bot.disconnect()
+        return
+
+    # Webhook is optional, disabled by default: no public URL is needed.
+    if RAZORPAY_ENABLE_WEBHOOK:
+        try:
+            await start_webhook_server()
+        except Exception as e:
+            logging.error('Could not start optional Razorpay webhook server: %s', e)
 
     global acc_mgr
     acc_mgr = AccountManager(
@@ -14118,6 +14377,7 @@ async def main():
             logging.info(f"🤖 Launched {launched} clone bot(s) live alongside the master bot.")
 
     asyncio.create_task(cleanup_expired_clone_deposit_reservations())
+    asyncio.create_task(poll_pending_razorpay_deposits())
 
     logging.info("🚀 Bot started successfully...")
 

@@ -242,3 +242,26 @@ For an existing database, run `python audit_referral_safety.py` before deploying
 old incomplete reward claims may need manual review. Test locally with
 `python -m unittest discover -s tests -v`. These are offline tests, not a
 live MongoDB/Telegram deployment verification.
+
+## Manual Payment ON/OFF + Custom Payment Link + QR
+
+See [PAYMENT_OPTIONS.md](PAYMENT_OPTIONS.md) for the new Admin Panel payment switches,
+custom HTTPS payment-link setup, Razorpay QR/Payment Link options, and deployment
+notes. Manual payment stays ON by default for compatibility; both screenshot
+methods can be turned OFF without affecting Razorpay QR/link auto deposits.
+
+## Razorpay API verification without a webhook
+
+See [RAZORPAY_NO_WEBHOOK.md](RAZORPAY_NO_WEBHOOK.md). Razorpay QR and the
+Razorpay-generated Payment Link now use authenticated GET requests against the
+Razorpay API. A background polling task runs every 60 seconds by default,
+and the customer also gets a **✅ Check Payment** button. A webhook, public
+URL, domain, SSL certificate or inbound port is **not required**. The old
+signed webhook can optionally be enabled with `RAZORPAY_ENABLE_WEBHOOK=true`.
+
+Only **captured, exactly matched** gateway payments are credited. Custom/static
+UPI QR or custom payment links still require screenshot/admin approval; API
+keys do not magically verify transactions from third-party/static URLs.
+
+Use `python3 audit_referral_safety.py` and `python3 -m unittest discover -s tests -v`
+for pre-deployment checks. Back up MongoDB and retain the production `.env`.
