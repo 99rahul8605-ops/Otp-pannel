@@ -58,12 +58,61 @@ RAZORPAY_API_POLL_SECONDS=60
   polled; successful approvals with unfinished posting are also retried. A
   customer can use **Check Payment** on an older pending deposit, or contact
   support. If the bot is offline for longer periods, reconcile manually.
-- Pending Razorpay deposits cannot be cancelled from the Telegram button
-  while funds may be in flight. Investigate old pending deposits from the
-  Razorpay Dashboard before refunding or releasing any reserved capacity.
+- Razorpay QR/Payment Link requests can be cancelled from Telegram. The bot
+  checks for captured funds before and after requesting gateway closure, and
+  releases reserved capacity **only after** cancellation is confirmed. In-flight
+  settlement can still arrive late; check private reconciliation alerts before
+  issuing refunds or manually crediting any cancelled request.
 - Reconciliation of interruptions between collateral locking and downstream
   bookkeeping is not a substitute for a full financial ledger. For a live
   production deployment, use MongoDB transactions/ledger reconciliation and
   monitor/log pending approved deposits.
 - An API key's secret must remain on the server or in protected admin settings.
   Never paste it into user chats or public logs.
+
+## Cancel an automatic Razorpay deposit and create a new request
+
+The customer's **Razorpay QR** and **Razorpay Payment Link** messages now include
+**❌ Cancel & New Deposit**. The **Deposit** screen for a pending automatic
+payment also offers **❌ Cancel This Deposit**, even after leaving the original
+QR/link message.
+
+1. On cancellation, the bot first queries the Razorpay API for any existing
+   captured payment. If a captured payment exists, it is **verified and credited
+   once** rather than cancelled.
+2. For an unpaid Payment Link, the bot calls
+   `POST /v1/payment_links/{id}/cancel`; for a single-use QR code, it calls
+   `POST /v1/payments/qr_codes/{id}/close`. A subsequent authenticated GET must
+   confirm `cancelled` or `closed`, respectively.
+3. The bot verifies for captured payment **again after** disabling the payment
+   source. Only then is the local request set `cancelled_by_user`, any reserved
+   clone capacity released, and **💳 New Deposit** offered.
+4. If the gateway times out, responds inconsistently, or a final API check
+   fails, cancellation is **not** treated as successful. The button can be
+   retried, and the background API worker also retries an interrupted
+   `cancelling_auto` request. This prevents a new request being created merely
+   because a local database field changed.
+5. Recently cancelled payment sources are periodically audited for unexpectedly
+   late captured payments. Those are **flagged in the existing private logs
+   channel for manual reconciliation**, not silently lost or blindly credited
+   after clone collateral has been released. If a customer was debited, check
+   Razorpay Dashboard and refund or reconcile correctly.
+
+**Existing manual QR/custom Payment Link behavior remains unchanged:** they
+still use screenshot approval, and turning Manual Payment OFF continues to hide
+both manual choices. This feature doesn't retroactively cancel old Razorpay
+requests in the database or unlink a copy of a QR image already saved outside
+Telegram; cancellation/closure at Razorpay is what prevents new payments.
+
+Run the offline checks after installation:
+
+```bash
+python3 audit_referral_safety.py
+python3 -m unittest discover -s tests -v
+```
+
+**Deployment:** Back up MongoDB and `.env`, then stop old bot processes before
+updating. Test Razorpay cancellation of a test QR and a test Payment Link with
+TEST keys; real-money races and late bank settlement cannot be simulated by the
+offline test suite. Avoid swapping Razorpay API keys while outstanding payment
+requests exist, or old requests may no longer be closable with the new keys.

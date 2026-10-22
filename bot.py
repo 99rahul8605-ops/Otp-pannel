@@ -775,6 +775,201 @@ async def razorpay_cancel_payment_link(payment_link_id: str, credential_scope: s
         logging.warning(f"Razorpay Payment Link cancel error for {payment_link_id}: {e}")
 
 
+async def razorpay_deactivate_payment_source(deposit: dict):
+    """Require gateway confirmation; NEVER mark a deposit cancelled on a POST timeout.
+
+    Returns (closed, reason). A failed/unknown response must keep the wallet
+    reservation and deposit open for retry/reconciliation.
+    """
+    cred = deposit.get("payment_credential_scope") or deposit.get("franchise_id") or "master"
+    method = deposit.get("method")
+    if method == "razorpay_upi_qr":
+        source_id = deposit.get("qr_code_id")
+        if not isinstance(source_id, str) or not re.fullmatch(r"qr_[A-Za-z0-9]+", source_id):
+            return False, "Missing/invalid QR ID. Contact support."
+        path = f"/payments/qr_codes/{source_id}"
+        terminal = "closed"
+    elif method == "razorpay_payment_link":
+        source_id = deposit.get("payment_link_id")
+        if not isinstance(source_id, str) or not re.fullmatch(r"plink_[A-Za-z0-9]+", source_id):
+            return False, "Missing/invalid Payment Link ID. Contact support."
+        path = f"/payment_links/{source_id}"
+        terminal = "cancelled"
+    else:
+        return False, "Not a cancellable Razorpay request."
+
+    key_id = await _payment_setting(cred, "razorpay_key_id", RAZORPAY_KEY_ID)
+    key_secret = await _payment_setting(cred, "razorpay_key_secret", RAZORPAY_KEY_SECRET)
+    if not key_id or not key_secret:
+        return False, "Razorpay API keys unavailable. Contact support."
+    try:
+        # A first GET also handles a previous POST that succeeded before timeout.
+        before = await razorpay_api_get(path, cred)
+        if before.get("id") != source_id:
+            return False, "Gateway returned a mismatched payment source."
+        if before.get("status") in ("paid", "partially_paid") or before.get("amount_paid", 0) or before.get("payments_amount_received", 0):
+            return False, "Payment may already be received. Verify/reconcile before cancellation."
+        if before.get("status") == terminal:
+            return True, "Already closed on Razorpay."
+        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as session:
+            async with session.post(f"{RAZORPAY_API_BASE}{path}/" + ("close" if method == "razorpay_upi_qr" else "cancel"),
+                                    timeout=aiohttp.ClientTimeout(total=15)) as response:
+                # Even if HTTP failed, GET might reveal the target terminal state.
+                code = response.status
+                body = await response.json(content_type=None)
+        if code not in (200, 201):
+            logging.warning("Razorpay cancel/close HTTP %s on %s", code, source_id)
+        after = await razorpay_api_get(path, cred)
+        if after.get("id") != source_id or after.get("status") != terminal:
+            return False, "Razorpay has not confirmed cancellation. Retry or contact support."
+        return True, "Gateway confirmed closed."
+    except Exception as exc:
+        logging.warning("Cannot confirm Razorpay cancellation of %s: %s", source_id, exc)
+        return False, "Cannot confirm cancellation from Razorpay. Retry shortly."
+
+
+async def cancel_razorpay_auto_deposit(dep_id, user_id: int, *, retry: bool = False):
+    """Two-phase cancellation: claim pending -> gateway close -> post-check -> cancelled.
+
+    Credit always wins if a captured payment is observed. No clone reservation
+    gets released while the external payment source might still accept funds.
+    """
+    deposits = db['deposits']
+    dep = await deposits.find_one({'_id': dep_id, 'user_id': user_id})
+    if not dep or dep.get('method') not in ('razorpay_upi_qr', 'razorpay_payment_link'):
+        return False, '❌ Razorpay deposit not found.'
+    if dep.get('status') == 'approved':
+        return False, '✅ Payment already approved. It cannot be cancelled.'
+    if dep.get('status') == 'cancelled_by_user':
+        return True, '✅ Old Razorpay request is already cancelled.'
+    if dep.get('status') not in ('pending_auto', 'cancelling_auto'):
+        return False, '⚠️ Deposit is not open for cancellation.'
+
+    if dep['status'] == 'pending_auto':
+        result = await deposits.update_one(
+            {'_id': dep_id, 'user_id': user_id, 'status': 'pending_auto'},
+            {'$set': {'status': 'cancelling_auto', 'cancellation_requested_at': now_ist()}},
+        )
+        if not result.modified_count:
+            return False, '⏳ Payment status changed. Open Deposit again to check.'
+    elif not retry and (now_ist() - dep.get('cancellation_requested_at', now_ist())) < timedelta(seconds=20):
+        return False, '⏳ Cancellation is already being verified. Try again in 20 seconds.'
+
+    # Check *before* cancelling; otherwise a paid QR could be closed and
+    # wallet credit lost because the local status already said cancelled.
+    try:
+        payment_id, _ = await _api_verify_razorpay_deposit(dep)
+    except Exception:
+        logging.exception('Initial Razorpay cancellation precheck failed: %s', dep_id)
+        return False, '⚠️ Razorpay is unavailable. Cancellation pending; do not pay this request.'
+    if payment_id:
+        return False, await verify_and_credit_razorpay_deposit(dep_id, trigger='cancel_precheck')
+
+    if not dep.get('razorpay_gateway_deactivated_at'):
+        closed, reason = await razorpay_deactivate_payment_source(dep)
+        if not closed:
+            # Failed gate close is never a local cancellation: re-open if
+            # payment did not become captured (a later retry re-checks it).
+            await deposits.update_one({'_id': dep_id, 'status': 'cancelling_auto'},
+                                      {'$set': {'status': 'pending_auto', 'cancellation_failed_at': now_ist()}})
+            return False, f'⚠️ {reason} Old QR/link has NOT been confirmed invalid; no new request yet.'
+        await deposits.update_one({'_id': dep_id, 'status': 'cancelling_auto'},
+                                  {'$set': {'razorpay_gateway_deactivated_at': now_ist()}})
+
+    # A transaction may have captured during the API cancel/close operation.
+    try:
+        payment_id, _ = await _api_verify_razorpay_deposit(dep)
+    except Exception:
+        logging.exception('Final Razorpay cancellation check failed: %s', dep_id)
+        return False, '⏳ Gateway closed, waiting for final payment reconciliation. Please retry.'
+    if payment_id:
+        return False, await verify_and_credit_razorpay_deposit(dep_id, trigger='cancel_postcheck')
+
+    result = await deposits.update_one(
+        {'_id': dep_id, 'user_id': user_id, 'status': 'cancelling_auto'},
+        {'$set': {'status': 'cancelled_by_user', 'cancelled_at': now_ist(),
+                  'gateway_cancellation_confirmed': True}},
+    )
+    if not result.modified_count:
+        return False, '⚠️ Status changed during cancellation. Reopen Deposit for details.'
+    # The scoped caller sets ctx so clone collateral can be released correctly.
+    await release_clone_customer_capacity(dep, reason='razorpay_user_cancelled')
+    return True, '✅ Old Razorpay QR/link deactivated and deposit cancelled.'
+
+
+async def reconcile_cancelled_razorpay_payments():
+    """Flag any late captured payments on cancelled requests for manual refund/credit.
+
+    Never automatically credit after clone collateral has been released.
+    """
+    cutoff = now_ist() - timedelta(days=3)
+    audit_before = now_ist() - timedelta(minutes=15)
+    cursor = db['deposits'].find({
+        'status': 'cancelled_by_user', 'gateway_cancellation_confirmed': True,
+        'cancelled_at': {'$gte': cutoff}, 'late_payment_review_at': {'$exists': False},
+        '$or': [{'last_late_payment_audit_at': {'$exists': False}},
+                {'last_late_payment_audit_at': {'$lt': audit_before}}],
+        'method': {'$in': ['razorpay_upi_qr', 'razorpay_payment_link']}
+    }).sort('last_late_payment_audit_at', 1).limit(25)
+    async for dep in cursor:
+        await db['deposits'].update_one({'_id': dep['_id']},
+                                        {'$set': {'last_late_payment_audit_at': now_ist()}})
+        try:
+            cred = dep.get('payment_credential_scope') or dep.get('franchise_id') or 'master'
+            if dep['method'] == 'razorpay_upi_qr':
+                data = await razorpay_api_get(f"/payments/qr_codes/{dep['qr_code_id']}/payments?count=100", cred)
+                ids = [p.get('id') for p in (data.get('items') or [])
+                       if isinstance(p, dict) and p.get('status') == 'captured']
+            else:
+                data = await razorpay_api_get(f"/payment_links/{dep['payment_link_id']}", cred)
+                if data.get('reference_id') != f"dep_{dep['_id']}" or data.get('id') != dep['payment_link_id']:
+                    continue
+                ids = [p.get('payment_id') for p in (data.get('payments') or [])
+                       if isinstance(p, dict) and p.get('plink_id') == dep['payment_link_id']
+                       and p.get('status') == 'captured']
+            captured_ids = []
+            for payment_id in ids:
+                if not isinstance(payment_id, str) or not re.fullmatch('pay_[A-Za-z0-9]+', payment_id):
+                    continue
+                payment = await razorpay_api_get(f'/payments/{payment_id}', cred)
+                # Flag even unexpected amounts; a smaller or larger captured
+                # amount is real money that also needs manual reconciliation.
+                if (isinstance(payment, dict) and payment.get('id') == payment_id
+                    and payment.get('status') == 'captured' and payment.get('captured') is True
+                    and payment.get('currency') == 'INR'
+                    and type(payment.get('amount')) is int and payment['amount'] > 0):
+                    captured_ids.append(payment_id)
+            if captured_ids:
+                result = await db['deposits'].update_one(
+                    {'_id': dep['_id'], 'status': 'cancelled_by_user',
+                     'late_payment_review_at': {'$exists': False}},
+                    {'$set': {'late_payment_review_at': now_ist(),
+                              'late_captured_payment_ids': captured_ids}}
+                )
+                if result.modified_count:
+                    logging.critical('LATE RAZORPAY PAYMENT after cancellation: dep=%s ids=%s', dep['_id'], captured_ids)
+                    scope = await _deposit_scope_context(dep.get('franchise_id', 'master'))
+                    token = current_ctx.set(scope)
+                    try:
+                        await log_event(
+                            f'⚠️ **Manual reconciliation required: payment after cancellation**\n'
+                            f'👤 User `{dep["user_id"]}` | Deposit `{dep["_id"]}`\n'
+                            f'💰 ₹{dep["amount"]} | Payment IDs `{", ".join(captured_ids)}`\n'
+                            'Do not auto-credit without verifying collateral/refund.',
+                            dm_master_admins=False,
+                        )
+                        try:
+                            await ctx()['client'].send_message(dep['user_id'],
+                                '⚠️ A payment was received on a previously cancelled request. '
+                                'Please contact support with your Razorpay payment ID for reconciliation.')
+                        except Exception:
+                            pass
+                    finally:
+                        current_ctx.reset(token)
+        except Exception:
+            logging.exception('Razorpay cancelled-payment reconciliation failed for %s', dep['_id'])
+
+
 # ---------- DYNAMIC ADMINS ----------
 # ADMIN_IDS from .env are permanent "founding" admins (can't be removed here).
 # Anyone else can be added/removed live, from inside the bot, no .env edit or
@@ -7914,7 +8109,7 @@ async def callback_handler(event):
                     return
                 await ensure_clone_security_health(ctx()['franchise_id'])
 
-            pending_dep = await deposits_col.find_one({"user_id": user_id, "status": {"$in": ["awaiting_proof", "pending", "pending_auto"]}})
+            pending_dep = await deposits_col.find_one({"user_id": user_id, "status": {"$in": ["awaiting_proof", "pending", "pending_auto", "cancelling_auto"]}})
             if pending_dep:
                 date_str = pending_dep["created_at"].strftime('%d/%m/%Y %H:%M')
                 if pending_dep.get("status") == "awaiting_proof":
@@ -7931,15 +8126,17 @@ async def callback_handler(event):
                         ],
                         parse_mode="markdown",
                     )
-                elif pending_dep.get("status") == "pending_auto":
+                elif pending_dep.get("status") in ("pending_auto", "cancelling_auto"):
                     await event.edit(
                         f"⏳ **Razorpay Payment Pending**\n\n"
                         f"💰 Amount: ₹{pending_dep['amount']}\n"
                         f"🕐 Created: {date_str}\n\n"
                         "Complete your QR/link payment, then tap **✅ Check Payment**. "
-                        "Bot also checks Razorpay automatically in the background.",
+                        "Bot also checks Razorpay automatically in the background.\n"
+                        "Use Cancel This Deposit to invalidate the old QR/link before creating another request.",
                         buttons=[
                             [Button.inline("✅ Check Payment", f"razorpay_check_{pending_dep['_id']}".encode(), style="success")],
+                            [Button.inline("❌ Cancel This Deposit", f"cancel_my_deposit_{pending_dep['_id']}".encode(), style="danger")],
                             [Button.inline("🔙 Back", b"main", style="primary")],
                         ], parse_mode="markdown",
                     )
@@ -8034,10 +8231,12 @@ async def callback_handler(event):
             await safe_callback_answer(event, "⏳ Checking Razorpay API...")
             msg = await verify_and_credit_razorpay_deposit(dep_id, trigger='user_button')
             try:
-                await event.respond(msg, buttons=[
-                    [Button.inline('✅ Check Payment', f'razorpay_check_{dep_id}'.encode(), style='success')],
-                    [Button.inline('🔙 Main Menu', b'main', style='primary')],
-                ])
+                latest = await deposits_col.find_one({'_id': dep_id})
+                buttons = [[Button.inline('✅ Check Payment', f'razorpay_check_{dep_id}'.encode(), style='success')]]
+                if latest and latest.get('status') in ('pending_auto', 'cancelling_auto'):
+                    buttons.append([Button.inline('❌ Cancel This Deposit', f'cancel_my_deposit_{dep_id}'.encode(), style='danger')])
+                buttons.append([Button.inline('🔙 Main Menu', b'main', style='primary')])
+                await event.respond(msg, buttons=buttons)
             except Exception:
                 logging.exception('Could not send payment-check result')
             return
@@ -8080,30 +8279,48 @@ async def callback_handler(event):
 
         if data.startswith("cancel_my_deposit_"):
             dep_id = data[len("cancel_my_deposit_"):]
-            dep = await deposits_col.find_one({"_id": ObjectId(dep_id)})
-            if not dep or dep["user_id"] != user_id:
+            try:
+                oid = ObjectId(dep_id)
+            except Exception:
+                await safe_callback_answer(event, "❌ Invalid deposit ID.", alert=True)
+                return
+            dep = await deposits_col.find_one({"_id": oid, "user_id": user_id})
+            if not dep:
                 await safe_callback_answer(event, "❌ Not found.", alert=True)
                 return
+            if dep.get('status') == 'cancelled_by_user':
+                await safe_callback_answer(event, "✅ Already cancelled.")
+                await event.respond("✅ Old deposit already cancelled. Start a new request:", buttons=[
+                    [Button.inline("💳 New Deposit", b"deposit", style="success")],
+                    [Button.inline("🔙 Main Menu", b"main", style="primary")],
+                ])
+                return
             if dep.get('method') in ('razorpay_upi_qr', 'razorpay_payment_link'):
-                await safe_callback_answer(event,
-                    "Razorpay requests cannot be cancelled here while payment may be in flight. Use Check Payment or contact support.", alert=True)
-                return
-            if dep["status"] not in ("awaiting_proof", "pending", "pending_auto"):
-                await safe_callback_answer(event, "Already processed — can't cancel now.", alert=True)
-                return
-            result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": {"$in": ["awaiting_proof", "pending", "pending_auto"]}},
-                {"$set": {"status": "cancelled_by_user"}}
-            )
-            if result.modified_count == 0:
-                await safe_callback_answer(event, "Already processed — can't cancel now.", alert=True)
-                return
-            await release_clone_customer_capacity(dep, reason="user_cancelled")
-            cred_scope = dep.get("payment_credential_scope") or dep.get("franchise_id") or ctx()['scope_id']
-            if dep.get("qr_code_id"):
-                await razorpay_close_qr(dep["qr_code_id"], cred_scope)
-            if dep.get("payment_link_id"):
-                await razorpay_cancel_payment_link(dep["payment_link_id"], cred_scope)
+                await safe_callback_answer(event, "⏳ Cancelling and verifying with Razorpay...")
+                cancelled, message = await cancel_razorpay_auto_deposit(oid, user_id)
+                if not cancelled:
+                    latest = await deposits_col.find_one({"_id": oid})
+                    buttons = []
+                    if latest and latest.get('status') in ('pending_auto', 'cancelling_auto'):
+                        buttons.extend([
+                            [Button.inline("✅ Check Payment", f"razorpay_check_{oid}".encode(), style="success")],
+                            [Button.inline("❌ Retry Cancel", f"cancel_my_deposit_{oid}".encode(), style="danger")],
+                        ])
+                    buttons.append([Button.inline("🔙 Main Menu", b"main", style="primary")])
+                    await event.respond(message, buttons=buttons)
+                    return
+            else:
+                if dep["status"] not in ("awaiting_proof", "pending"):
+                    await safe_callback_answer(event, "Already processed — can't cancel now.", alert=True)
+                    return
+                result = await deposits_col.update_one(
+                    {"_id": oid, "status": {"$in": ["awaiting_proof", "pending"]}},
+                    {"$set": {"status": "cancelled_by_user"}}
+                )
+                if result.modified_count == 0:
+                    await safe_callback_answer(event, "Already processed — can't cancel now.", alert=True)
+                    return
+                await release_clone_customer_capacity(dep, reason="user_cancelled")
 
             # Disable the Approve/Reject buttons on every admin's copy of this
             # request so nobody can act on it after the fact.
@@ -8133,6 +8350,12 @@ async def callback_handler(event):
                 await event.delete()
             except Exception as e:
                 logging.warning(f"Could not delete cancelled deposit message: {e}")
+            old_payment_msg = dep.get("user_payment_message_id")
+            if old_payment_msg and old_payment_msg != getattr(event, 'message_id', None):
+                try:
+                    await ctx()['client'].delete_messages(event.chat_id, [old_payment_msg])
+                except Exception as e:
+                    logging.warning("Could not delete old QR/Link message for deposit %s: %s", oid, e)
 
             await ctx()['client'].send_message(
                 event.chat_id,
@@ -8142,6 +8365,9 @@ async def callback_handler(event):
                     [Button.inline("🔙 Main Menu", b"main", style="primary")]
                 ]
             )
+            state = user_states.get(user_id)
+            if state and state.get('action') == 'deposit' and state.get('deposit_id') == str(oid):
+                user_states.pop(user_id, None)
             cancel_name = await get_display_name(user_id)
             await log_event(
                 f"🚫 **Deposit Cancelled by User**\n"
@@ -11550,7 +11776,7 @@ async def verify_and_credit_razorpay_deposit(dep_id, trigger="api_check"):
             # Recover an interruption after deposit approval but before wallet posting.
             return await _resume_razorpay_credit(dep)
         return "✅ Payment already processed. No second credit."
-    if dep.get('status') not in ('pending_auto',):
+    if dep.get('status') not in ('pending_auto', 'cancelling_auto'):
         return "⚠️ Deposit is closed. If you paid, contact support with your payment ID."
     try:
         payment_id, reason = await _api_verify_razorpay_deposit(dep)
@@ -11564,7 +11790,7 @@ async def verify_and_credit_razorpay_deposit(dep_id, trigger="api_check"):
     # two deposits, including across master/clone scopes.
     try:
         result = await db['deposits'].update_one(
-            {'_id': dep_id, 'status': 'pending_auto'},
+            {'_id': dep_id, 'status': {'$in': ['pending_auto', 'cancelling_auto']}},
             {'$set': {'status': 'approved', 'approved_via': 'razorpay_api',
                       'approved_at': now_ist(), 'payment_id': payment_id,
                       'razorpay_verified_payment_id': payment_id}},
@@ -11617,16 +11843,30 @@ async def poll_pending_razorpay_deposits():
                      'created_at': {'$gte': cutoff}},
                     {'status': 'approved', 'approved_via': 'razorpay_api',
                      'wallet_credit_completed_at': {'$exists': False}},
+                    {'status': 'cancelling_auto',
+                     'method': {'$in': ['razorpay_upi_qr', 'razorpay_payment_link']}},
                 ]
             }).sort('last_api_check_at', 1).limit(50)
             async for dep in cursor:
                 await db['deposits'].update_one({'_id': dep['_id']}, {'$set': {'last_api_check_at': now_ist()}})
-                await verify_and_credit_razorpay_deposit(dep['_id'], trigger='api_poll')
+                if dep.get('status') == 'cancelling_auto':
+                    target = await _deposit_scope_context(dep.get('franchise_id', 'master'))
+                    token = current_ctx.set(target)
+                    try:
+                        await cancel_razorpay_auto_deposit(dep['_id'], dep['user_id'], retry=True)
+                    finally:
+                        current_ctx.reset(token)
+                else:
+                    await verify_and_credit_razorpay_deposit(dep['_id'], trigger='api_poll')
                 await asyncio.sleep(0.2)
         except asyncio.CancelledError:
             raise
         except Exception:
             logging.exception('Razorpay API polling error')
+        try:
+            await reconcile_cancelled_razorpay_payments()
+        except Exception:
+            logging.exception("Late Razorpay cancellation audit failed")
         await asyncio.sleep(RAZORPAY_API_POLL_SECONDS)
 
 
@@ -11931,7 +12171,10 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float, prefer
             f"Tap Check Payment after paying (automatic API checking also runs).\n\n"
             f"⏳ QR expires in ~{minutes} min."
         )
-        buttons = [[Button.inline("✅ Check Payment", f"razorpay_check_{dep_id}".encode(), style="success")]]
+        buttons = [
+            [Button.inline("✅ Check Payment", f"razorpay_check_{dep_id}".encode(), style="success")],
+            [Button.inline("❌ Cancel & New Deposit", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
+        ]
         try:
             if image_url:
                 async with aiohttp.ClientSession() as sess:
@@ -11941,12 +12184,16 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float, prefer
                         qr_bytes = await r.read()
                 qr_file = io.BytesIO(qr_bytes)
                 qr_file.name = f"razorpay_qr_{dep_id}.png"
-                await ctx()["client"].send_file(event.chat_id, qr_file, caption=caption, buttons=buttons, force_document=False)
+                sent_payment_msg = await ctx()["client"].send_file(
+                    event.chat_id, qr_file, caption=caption, buttons=buttons, force_document=False)
             elif short_url:
-                await event.respond(caption + f"\n\n🔗 {short_url}", buttons=buttons)
+                sent_payment_msg = await event.respond(caption + f"\n\n🔗 {short_url}", buttons=buttons)
             else:
                 raise RuntimeError("Razorpay QR response had no image_url/short_url")
 
+            if sent_payment_msg:
+                await deposits_col.update_one({"_id": dep_id, "status": "pending_auto"},
+                                              {"$set": {"user_payment_message_id": sent_payment_msg.id}})
             try:
                 group_msg = await send_auto_deposit_to_payment_group(
                     user_id=user_id,
@@ -11995,10 +12242,14 @@ async def start_razorpay_auto_deposit(event, user_id: int, amount: float, prefer
             f"Tap Check Payment after paying (automatic API checking also runs).\n\n"
         f"⏳ Link expires in ~{minutes} min."
     )
-    await event.respond(msg, buttons=[
+    sent_payment_msg = await event.respond(msg, buttons=[
         [Button.url(f"💳 Pay ₹{amount}", short_url)],
         [Button.inline("✅ Check Payment", f"razorpay_check_{dep_id}".encode(), style="success")],
+        [Button.inline("❌ Cancel & New Deposit", f"cancel_my_deposit_{dep_id}".encode(), style="danger")],
     ])
+    if sent_payment_msg:
+        await deposits_col.update_one({"_id": dep_id, "status": "pending_auto"},
+                                      {"$set": {"user_payment_message_id": sent_payment_msg.id}})
 
     try:
         group_msg = await send_auto_deposit_to_payment_group(
@@ -12140,7 +12391,7 @@ async def process_deposit_step(event):
 
         descriptions = []
         if methods["razorpay"]:
-            descriptions.append("⚡ **Razorpay QR / Payment Link** — automatic webhook confirmation.")
+            descriptions.append("⚡ **Razorpay QR / Payment Link** — automatic API verification (no webhook required).")
         if methods["manual_qr"]:
             descriptions.append("📲 **UPI QR** — manual screenshot and admin approval.")
         if methods["manual_link"]:
