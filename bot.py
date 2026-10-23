@@ -6680,6 +6680,7 @@ async def render_admin_pending_deposits(event, page=0, notice=None):
         status = dep.get('status')
         method = dep.get('method', '')
         is_manual = status == 'pending' and method == 'manual_upi'
+        is_waiting_manual_proof = status == 'awaiting_proof' and method == 'manual_upi'
         is_auto = method in ('razorpay_upi_qr', 'razorpay_payment_link', 'razorpay_auto')
         if status == 'awaiting_proof':
             label = '📷 Waiting for proof'
@@ -6698,21 +6699,27 @@ async def render_admin_pending_deposits(event, page=0, notice=None):
             f"   Bot: `{scope}` • User: `{dep.get('user_id', 'N/A')}`\n"
             f"   ₹{float(dep.get('amount') or 0):.2f} • Ref: `{txn}`"
         )
-        if is_manual:
-            # These controls cannot approve/reject an auto Razorpay payment.
+        if is_manual or is_waiting_manual_proof:
+            # Pending with proof: Approve/Reject. Awaiting proof: Reject only.
+            # Never let a Razorpay auto deposit enter this manual-review path.
             if not ctx()['is_franchise'] and scope != 'master':
                 approve_data = f"maplist_{dep['_id']}_{page}"
                 reject_data = f"mrjlist_{dep['_id']}_{page}"
             else:
                 approve_data = f"aplist_{dep['_id']}_{page}"
                 reject_data = f"rjlist_{dep['_id']}_{page}"
-            buttons.append([
-                Button.inline(f'✅ Approve #{index}', approve_data, style='success'),
-                Button.inline(f'❌ Reject #{index}', reject_data, style='danger'),
-            ])
-            if dep.get('proof_source_message_id'):
+            if is_manual:
                 buttons.append([
-                    Button.inline(f'📸 View Proof #{index}', f"dep_proof_{dep['_id']}", style='primary')
+                    Button.inline(f'✅ Approve #{index}', approve_data, style='success'),
+                    Button.inline(f'❌ Reject #{index}', reject_data, style='danger'),
+                ])
+                if dep.get('proof_source_message_id'):
+                    buttons.append([
+                        Button.inline(f'📸 View Proof #{index}', f"dep_proof_{dep['_id']}", style='primary')
+                    ])
+            else:
+                buttons.append([
+                    Button.inline(f'❌ Reject Unsubmitted #{index}', reject_data, style='danger'),
                 ])
 
     if not rows:
@@ -10499,7 +10506,8 @@ async def callback_handler(event):
                 return
             new_status = "approved" if is_approve else "rejected"
             result = await db['deposits'].update_one(
-                {"_id": oid, "status": "pending"},
+                {"_id": oid, "method": "manual_upi", "franchise_id": deposit['franchise_id'],
+                 "status": "pending" if is_approve else {"$in": ["pending", "awaiting_proof"]}},
                 {"$set": {
                     "status": new_status,
                     "approved_at" if is_approve else "rejected_at": now_ist(),
@@ -10617,7 +10625,8 @@ async def callback_handler(event):
                 return
             dep_id = data.split("_", 1)[1]
             result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": "pending", "method": "manual_upi"},
+                {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "awaiting_proof"]},
+                 "method": "manual_upi"},
                 {"$set": {"status": "rejected", "rejected_at": now_ist(),
                           "rejected_by": user_id}}
             )
