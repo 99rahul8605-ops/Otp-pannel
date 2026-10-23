@@ -6620,6 +6620,120 @@ async def render_admin_stats(event, user_id: int, range_key: str = "today", cust
         await event.respond(dashboard_text, buttons=buttons, parse_mode="markdown")
 
 
+# Admin deposit queue: paginated, scope-isolated, and manual-review-only.
+# Auto Razorpay payments are shown for visibility but can only be credited by
+# verified Razorpay API results (never an admin's manual Approve click).
+ADMIN_DEPOSIT_PAGE_SIZE = 5
+ADMIN_DEPOSIT_ACTIVE_STATUSES = (
+    "awaiting_proof", "pending", "pending_auto", "cancelling_auto",
+)
+
+
+async def render_admin_pending_deposits(event, page=0, notice=None):
+    if not await is_admin(event.sender_id):
+        await safe_callback_answer(event, "❌ Unauthorized", alert=True)
+        return
+
+    if ctx()['is_franchise']:
+        collection = deposits_col
+        query = {"status": {"$in": list(ADMIN_DEPOSIT_ACTIVE_STATUSES)}}
+        scope_label = str(ctx().get('franchise_id') or 'Clone')
+    else:
+        # Never mix in own-payment clones (only the owner of that bot can
+        # see/review them). Master may review its own & master-managed clones.
+        managed = await bot_clones_col.find({
+            "status": {"$ne": "removed"},
+            "payment_mode": {"$ne": "own_payment"},
+        }).to_list(length=None)
+        allowed_scopes = list(dict.fromkeys(
+            ['master'] + [str(c['franchise_id']) for c in managed if c.get('franchise_id')]
+        ))
+        collection = db['deposits']
+        query = {
+            "franchise_id": {"$in": allowed_scopes},
+            "status": {"$in": list(ADMIN_DEPOSIT_ACTIVE_STATUSES)},
+        }
+        scope_label = 'Master + managed clones'
+
+    count = await collection.count_documents(query)
+    page_count = max(1, (count + ADMIN_DEPOSIT_PAGE_SIZE - 1) // ADMIN_DEPOSIT_PAGE_SIZE)
+    page = max(0, min(int(page or 0), page_count - 1))
+    rows = await (collection.find(query)
+                  .sort([('created_at', 1), ('_id', 1)])
+                  .skip(page * ADMIN_DEPOSIT_PAGE_SIZE)
+                  .limit(ADMIN_DEPOSIT_PAGE_SIZE)
+                  .to_list(length=ADMIN_DEPOSIT_PAGE_SIZE))
+
+    lines = [
+        '🕒 **Pending Deposits**',
+        f'🤖 Scope: {scope_label}',
+        f'📋 Total active requests: **{count}** • Page **{page + 1}/{page_count}**',
+    ]
+    if notice:
+        # Only internally authored messages should be passed as notice.
+        lines.append(str(notice)[:180])
+    lines.append('')
+    buttons = []
+
+    for index, dep in enumerate(rows, start=page * ADMIN_DEPOSIT_PAGE_SIZE + 1):
+        scope = str(dep.get('franchise_id') or 'master')
+        status = dep.get('status')
+        method = dep.get('method', '')
+        is_manual = status == 'pending' and method == 'manual_upi'
+        is_auto = method in ('razorpay_upi_qr', 'razorpay_payment_link', 'razorpay_auto')
+        if status == 'awaiting_proof':
+            label = '📷 Waiting for proof'
+        elif status == 'cancelling_auto':
+            label = '🔄 Cancelling at Razorpay'
+        elif is_auto:
+            label = '⚡ Razorpay • awaiting API verification'
+        elif is_manual:
+            label = '📝 Manual • review required'
+        else:
+            label = '⏳ Pending • needs review'
+        # Sanitize user-supplied transaction refs before embedding in Markdown.
+        txn = re.sub(r'[^A-Za-z0-9_\-]', '', str(dep.get('txn_id') or 'N/A'))[:36]
+        lines.append(
+            f"**{index}.** {label}\n"
+            f"   Bot: `{scope}` • User: `{dep.get('user_id', 'N/A')}`\n"
+            f"   ₹{float(dep.get('amount') or 0):.2f} • Ref: `{txn}`"
+        )
+        if is_manual:
+            # These controls cannot approve/reject an auto Razorpay payment.
+            if not ctx()['is_franchise'] and scope != 'master':
+                approve_data = f"maplist_{dep['_id']}_{page}"
+                reject_data = f"mrjlist_{dep['_id']}_{page}"
+            else:
+                approve_data = f"aplist_{dep['_id']}_{page}"
+                reject_data = f"rjlist_{dep['_id']}_{page}"
+            buttons.append([
+                Button.inline(f'✅ Approve #{index}', approve_data, style='success'),
+                Button.inline(f'❌ Reject #{index}', reject_data, style='danger'),
+            ])
+            if dep.get('proof_source_message_id'):
+                buttons.append([
+                    Button.inline(f'📸 View Proof #{index}', f"dep_proof_{dep['_id']}", style='primary')
+                ])
+
+    if not rows:
+        lines.append('✅ No active pending deposits.')
+    nav = []
+    if page > 0:
+        nav.append(Button.inline('⬅️ Previous', f'admin_deposits|{page - 1}', style='primary'))
+    if page + 1 < page_count:
+        nav.append(Button.inline('Next ➡️', f'admin_deposits|{page + 1}', style='primary'))
+    if nav:
+        buttons.append(nav)
+    buttons.append([Button.inline('🔄 Refresh', f'admin_deposits|{page}', style='primary')])
+    buttons.append([Button.inline('🔙 Finance Menu', b'admin_cat_finance', style='primary')])
+    try:
+        await event.edit('\n'.join(lines), buttons=buttons, parse_mode='markdown')
+    except MessageNotModifiedError:
+        # Refresh on the same unchanged page is not a fatal callback error.
+        pass
+    await safe_callback_answer(event)
+
+
 # ============================================================
 #  2. CALLBACK HANDLER
 # ============================================================
@@ -6639,6 +6753,22 @@ async def callback_handler(event):
 
         user_id = event.sender_id
         logging.info(f"Callback received: {data} from user {user_id}")
+        pending_list_page = None
+        for prefix, action in (
+            ('aplist_', 'approve_'),
+            ('rjlist_', 'reject_'),
+            ('maplist_', 'mdepapprove_'),
+            ('mrjlist_', 'mdepreject_'),
+        ):
+            if data.startswith(prefix):
+                # Exact 24-hex ObjectId and nonnegative page; no ambiguous IDs.
+                match = re.fullmatch(re.escape(prefix) + r'([0-9a-fA-F]{24})_(\d{1,6})', data)
+                if not match:
+                    await safe_callback_answer(event, '❌ Invalid deposit action.', alert=True)
+                    return
+                pending_list_page = min(int(match.group(2)), 100000)
+                data = action + match.group(1)
+                break
 
         # Skip broadcast callbacks (handled separately)
         if data.startswith("broadcast_"):
@@ -10154,71 +10284,16 @@ async def callback_handler(event):
             await event.edit("👤 Send user ID:", buttons=[[Button.inline("🔙 Cancel", b"admin", style="danger")]])
             await safe_callback_answer(event, )
             return
-        if data == "admin_deposits":
-            if not await is_admin(user_id):
-                await safe_callback_answer(event, "❌ Unauthorized", alert=True)
-                return
-
-            # Master admins must also be able to recover master-managed clone
-            # deposits if a Telegram notification was missed. Own-payment clone
-            # deposits remain visible only inside that clone's admin panel.
-            if not ctx()['is_franchise']:
-                managed = await bot_clones_col.find({
-                    "status": {"$ne": "removed"},
-                    "payment_mode": {"$ne": "own_payment"},
-                }).to_list(length=None)
-                allowed_scopes = ["master"] + [
-                    str(c.get("franchise_id")) for c in managed if c.get("franchise_id")
-                ]
-                cursor = db['deposits'].find({
-                    "franchise_id": {"$in": allowed_scopes},
-                    "status": {"$in": ["pending", "pending_auto"]},
-                }).sort("created_at", 1)
+        if data == "admin_deposits" or data.startswith("admin_deposits|"):
+            if data.startswith('admin_deposits|'):
+                page_text = data.split('|', 1)[1]
+                if not page_text.isdecimal() or len(page_text) > 6:
+                    await safe_callback_answer(event, '❌ Invalid page.', alert=True)
+                    return
+                page = int(page_text)
             else:
-                cursor = deposits_col.find({
-                    "status": {"$in": ["pending", "pending_auto"]}
-                }).sort("created_at", 1)
-
-            pending = await cursor.to_list(length=10)
-            if not pending:
-                await safe_callback_answer(event, "No pending deposits.", alert=True)
-                return
-
-            btns = []
-            lines = ["🕒 **Pending Deposits**", ""]
-            for index, dep in enumerate(pending, start=1):
-                txn_id = dep.get('txn_id', 'N/A')
-                dep_scope = str(dep.get('franchise_id') or 'master')
-                tag = "🅰️ " if dep.get("status") == "pending_auto" else ""
-                delivered = int(dep.get("proof_delivered_count", len(dep.get("admin_msg_refs", []))) or 0)
-                lines.append(
-                    f"{index}. `{dep_scope}` • User `{dep.get('user_id')}` • "
-                    f"**₹{dep.get('amount', 0)}** • `{txn_id}` • Proof sent: **{delivered}**"
-                )
-
-                if not ctx()['is_franchise'] and dep_scope != "master":
-                    approve_cb = f"mdepapprove_{dep['_id']}"
-                    reject_cb = f"mdepreject_{dep['_id']}"
-                else:
-                    approve_cb = f"approve_{dep['_id']}"
-                    reject_cb = f"reject_{dep['_id']}"
-
-                btns.append([
-                    Button.inline(f"✅ Approve {tag}₹{dep['amount']}", approve_cb, style="success"),
-                    Button.inline("❌ Reject", reject_cb, style="danger"),
-                ])
-                if dep.get("proof_source_message_id"):
-                    btns.append([
-                        Button.inline(
-                            f"📸 Send Proof Here • #{index}",
-                            f"dep_proof_{dep['_id']}",
-                            style="primary",
-                        )
-                    ])
-
-            btns.append([Button.inline("🔙 Back", b"admin_cat_finance", style="primary")])
-            await event.edit("\n".join(lines), buttons=btns, parse_mode="markdown")
-            await safe_callback_answer(event)
+                page = 0
+            await render_admin_pending_deposits(event, page=page)
             return
 
         if data.startswith("dep_proof_"):
@@ -10415,6 +10490,9 @@ async def callback_handler(event):
             if not deposit or deposit.get("franchise_id") == "master":
                 await safe_callback_answer(event, "❌ Deposit not found.", alert=True)
                 return
+            if deposit.get('method') != 'manual_upi':
+                await safe_callback_answer(event, '⚠️ Razorpay deposits require API verification.', alert=True)
+                return
             clone = await bot_clones_col.find_one({"franchise_id": deposit.get("franchise_id")})
             if not clone or clone.get("payment_mode", "master_managed") == "own_payment":
                 await safe_callback_answer(event, "❌ This deposit is not master-managed.", alert=True)
@@ -10430,7 +10508,12 @@ async def callback_handler(event):
                 }}
             )
             if result.modified_count == 0:
-                await safe_callback_answer(event, "Already processed.", alert=True)
+                if pending_list_page is not None:
+                    await render_admin_pending_deposits(
+                        event, page=pending_list_page, notice='ℹ️ Already processed by another admin.'
+                    )
+                else:
+                    await safe_callback_answer(event, 'Already processed.', alert=True)
                 return
 
             target_ctx = find_ctx_by_scope(deposit['franchise_id'])
@@ -10468,13 +10551,22 @@ async def callback_handler(event):
             finally:
                 current_ctx.reset(token)
 
-            try:
-                original = await event.get_message()
-                base = (original.text or original.message or "") if original else ""
-                mark = "✅ **APPROVED BY MASTER**" if is_approve else "❌ **REJECTED BY MASTER**"
-                await event.edit(base + f"\n\n{mark}\n🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST", buttons=None)
-            except Exception:
-                pass
+            if pending_list_page is not None:
+                await render_admin_pending_deposits(
+                    event, page=pending_list_page,
+                    notice='✅ Deposit approved.' if is_approve else '❌ Deposit rejected.',
+                )
+            else:
+                try:
+                    original = await event.get_message()
+                    base = (original.text or original.message or "") if original else ""
+                    mark = "✅ **APPROVED BY MASTER**" if is_approve else "❌ **REJECTED BY MASTER**"
+                    await event.edit(
+                        base + f"\n\n{mark}\n🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST",
+                        buttons=[[Button.inline('🕒 Pending Deposits', b'admin_deposits', style='primary')]],
+                    )
+                except Exception:
+                    pass
             return
 
         if data.startswith("approve_"):
@@ -10486,21 +10578,38 @@ async def callback_handler(event):
             # double-credit a deposit the Razorpay webhook just auto-approved
             # (or vice versa).
             result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": "pending"},
+                {"_id": ObjectId(dep_id), "status": "pending", "method": "manual_upi"},
                 {"$set": {"status": "approved", "approved_at": now_ist(), "approved_via": "admin_manual"}}
             )
             if result.modified_count == 0:
-                await safe_callback_answer(event, "Already processed.", alert=True)
+                if pending_list_page is not None:
+                    await render_admin_pending_deposits(
+                        event, page=pending_list_page, notice='ℹ️ Already processed by another admin.'
+                    )
+                else:
+                    await safe_callback_answer(event, 'Already processed.', alert=True)
                 return
             deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
             admin_name = await get_display_name(user_id)
             await finalize_deposit_credit(
                 deposit, approver_label=f"{admin_name} (`{user_id}`)",
-                admin_click_event=event, admin_user_id=user_id
+                admin_click_event=None if pending_list_page is not None else event,
+                admin_user_id=user_id,
             )
-            if deposit.get("qr_code_id"):
-                await razorpay_close_qr(deposit["qr_code_id"], deposit.get("payment_credential_scope"))
-            await safe_callback_answer(event, "✅ Approved")
+            if pending_list_page is not None:
+                await render_admin_pending_deposits(event, page=pending_list_page,
+                                                    notice='✅ Deposit approved.')
+            else:
+                # Notifications should retain a route back to the queue.
+                try:
+                    msg = await event.get_message()
+                    caption = (msg.text or msg.message or '') if msg else ''
+                    await event.edit(caption, buttons=[[
+                        Button.inline('🕒 Pending Deposits', b'admin_deposits', style='primary')
+                    ]])
+                except Exception:
+                    pass
+                await safe_callback_answer(event, "✅ Approved")
             return
         if data.startswith("reject_"):
             if not await is_admin(user_id):
@@ -10508,11 +10617,17 @@ async def callback_handler(event):
                 return
             dep_id = data.split("_", 1)[1]
             result = await deposits_col.update_one(
-                {"_id": ObjectId(dep_id), "status": {"$in": ["pending", "pending_auto"]}},
-                {"$set": {"status": "rejected"}}
+                {"_id": ObjectId(dep_id), "status": "pending", "method": "manual_upi"},
+                {"$set": {"status": "rejected", "rejected_at": now_ist(),
+                          "rejected_by": user_id}}
             )
             if result.modified_count == 0:
-                await safe_callback_answer(event, "Already processed.", alert=True)
+                if pending_list_page is not None:
+                    await render_admin_pending_deposits(
+                        event, page=pending_list_page, notice='ℹ️ Already processed by another admin.'
+                    )
+                else:
+                    await safe_callback_answer(event, 'Already processed.', alert=True)
                 return
             deposit = await deposits_col.find_one({"_id": ObjectId(dep_id)})
             if deposit:
@@ -10529,12 +10644,15 @@ async def callback_handler(event):
                 + f"\n\n❌ **REJECTED** by {admin_name}\n"
                 + f"🕐 {now_ist().strftime('%d/%m/%Y %H:%M:%S')} IST"
             )
-            try:
-                await event.edit(new_caption, buttons=None)
-            except MessageNotModifiedError:
-                pass
-            except Exception as e:
-                logging.error(f"Could not edit reject message: {e}")
+            if pending_list_page is None:
+                try:
+                    await event.edit(new_caption, buttons=[[
+                        Button.inline('🕒 Pending Deposits', b'admin_deposits', style='primary')
+                    ]])
+                except MessageNotModifiedError:
+                    pass
+                except Exception as e:
+                    logging.error(f"Could not edit reject message: {e}")
             if deposit and deposit.get("method") == "manual_upi":
                 await sync_payment_group_deposit_message(
                     deposit,
@@ -10552,7 +10670,11 @@ async def callback_handler(event):
                 )
             except Exception:
                 pass
-            await safe_callback_answer(event, "❌ Rejected")
+            if pending_list_page is not None:
+                await render_admin_pending_deposits(event, page=pending_list_page,
+                                                    notice='❌ Deposit rejected.')
+            else:
+                await safe_callback_answer(event, "❌ Rejected")
             return
         if data == "admin_setprice":
             if not await is_admin(user_id):
