@@ -20,6 +20,14 @@ def now_ist():
     """Current time in IST, returned as a naive datetime so it stays
     comparable/sortable with existing datetime fields already in MongoDB."""
     return datetime.now(IST).replace(tzinfo=None)
+
+# Fields describing a purchase's validity/connection state; cleared whenever an
+# account goes back to stock so a re-sale starts with a fresh 72h window.
+_ACCESS_UNSET = {
+    "access_expires_at": "", "access_expired": "", "access_expired_at": "",
+    "conn_status": "", "conn_updated_at": "", "conn_last_error": "",
+    "conn_retry_after": "", "conn_last_ok_at": "",
+}
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions
 from telethon.sessions import StringSession, SQLiteSession
@@ -38,7 +46,7 @@ from aiohttp import web
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
 from razorpay_api_verification import (expected_paise, captured_payment, qr_payment_ids, link_payment_ids)
-from account_manager import AccountManager
+from account_manager import AccountManager, ACCESS_VALIDITY
 from server2_server import Server2Server
 from server3_server import Server3Server
 
@@ -1833,11 +1841,13 @@ async def _server1_pick_active_replacement(
                 {"$set": {
                     "status": "sold",
                     "buyer_id": buyer_id,
-                    "sold_at": now_ist(),
+                    "sold_at": (_sold_ts := now_ist()),
+                    "access_expires_at": _sold_ts + ACCESS_VALIDITY,
+                    "access_expired": False,
                     "sold_via_franchise_id": ctx()["scope_id"],
                     "first_otp_sent": False,
                     "replacement_for_account_id": str(old_account_id),
-                }},
+                }, "$unset": {"access_expired_at": ""}},
             )
             if reserved is None:
                 continue
@@ -2144,6 +2154,7 @@ async def _server1_release_bulk_accounts(accounts: list[dict], bulk_id=None):
                     "bulk_total": "",
                     "bulk_active": "",
                     "first_otp_sent": "",
+                    **_ACCESS_UNSET,
                 },
             },
         )
@@ -2293,6 +2304,8 @@ async def _server1_finalize_bulk_accounts(
                     "status": "sold",
                     "buyer_id": int(buyer_id),
                     "sold_at": sold_at,
+                    "access_expires_at": sold_at + ACCESS_VALIDITY,
+                    "access_expired": False,
                     "sold_via_franchise_id": ctx()["scope_id"],
                     "first_otp_sent": False,
                     "bulk_order_id": str(bulk_id),
@@ -2300,7 +2313,8 @@ async def _server1_finalize_bulk_accounts(
                     "bulk_index": idx + 1,
                     "bulk_total": total,
                     "bulk_active": bool(mode == "direct_otp" and idx == 0),
-                }
+                },
+                "$unset": {"access_expired_at": ""},
             },
         )
 
@@ -8028,9 +8042,10 @@ async def callback_handler(event):
                 updated = await accounts_col.find_one_and_update(
                     {"_id": acc["_id"], "status": "available"},
                     {"$set": {
-                        "status": "sold", "buyer_id": user_id, "sold_at": now_ist(),
+                        "status": "sold", "buyer_id": user_id, "sold_at": (_sold_ts := now_ist()),
+                        "access_expires_at": _sold_ts + ACCESS_VALIDITY, "access_expired": False,
                         "sold_via_franchise_id": ctx()['scope_id'], "first_otp_sent": False,
-                    }}
+                    }, "$unset": {"access_expired_at": ""}}
                 )
                 if updated is None:
                     continue
@@ -8065,7 +8080,7 @@ async def callback_handler(event):
             if not finance_reservation:
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
-                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
+                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": "", **_ACCESS_UNSET}}
                 )
                 await notify_franchise_low_balance(price)
                 await safe_callback_answer(event, "⚠️ Service temporarily unavailable. Please try again shortly.", alert=True)
@@ -8083,7 +8098,7 @@ async def callback_handler(event):
                 # and refund the franchise wallet since the sale didn't complete.
                 await accounts_col.update_one(
                     {"_id": acc["_id"]},
-                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": ""}}
+                    {"$set": {"status": "available"}, "$unset": {"buyer_id": "", "sold_at": "", **_ACCESS_UNSET}}
                 )
                 await rollback_franchise_sale(finance_reservation, reason="buyer_balance_changed")
                 await show_insufficient_balance(
@@ -8220,28 +8235,10 @@ async def callback_handler(event):
         # ---------- RESEND OTP ----------
         if data.startswith("resend_"):
             phone = data.split("_", 1)[1]
-            if phone not in acc_mgr.clients:
-                await safe_callback_answer(event, "❌ Session expired. Contact admin.", alert=True)
-                return
-
-            key = (user_id, phone)
-            already_waiting = key in pending_otp_requests
-
-            # Keep waiting until Telegram actually sends a new OTP.
-            # No short timeout: the request is cleared only after a new OTP
-            # is successfully delivered to the buyer.
-            pending_otp_requests[key] = True
-
-            if already_waiting:
-                await safe_callback_answer(event, 
-                    "⏳ Already waiting for a new OTP. It will be sent automatically when it arrives.",
-                    alert=True,
-                )
-            else:
-                await safe_callback_answer(event, 
-                    "✅ Please wait for the new OTP. It will be sent automatically as soon as it arrives.",
-                    alert=True,
-                )
+            # Refreshes validity + connection state (reconnects if needed) and only
+            # registers the pending OTP request when the account is reachable.
+            res = await acc_mgr.request_again(user_id, phone)
+            await safe_callback_answer(event, res["message"], alert=True)
             return
 
         # ---------- INACTIVE STOCK QUICK ACTIONS ----------
@@ -13401,6 +13398,7 @@ async def handle_message(event):
                     "replaced_before_first_otp": "", "buyer_id": "",
                     "sold_at": "", "first_otp_sent": "", "last_otp_sent": "",
                     "last_otp_received_at": "",
+                    **_ACCESS_UNSET,
                 },
             },
         )
@@ -14818,6 +14816,7 @@ async def main():
         otp_sent_notifier=notify_otp_sent_to_owner,
     )
     await acc_mgr.load_all()
+    acc_mgr.start_supervisor()
 
     # Bring every previously-created clone back online, live, in THIS SAME
     # process — so a restart doesn't take any franchise bot offline.
@@ -14847,10 +14846,25 @@ async def main():
     # a hiccup — Telethon auto-reconnects individual clients on transient
     # network issues, so one client's blip shouldn't take every clone down
     # with it. Only an external stop (Ctrl+C, systemd, etc.) ends the process.
+    # On SIGTERM/SIGINT (redeploy) stop cleanly so session leases are released
+    # immediately and the next deployment can take over without waiting for the TTL.
+    stop_event = asyncio.Event()
     try:
-        await asyncio.Event().wait()
+        import signal as _signal
+        _loop = asyncio.get_running_loop()
+        for _sig in (_signal.SIGTERM, _signal.SIGINT):
+            _loop.add_signal_handler(_sig, stop_event.set)
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass  # e.g. Windows: fall back to default behaviour
+    try:
+        await stop_event.wait()
     except asyncio.CancelledError:
         pass
+    finally:
+        try:
+            await asyncio.wait_for(acc_mgr.stop_all(), 30)
+        except Exception as e:
+            logging.warning(f"Shutdown cleanup incomplete: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())
