@@ -776,10 +776,11 @@ async def razorpay_cancel_payment_link(payment_link_id: str, credential_scope: s
 
 
 async def razorpay_deactivate_payment_source(deposit: dict):
-    """Require gateway confirmation; NEVER mark a deposit cancelled on a POST timeout.
+    """Deactivate an unpaid Razorpay QR/Link, requiring gateway evidence.
 
-    Returns (closed, reason). A failed/unknown response must keep the wallet
-    reservation and deposit open for retry/reconciliation.
+    A Link can also be expired (already unusable).  POST responses can be
+    authoritative even when an immediately following GET is briefly stale.
+    Never treat a payment-bearing/paid source as safely cancellable.
     """
     cred = deposit.get("payment_credential_scope") or deposit.get("franchise_id") or "master"
     method = deposit.get("method")
@@ -788,13 +789,18 @@ async def razorpay_deactivate_payment_source(deposit: dict):
         if not isinstance(source_id, str) or not re.fullmatch(r"qr_[A-Za-z0-9]+", source_id):
             return False, "Missing/invalid QR ID. Contact support."
         path = f"/payments/qr_codes/{source_id}"
-        terminal = "closed"
+        terminal_states = {"closed"}
+        action = "close"
+        label = "QR"
     elif method == "razorpay_payment_link":
         source_id = deposit.get("payment_link_id")
         if not isinstance(source_id, str) or not re.fullmatch(r"plink_[A-Za-z0-9]+", source_id):
             return False, "Missing/invalid Payment Link ID. Contact support."
         path = f"/payment_links/{source_id}"
-        terminal = "cancelled"
+        # An expired standard Payment Link cannot accept further payment.
+        terminal_states = {"cancelled", "expired"}
+        action = "cancel"
+        label = "Payment Link"
     else:
         return False, "Not a cancellable Razorpay request."
 
@@ -802,30 +808,104 @@ async def razorpay_deactivate_payment_source(deposit: dict):
     key_secret = await _payment_setting(cred, "razorpay_key_secret", RAZORPAY_KEY_SECRET)
     if not key_id or not key_secret:
         return False, "Razorpay API keys unavailable. Contact support."
+
+    def money_seen(entity):
+        if not isinstance(entity, dict):
+            return False
+        if entity.get("status") in ("paid", "partially_paid"):
+            return True
+        if method == "razorpay_upi_qr" and entity.get("close_reason") == "paid":
+            return True
+        keys = ("amount_paid", "payments_amount_received", "payments_count_received")
+        return any(type(entity.get(k)) in (int, float) and entity[k] > 0 for k in keys)
+
+    def validated(entity):
+        return isinstance(entity, dict) and entity.get("id") == source_id
+
+    def confirmed(entity):
+        return (validated(entity) and not money_seen(entity)
+                and entity.get("status") in terminal_states)
+
+    async def get_source():
+        return await razorpay_api_get(path, cred)
+
     try:
-        # A first GET also handles a previous POST that succeeded before timeout.
-        before = await razorpay_api_get(path, cred)
-        if before.get("id") != source_id:
-            return False, "Gateway returned a mismatched payment source."
-        if before.get("status") in ("paid", "partially_paid") or before.get("amount_paid", 0) or before.get("payments_amount_received", 0):
-            return False, "Payment may already be received. Verify/reconcile before cancellation."
-        if before.get("status") == terminal:
-            return True, "Already closed on Razorpay."
-        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as session:
-            async with session.post(f"{RAZORPAY_API_BASE}{path}/" + ("close" if method == "razorpay_upi_qr" else "cancel"),
-                                    timeout=aiohttp.ClientTimeout(total=15)) as response:
-                # Even if HTTP failed, GET might reveal the target terminal state.
-                code = response.status
-                body = await response.json(content_type=None)
-        if code not in (200, 201):
-            logging.warning("Razorpay cancel/close HTTP %s on %s", code, source_id)
-        after = await razorpay_api_get(path, cred)
-        if after.get("id") != source_id or after.get("status") != terminal:
-            return False, "Razorpay has not confirmed cancellation. Retry or contact support."
-        return True, "Gateway confirmed closed."
+        before = await get_source()
     except Exception as exc:
-        logging.warning("Cannot confirm Razorpay cancellation of %s: %s", source_id, exc)
-        return False, "Cannot confirm cancellation from Razorpay. Retry shortly."
+        logging.warning("Razorpay cancellation precheck unavailable for %s: %s", source_id, exc)
+        return False, f"Unable to read {label} status from Razorpay. Retry shortly."
+
+    if not validated(before):
+        return False, "Gateway returned a mismatched payment source."
+    if money_seen(before):
+        return False, "Payment may already be received. Verify/reconcile before cancellation."
+    if confirmed(before):
+        return True, f"Already inactive on Razorpay ({before['status']})."
+
+    post_code = None
+    post_body = None
+    gateway_error = ""
+    try:
+        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, key_secret)) as session:
+            async with session.post(
+                f"{RAZORPAY_API_BASE}{path}/{action}",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                post_code = response.status
+                try:
+                    post_body = await response.json(content_type=None)
+                except Exception:
+                    # A non-JSON response is not proof of success.
+                    post_body = None
+    except Exception as exc:
+        # The POST could have succeeded before a network timeout. Recheck GET.
+        logging.warning("Razorpay %s POST failed for %s: %s", action, source_id, exc)
+
+    if isinstance(post_body, dict) and isinstance(post_body.get("error"), dict):
+        error = post_body["error"]
+        # Display a short safe gateway code, never credentials/raw response.
+        gateway_error = str(error.get("code") or "")[:60]
+        logging.warning("Razorpay %s %s HTTP %s: code=%s description=%s",
+                        action, source_id, post_code, gateway_error,
+                        str(error.get("description") or "")[:250])
+    elif post_code is not None and post_code not in (200, 201):
+        logging.warning("Razorpay %s %s returned HTTP %s", action, source_id, post_code)
+
+    # Razorpay's successful POST response is itself gateway confirmation if
+    # it contains the matching source id and a terminal state. Still poll GET
+    # to detect a concurrent payment and handle eventual read consistency.
+    confirmed_by_post = post_code in (200, 201) and confirmed(post_body)
+    last_status = before.get("status")
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(0.5 * attempt)
+        try:
+            after = await get_source()
+        except Exception as exc:
+            logging.warning("Razorpay cancellation status retry %s for %s failed: %s",
+                            attempt + 1, source_id, exc)
+            continue
+        if not validated(after):
+            return False, "Gateway returned a mismatched source during cancellation."
+        last_status = after.get("status")
+        if money_seen(after):
+            return False, "Payment detected during cancellation. Verify/reconcile it first."
+        if confirmed(after):
+            return True, f"Gateway confirmed {last_status}."
+        if last_status in ("paid", "partially_paid"):
+            return False, "Payment detected during cancellation. Verify/reconcile it first."
+        if confirmed_by_post:
+            # The POST is a successful, ID-matched response from Razorpay;
+            # GET may not yet reflect the updated state.
+            return True, "Gateway confirmed deactivation via POST response."
+
+    if confirmed_by_post:
+        return True, "Gateway confirmed deactivation via POST response."
+    status_text = str(last_status or "unknown")[:40]
+    http_text = f"; HTTP {post_code}" if post_code is not None and post_code not in (200, 201) else ""
+    code_text = f"; {gateway_error}" if gateway_error else ""
+    return False, (f"Razorpay {label} is still not confirmed inactive "
+                   f"(status: {status_text}{http_text}{code_text}). Retry Cancel or contact support.")
 
 
 async def cancel_razorpay_auto_deposit(dep_id, user_id: int, *, retry: bool = False):
