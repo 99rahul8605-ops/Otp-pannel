@@ -37,25 +37,35 @@ def qr_payment_ids(qr_payload, expected):
             and isinstance(p.get('id'), str) and p['id'].startswith('pay_')]
 
 
+def link_is_paid_for_deposit(link, link_id, dep_id, expected):
+    """True when the Payment Link itself is fully paid and is OUR exact deposit."""
+    return bool(
+        isinstance(link, dict) and link_id and link.get('id') == link_id
+        and link.get('status') == 'paid' and link.get('currency') == 'INR'
+        and type(link.get('amount')) is int and link['amount'] == expected
+        and type(link.get('amount_paid')) is int and link['amount_paid'] == expected
+        and link.get('reference_id') == f'dep_{dep_id}'
+        and link.get('accept_partial') is not True
+    )
+
+
 def link_payment_ids(link, link_id, dep_id, expected):
-    """Validate that the paid standard Payment Link is OUR exact deposit."""
-    if not isinstance(link, dict) or not link_id or link.get('id') != link_id:
-        return []
-    if (link.get('status') != 'paid' or link.get('currency') != 'INR'
-            or type(link.get('amount')) is not int or link['amount'] != expected
-            or type(link.get('amount_paid')) is not int or link['amount_paid'] != expected
-            or link.get('reference_id') != f'dep_{dep_id}'
-            or link.get('accept_partial') is not False):
+    """Captured payment ids listed inside a paid Payment Link (tolerant of
+    Razorpay's field variations: payment_id/id, plink_id optional)."""
+    if not link_is_paid_for_deposit(link, link_id, dep_id, expected):
         return []
     payments = link.get('payments')
     if not isinstance(payments, list):
         return []
     valid = []
     for item in payments:
-        if (isinstance(item, dict) and item.get('status') == 'captured'
-                and item.get('plink_id') == link_id
-                and type(item.get('amount')) is int and item['amount'] == expected
-                and isinstance(item.get('payment_id'), str)
-                and item['payment_id'].startswith('pay_')):
-            valid.append(item['payment_id'])
+        if not isinstance(item, dict) or item.get('status') != 'captured':
+            continue
+        if item.get('plink_id') not in (None, link_id):
+            continue
+        if type(item.get('amount')) is not int or item['amount'] != expected:
+            continue
+        pid = item.get('payment_id') or item.get('id')
+        if isinstance(pid, str) and pid.startswith('pay_'):
+            valid.append(pid)
     return valid
