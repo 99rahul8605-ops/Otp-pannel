@@ -12014,6 +12014,13 @@ async def _api_verify_razorpay_deposit(dep: dict):
     return payment_id, None
 
 
+def _approval_in_progress(dep: dict, seconds: int = 45) -> bool:
+    """True if another worker approved this deposit moments ago and is still
+    posting the wallet credit - so we must not run a second credit in parallel."""
+    at = dep.get('approved_at')
+    return bool(at and (now_ist() - at) < timedelta(seconds=seconds))
+
+
 async def verify_and_credit_razorpay_deposit(dep_id, trigger="api_check"):
     """API verification -> unique payment receipt -> atomic approval -> wallet credit.
 
@@ -12026,6 +12033,8 @@ async def verify_and_credit_razorpay_deposit(dep_id, trigger="api_check"):
         return "❌ This is not a Razorpay payment."
     if dep.get('status') == 'approved':
         if dep.get('approved_via') == 'razorpay_api' and not dep.get('wallet_credit_completed_at'):
+            if _approval_in_progress(dep):
+                return "⏳ Payment verified, wallet credit is being posted. Check again in a few seconds."
             # Recover an interruption after deposit approval but before wallet posting.
             return await _resume_razorpay_credit(dep)
         return "✅ Payment already processed. No second credit."
@@ -12055,6 +12064,8 @@ async def verify_and_credit_razorpay_deposit(dep_id, trigger="api_check"):
         fresh = await db['deposits'].find_one({'_id': dep_id})
         if fresh and fresh.get('status') == 'approved':
             if fresh.get('approved_via') == 'razorpay_api' and not fresh.get('wallet_credit_completed_at'):
+                if _approval_in_progress(fresh):
+                    return "⏳ Payment verified, wallet credit is being posted. Check again in a few seconds."
                 return await _resume_razorpay_credit(fresh)
             return "✅ Payment already processed. No second credit."
         return "⚠️ Payment state changed. Contact support if money was debited."
