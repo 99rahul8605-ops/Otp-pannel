@@ -45,7 +45,7 @@ import hmac
 from aiohttp import web
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
-from razorpay_api_verification import (expected_paise, captured_payment, qr_payment_ids, link_payment_ids)
+from razorpay_api_verification import (expected_paise, captured_payment, qr_payment_ids, link_payment_ids, link_is_paid_for_deposit)
 from account_manager import AccountManager, ACCESS_VALIDITY
 from server2_server import Server2Server
 from server3_server import Server3Server
@@ -11925,17 +11925,39 @@ async def finalize_deposit_credit(deposit: dict, approver_label: str,
 
 
 async def razorpay_api_get(path: str, credential_scope: str):
-    """Authenticated read from the fixed Razorpay API host; never from user URL."""
+    """Authenticated read from the fixed Razorpay API host; never from user URL.
+    Retries rate-limit (429), 5xx and network errors so a temporary Razorpay
+    hiccup does not leave a paid deposit pending."""
     key_id = await _payment_setting(credential_scope, "razorpay_key_id", RAZORPAY_KEY_ID)
     secret = await _payment_setting(credential_scope, "razorpay_key_secret", RAZORPAY_KEY_SECRET)
     if not key_id or not secret:
         raise RuntimeError("Razorpay API keys are not configured for this payment account")
-    async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, secret)) as session:
-        async with session.get(f"{RAZORPAY_API_BASE}{path}", timeout=aiohttp.ClientTimeout(total=15)) as res:
-            if res.status != 200:
-                logging.error("Razorpay API GET %s returned HTTP %s", path.split('?')[0], res.status)
-                raise RuntimeError("Razorpay API temporarily unavailable")
-            return await res.json(content_type=None)
+    last_err = None
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(key_id, secret)) as session:
+                async with session.get(f"{RAZORPAY_API_BASE}{path}", timeout=aiohttp.ClientTimeout(total=15)) as res:
+                    if res.status == 200:
+                        return await res.json(content_type=None)
+                    logging.error("Razorpay API GET %s returned HTTP %s (attempt %s)", path.split('?')[0], res.status, attempt + 1)
+                    last_err = RuntimeError(f"Razorpay API HTTP {res.status}")
+                    if res.status not in (429, 500, 502, 503, 504):
+                        break  # 401/404 etc. will not fix themselves
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.error("Razorpay API GET %s network error (attempt %s): %s", path.split('?')[0], attempt + 1, exc)
+            last_err = exc
+        await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError("Razorpay API temporarily unavailable") from last_err
+
+
+async def _save_verify_note(dep: dict, note: str):
+    """Keep the reason a paid-looking deposit is not matching, so admins can
+    query: db.deposits.find({status:'pending_auto', last_verify_note:{$exists:true}})"""
+    try:
+        await db['deposits'].update_one({'_id': dep['_id']},
+                                        {'$set': {'last_verify_note': note[:500], 'last_verify_at': now_ist()}})
+    except Exception:
+        logging.debug("Could not save verify note", exc_info=True)
 
 
 async def _api_verify_razorpay_deposit(dep: dict):
@@ -11951,18 +11973,41 @@ async def _api_verify_razorpay_deposit(dep: dict):
             return None, "Invalid QR reference."
         data = await razorpay_api_get(f"/payments/qr_codes/{qr_id}/payments?count=100", cred)
         ids = qr_payment_ids(data, paise)
+        if not ids and isinstance(data, dict) and data.get("items"):
+            seen = ", ".join(f"{p.get('id')}:{p.get('status')}:{p.get('amount')}{p.get('currency')}"
+                             for p in data["items"][:5] if isinstance(p, dict))
+            await _save_verify_note(dep, f"QR has payments but none matched (expected {paise} INR captured): {seen}")
     elif method == "razorpay_payment_link":
         link_id = dep.get("payment_link_id")
         if not isinstance(link_id, str) or not re.fullmatch(r"plink_[A-Za-z0-9]+", link_id):
             return None, "Invalid Payment Link reference."
         data = await razorpay_api_get(f"/payment_links/{link_id}", cred)
         ids = link_payment_ids(data, link_id, str(dep['_id']), paise)
+        if not ids and link_is_paid_for_deposit(data, link_id, str(dep['_id']), paise):
+            # Link is paid but its `payments` list is empty/odd: read the
+            # payments of the link's underlying order instead.
+            order_id = data.get("order_id")
+            if isinstance(order_id, str) and re.fullmatch(r"order_[A-Za-z0-9]+", order_id):
+                od = await razorpay_api_get(f"/orders/{order_id}/payments", cred)
+                ids = qr_payment_ids(od, paise)
+        if not ids and isinstance(data, dict) and data.get("status") not in (None, "created"):
+            await _save_verify_note(dep, (
+                f"Link status={data.get('status')} amount={data.get('amount')} amount_paid={data.get('amount_paid')} "
+                f"reference_id={data.get('reference_id')} accept_partial={data.get('accept_partial')} "
+                f"payments={len(data.get('payments') or [])} (expected {paise} paise, ref dep_{dep['_id']})"))
     else:
         return None, "Not a Razorpay API-verifiable deposit."
-    # Accept exactly one captured transaction. Multiple matches need review.
-    if len(set(ids)) != 1 or len(ids) != 1:
-        return None, "Payment not captured yet, or needs manual reconciliation."
-    payment_id = ids[0]
+    # Credit ONE captured transaction per deposit. If the customer paid the
+    # same QR twice, the first is credited and the extra ones are flagged for
+    # refund instead of leaving the user's deposit pending forever.
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        return None, "Payment not captured yet."
+    if len(unique_ids) > 1:
+        logging.critical("DUPLICATE RAZORPAY PAYMENTS on deposit %s: %s - crediting first, refund the rest",
+                         dep.get('_id'), unique_ids)
+        await _save_verify_note(dep, f"Multiple captured payments {unique_ids}; first credited, refund extras")
+    payment_id = unique_ids[0]
     payment = await razorpay_api_get(f"/payments/{payment_id}", cred)
     if not captured_payment(payment, payment_id, paise):
         return None, "Payment is not captured for this amount."
@@ -12041,21 +12086,17 @@ async def _resume_razorpay_credit(dep):
 
 
 async def poll_pending_razorpay_deposits():
-    """API polling works even when users never press Check Payment."""
-    while True:
-        try:
-            cutoff = now_ist() - timedelta(days=7)
-            cursor = db['deposits'].find({
-                '$or': [
-                    {'status': 'pending_auto', 'method': {'$in': ['razorpay_upi_qr', 'razorpay_payment_link']},
-                     'created_at': {'$gte': cutoff}},
-                    {'status': 'approved', 'approved_via': 'razorpay_api',
-                     'wallet_credit_completed_at': {'$exists': False}},
-                    {'status': 'cancelling_auto',
-                     'method': {'$in': ['razorpay_upi_qr', 'razorpay_payment_link']}},
-                ]
-            }).sort('last_api_check_at', 1).limit(50)
-            async for dep in cursor:
+    """API polling works even when users never press Check Payment.
+
+    Fresh deposits (last 3 hours - where real payments happen) are checked on
+    EVERY cycle, so abandoned old deposits can never delay a real payment.
+    Older ones are re-checked at most every 10 minutes."""
+    razorpay_methods = ['razorpay_upi_qr', 'razorpay_payment_link']
+    sem = asyncio.Semaphore(5)
+
+    async def _process(dep):
+        async with sem:
+            try:
                 await db['deposits'].update_one({'_id': dep['_id']}, {'$set': {'last_api_check_at': now_ist()}})
                 if dep.get('status') == 'cancelling_auto':
                     target = await _deposit_scope_context(dep.get('franchise_id', 'master'))
@@ -12066,7 +12107,43 @@ async def poll_pending_razorpay_deposits():
                         current_ctx.reset(token)
                 else:
                     await verify_and_credit_razorpay_deposit(dep['_id'], trigger='api_poll')
-                await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception('Razorpay poll failed for deposit %s', dep.get('_id'))
+
+    while True:
+        try:
+            now = now_ist()
+            fresh_cutoff = now - timedelta(hours=3)
+            week_cutoff = now - timedelta(days=7)
+            stale_before = now - timedelta(minutes=10)
+
+            batch = []
+            seen = set()
+
+            async def _collect(query, limit):
+                async for d in db['deposits'].find(query).sort('last_api_check_at', 1).limit(limit):
+                    if d['_id'] not in seen:
+                        seen.add(d['_id'])
+                        batch.append(d)
+
+            # 1) stuck "approved but wallet not credited" - always retry
+            await _collect({'status': 'approved', 'approved_via': 'razorpay_api',
+                            'wallet_credit_completed_at': {'$exists': False}}, 100)
+            # 2) cancellations that still need gateway confirmation
+            await _collect({'status': 'cancelling_auto', 'method': {'$in': razorpay_methods}}, 100)
+            # 3) fresh pending deposits - every cycle
+            await _collect({'status': 'pending_auto', 'method': {'$in': razorpay_methods},
+                            'created_at': {'$gte': fresh_cutoff}}, 200)
+            # 4) older pending deposits (up to 7 days) - throttled
+            await _collect({'status': 'pending_auto', 'method': {'$in': razorpay_methods},
+                            'created_at': {'$gte': week_cutoff, '$lt': fresh_cutoff},
+                            '$or': [{'last_api_check_at': {'$exists': False}},
+                                    {'last_api_check_at': {'$lt': stale_before}}]}, 50)
+
+            if batch:
+                await asyncio.gather(*(_process(d) for d in batch))
         except asyncio.CancelledError:
             raise
         except Exception:
